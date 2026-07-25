@@ -44,7 +44,16 @@ describeIfDb('Module 2: customer & CRM', () => {
     // immutability trigger. Module 3's tables are cleared here (FK order:
     // loans before customers/users) because loans FK to customers.
     await pool.query('TRUNCATE loan_repayments RESTART IDENTITY CASCADE');
+    await pool.query('TRUNCATE savings_transactions, susu_collections RESTART IDENTITY CASCADE');
     for (const table of [
+      'standing_order_runs',
+      'standing_orders',
+      'susu_commissions',
+      'agent_remittances',
+      'susu_accounts',
+      'withdrawal_requests',
+      'savings_accounts',
+      'savings_products',
       'loan_group_liabilities',
       'loan_guarantors',
       'loan_collateral',

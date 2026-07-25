@@ -19,16 +19,16 @@ Finalized in Module 1 (migration 009_gl_control_accounts.sql):
 
 | Code Range | Category | Notes |
 |---|---|---|
-| 1000-1999 | Asset | `1000` Cash in Hand, `1010` Vault Cash, `1020` Cash in Transit, `1100` Loans Receivable (Module 3) |
-| 2000-2999 | Liability | None seeded yet — no module has needed one |
+| 1000-1999 | Asset | `1000` Cash in Hand, `1010` Vault Cash, `1020` Cash in Transit, `1030` Cash with Agents (Module 4), `1100` Loans Receivable (Module 3) |
+| 2000-2999 | Liability | `2000` Customer Deposits (Module 4), `2010` Susu Deposits (Module 4), `2020` Agent Commission Payable (Module 4) |
 | 3000-3999 | Equity | None seeded yet |
-| 4000-4999 | Income | `4000` Operating Income, `4010` Loan Interest Income (Module 3), `4020` Loan Fee Income (Module 3) |
-| 5000-5999 | Expense | `5000` Operating Expense, `5100` Loan Loss Expense (Module 3) |
+| 4000-4999 | Income | `4000` Operating Income, `4010` Loan Interest Income (Module 3), `4020` Loan Fee Income (Module 3), `4030` Savings Fee Income (Module 4) |
+| 5000-5999 | Expense | `5000` Operating Expense, `5100` Loan Loss Expense (Module 3), `5200` Agent Commission Expense (Module 4) |
 
 Branch sub-account pattern: on branch creation, `branchService.createBranch()`
-auto-generates a sub-account per control account (8 as of Module 3:
-cash-in-hand, vault, income, expense, loans-receivable,
-loan-interest-income, loan-fee-income, loan-loss-expense) coded
+auto-generates a sub-account per control account (14 as of Module 4 — the
+full `branchService.CONTROL_ACCOUNT_CODES` map, minus `1020` Cash in
+Transit which is org-wide by design since it spans two branches) coded
 `<control_code>.<branch_code>` (e.g. `1000.NRA-01`), each with
 `branch_id` = the new branch and `parent_account_id` = the matching
 org-wide control row — so a consolidated report can roll sub-accounts up to
@@ -38,9 +38,9 @@ characters** (enforced by `branches_code_shape_chk` and
 `branchService.validateBranchCode()`) — the composed code must fit
 `gl_accounts.code`'s `VARCHAR(20)`.
 
-Liability/equity control accounts aren't seeded yet — add them (and this
-row) when a module first needs one (e.g. Module 4 for a customer-deposits
-liability control, or Module 5 for investor equity).
+Equity control accounts aren't seeded yet — add them (and a row above)
+when a module first needs one (e.g. Module 5 for investor equity).
+Liability controls arrived with Module 4's deposit accounting.
 
 **How to add a control account (the Module 3 recipe, follow it verbatim):**
 a new migration (a) `INSERT`s the org-wide control row(s) into
@@ -101,8 +101,9 @@ _Naming patterns adopted for the schema so later modules stay consistent
   too. This has caught out every module so far — when you add tables,
   run the **full** `npm test`, not just your own file, and verify with a
   reversed file order. Note also that immutable tables (`audit_log`,
-  `gl_journal_lines`, `loan_repayments`) need `TRUNCATE`, since their
-  triggers block plain `DELETE`.
+  `gl_journal_lines`, `loan_repayments`, `savings_transactions`,
+  `susu_collections`) need `TRUNCATE`, since their triggers block plain
+  `DELETE`.
 - **`branches`** started as a stub in Module 11/7's migrations (just `id,
   code, name, status, created_at, updated_at`) so every other table could
   carry a real `branch_id` FK immediately. Module 1 (migration
@@ -152,7 +153,16 @@ authentication header, versioning approach._
   `/loans/:id/approval-requests`, `/loans/:id/disburse`,
   `/loans/:id/schedule`, `/loans/:id/repayments`,
   `/loans/:id/restructure-requests`, `/loans/:id/write-off`,
-  `/loans/:id/collateral`, `/loans/:id/guarantors`.
+  `/loans/:id/collateral`, `/loans/:id/guarantors`, `/savings`,
+  `/savings/products`, `/savings/:id/deposits`,
+  `/savings/:id/withdrawal-requests`, `/savings/:id/charges`,
+  `/savings/:id/statement`, `/savings/:id/reconciliation`,
+  `/savings/withdrawal-requests/:id/settle`,
+  `/savings/reconciliation/branch/:branchId`,
+  `/savings/standing-orders`, `/savings/standing-orders/execute-due`,
+  `/savings/standing-orders/failures`, `/susu`, `/susu/:id/collections`,
+  `/susu/:id/complete-cycle`, `/susu/:id/payout`, `/susu/remittances`,
+  `/susu/agents/:agentId/commissions`.
 - Route file ordering rule (see `backend/src/routes/branches.js`): every
   fixed-prefix path (`/regions`, `/clusters`, `/transfers`,
   `/performance/compare`) must be registered before the `/:id` catch-all,
@@ -214,6 +224,14 @@ values, loan status values, account status values._
 | `loan_schedules.status` | `pending`, `partially_paid`, `paid` | 3 |
 | `loan_appraisals.recommendation` | `recommend`, `decline` | 3 — a `decline` moves the loan straight to `rejected` |
 | `loan_collateral.verification_status` / `loan_guarantors.verification_status` | `pending`, `verified`, `rejected` | 3 |
+| `savings_products.status` | `active`, `inactive` | 4 |
+| `savings_accounts.status` | `active`, `dormant`, `closed` | 4 — `closed` requires a zero balance; nothing sets `dormant` yet (no inactivity job until Module 12) |
+| `savings_transactions.txn_type` | `deposit`, `withdrawal`, `maintenance_fee`, `withdrawal_fee`, `min_balance_charge`, `standing_order_out`, `standing_order_in`, `susu_payout` | 4 — the signed `amount_pesewas` carries direction, so type is descriptive not directional |
+| `withdrawal_requests.status` | `pending`, `paid`, `rejected` | 4 |
+| `susu_accounts.status` | `active`, `completed`, `uncompleted`, `paid_out` | 4 — `completed`/`uncompleted` is the spec's required split (target reached vs. cycle ended short); `paid_out` is added so a settled account is distinguishable from one still awaiting payout |
+| `susu_commissions.basis` | `per_collection`, `per_cycle` | 4 — only `per_collection` is produced today |
+| `standing_orders.status` | `active`, `paused`, `suspended`, `completed`, `cancelled` | 4 — `suspended` is set automatically after `max_consecutive_failures`; `paused`/`cancelled` are deliberate human actions |
+| `standing_order_runs.status` | `success`, `failed` | 4 — every run writes one, so a failure is never silent |
 
 **`branches.status` transition table** (`branchService.VALID_STATUS_TRANSITIONS`):
 
@@ -397,7 +415,14 @@ validateBalancedLines(lines) -> void  // pure, throws UnbalancedEntryError; no d
   `loan.appraise`, `loan.request_approval`, `loan.disburse`,
   `loan.post_repayment`, `loan.restructure`, `loan.write_off`,
   `loan.manage_collateral`, `loan.manage_guarantors`,
-  `loan.view_reports`. Add new codes via
+  `loan.view_reports`, `savings.manage_products`, `savings.open_account`,
+  `savings.close_account`, `savings.deposit`, `savings.withdraw`,
+  `savings.apply_charges`, `savings.view`, `susu.manage_accounts`,
+  `susu.record_collection`, `susu.remit`, `susu.complete_cycle`,
+  `susu.view`, `standing_order.manage`, `standing_order.execute`.
+  Note the `field_agent` role gets `susu.record_collection` but NOT
+  `savings.deposit`/`savings.withdraw` — agents never touch a till.
+  Add new codes via
   `POST /rbac/roles/:roleId/permissions`, not a new migration, unless you
   also need to seed a default grant.
 
@@ -644,6 +669,102 @@ direct writes):
   doesn't exist yet when the repayment row is inserted. Every financial
   field stays immutable, and the trigger verifies nothing else changed.
 
+### Savings / susu / standing orders — `backend/src/modules/savings/` (Module 4)
+
+`savingsMath.js` is pure (no db) and separately unit-tested, same split as
+Module 3's `loanMath.js`: charge resolution, withdrawal assessment,
+commission, cycle outcome, and next-run-date scheduling.
+
+```js
+// savingsService.js
+openAccount / closeAccount(pool, ...)
+deposit(pool, { accountId, amountPesewas, depositedBy, idempotencyKey? })
+requestWithdrawal(pool, { accountId, amountPesewas, requestedBy })   // pays out OR queues for approval
+settleApprovedWithdrawal(pool, { withdrawalRequestId, paidBy })
+applyCharges(pool, { accountId, appliedBy, chargeTypes? })
+applyMovement(pool, { accountId, txnType, deltaPesewas, buildGlLines, ... })  // the single balance-movement funnel
+reconcileAccount / reconcileBranchDeposits(pool, ...)
+
+// susuService.js
+createSusuAccount / recordCollection / recordRemittance / completeCycle / payOutCycle(pool, ...)
+
+// standingOrderService.js
+createStandingOrder / executeOrder / executeDueOrders / listUnnotifiedFailures(pool, ...)
+```
+
+**GL mapping — deposits are a LIABILITY** (money owed back to the
+customer), which is why a deposit *credits* the control account:
+
+| Event | Debit | Credit |
+|---|---|---|
+| Deposit | Cash in Hand | Customer Deposits |
+| Withdrawal | Customer Deposits | Cash in Hand |
+| Fee / charge | Customer Deposits | Savings Fee Income |
+| **Susu field collection** | **Cash with Agents (1030)** | Susu Deposits |
+| **Agent remittance (banking it)** | Cash in Hand | **Cash with Agents (1030)** |
+| Agent commission accrual | Agent Commission Expense | Agent Commission Payable |
+| Susu cycle payout | Susu Deposits | Customer Deposits |
+
+- **`1030` Cash with Agents answers Module 4's "BEFORE YOU WRITE CODE"
+  question.** Cash an agent collects in the field is NOT branch cash until
+  they bank it, so a collection debits 1030 rather than 1000. **1030's
+  balance is therefore exactly "what agents are currently holding"** —
+  the figure Module 10's end-of-day reconciliation compares against what
+  the cashier actually received. `susu_collections.remittance_id` is NULL
+  until banked and can only ever be set once (enforced by the immutability
+  trigger), so **the same collection can never be reconciled twice** under
+  two different processes — the specific risk that question raised.
+- **The join key into Module 10 is `users(id)`.** `susu_collections.agent_id`
+  references the agent's staff/user record directly, NOT a Module-10
+  `field_agents` row (which doesn't exist yet). Module 10's `field_agents`
+  is specced as "linked to a staff/user record", so it will hang off the
+  same `users(id)`; joining `susu_collections -> users <- field_agents`
+  gives Module 10 its input without Module 4 depending on unbuilt tables.
+  **Module 10 must not introduce a second agent identifier** — extend
+  `field_agents.user_id` instead.
+- **`savings_accounts.balance_pesewas` is a stored subledger balance**,
+  which is NOT a violation of CLAUDE.md's "reconstruct from journal lines"
+  rule — that rule governs *GL* reporting, which still reconstructs from
+  `gl_journal_lines` untouched. This is a customer subledger, the spec
+  explicitly asks for it, and a teller needs a balance without summing all
+  history. It stays trustworthy because every movement also writes an
+  immutable `savings_transactions` row carrying `balance_after_pesewas`,
+  so `reconcileAccount()` proves stored balance == ledger sum, and
+  `reconcileBranchDeposits()` proves subledger total == GL control
+  balance. Those two are the per-account and per-branch halves of Module
+  7's required "GL-to-customer-account reconciliation report".
+- **Withdrawal approval threshold resolution order** (business rule:
+  "configurable per branch or per product"): a Module 11
+  `approval_thresholds` row for `action_type = 'savings.withdraw'` wins
+  (and that table already prefers a branch-specific row over the org-wide
+  one); otherwise the account's `charges_config` override; otherwise the
+  product's `withdrawal_approval_threshold_pesewas`. An amount **>=** the
+  threshold needs approval. A threshold of 0 means *everything* needs
+  approval and is honoured as such, not treated as "unset".
+- **Idempotency is a DB guarantee, not a convention.**
+  `savings_transactions.idempotency_key` and
+  `susu_collections.idempotency_key` are UNIQUE; the services check first
+  and return the existing row with `idempotentReplay: true` (HTTP 200
+  rather than 201) instead of erroring. That is what makes the agent
+  collection endpoint safe for low-connectivity retries.
+- **`applyMovement()` is the single funnel** for every savings balance
+  change — it locks the account, writes the immutable ledger row, updates
+  the balance, then posts the GL entry via `glPosting`. Callers supply a
+  `buildGlLines` callback so the funnel doesn't need to know every
+  transaction type. Any future module touching savings balances should go
+  through it rather than updating `balance_pesewas` directly.
+- **Standing orders never fail silently**: every run writes a
+  `standing_order_runs` row; a failure records the reason, reschedules by
+  the order's own `retry_after_days`, and suspends the order once
+  `max_consecutive_failures` is reached (rather than retrying forever).
+  `listUnnotifiedFailures()` exposes the queue of failures nobody has told
+  the customer about — see Open Questions, there is no notification
+  service yet.
+- **Savings accounts accrue no interest.** The Module 4 spec covers
+  charges, not credit interest; interest-bearing products are Module 5
+  (Investments). If a savings product ever needs to pay interest, that is
+  a new accrual posting model, not a config tweak.
+
 ---
 
 ## Branch Scoping Convention
@@ -746,13 +867,16 @@ knowledge — plus any module prompt conflicts that need a human call._
       bureau lookup a precondition of loan approval** precisely because
       the stub's output is meaningless — wire that in when the real
       integration lands.
-- [ ] **Overdraft loans are not implemented.** `overdraft` is a valid
-      `loan_type` in the enum (the spec lists it), but nothing supports
-      it: an overdraft is drawn against a savings account, and Module 4
-      (Savings/Susu) doesn't exist yet. `applyForLoan()` will happily
-      create one and it will amortize like a term loan, which is NOT
-      overdraft behavior. Either build it properly with Module 4 or
-      reject `overdraft` at the application boundary until then.
+- [ ] **Overdraft loans are still not implemented — but are now
+      unblocked.** `overdraft` is a valid `loan_type` and
+      `savings_products.allows_overdraft` now exists (Module 4 honours it
+      in `assessWithdrawal`, letting a flagged account go negative), so
+      the savings side of the dependency is in place. What is still
+      missing is Module 3 linking an overdraft loan to a savings account
+      and servicing it as a revolving facility rather than an amortizing
+      term loan — `applyForLoan()` would still build a term schedule for
+      it. Either finish it in Module 3 or reject `overdraft` at the
+      application boundary until someone does.
 - [ ] **Interest is recognized on receipt, not accrual** (see the Loan
       service section). This is a coherent, simple model for a
       cash-basis microfinance book, but Module 8 (BOG prudential returns,
@@ -771,7 +895,37 @@ knowledge — plus any module prompt conflicts that need a human call._
       so every loan approval currently accepts any user holding
       `approval.decide` regardless of loan size. The table supports
       amount-banded routing (`amount_pesewas` is already stamped on loan
-      approval requests) — decide the real bands with the business.
+      approval requests) — decide the real bands with the business. Module
+      4's `savings.withdraw` reads the same table and does have a
+      resolution path wired (product default -> branch override), but no
+      rows are seeded there either: the real withdrawal thresholds are a
+      business/compliance number nobody has supplied yet.
+- [ ] **There is no notification service, so standing-order failures are
+      recorded but not delivered.** The business rule says a failed
+      standing order should "notify the customer". Module 4 records every
+      failure with its reason and exposes
+      `GET /savings/standing-orders/failures` (rows where
+      `customer_notified = false`) so nothing is silently lost — but
+      nothing sends an SMS/email, and nothing ever flips that flag.
+      Whoever builds notifications (likely alongside Module 12) should
+      drain that queue and set `customer_notified`.
+- [ ] **Cross-branch standing orders are rejected, not supported.**
+      Transferring between accounts at different branches needs a
+      due-to/due-from inter-branch GL account pair, which doesn't exist.
+      `createStandingOrder()` refuses them explicitly rather than posting
+      something lopsided. Add the inter-branch pair (and the same for
+      ad-hoc customer transfers) when the business needs it.
+- [ ] **Nothing marks a savings account `dormant`.** The status exists in
+      the enum but requires an inactivity sweep, which belongs to Module
+      12's scheduler. Likewise, `applyCharges()` is per-account and
+      staff-invoked — the periodic bulk run (monthly maintenance fees
+      across the book) is a Module 12 job that doesn't exist yet.
+- [ ] **Agent commission is accrued but never paid.**
+      `susu_commissions.paid_at` and the Agent Commission Payable
+      liability exist, and commission accrues per collection, but there is
+      no payout flow — that plausibly belongs with Module 10 (Agent & Field
+      Ops) or payroll. The liability will therefore grow monotonically
+      until someone builds the settlement side.
 
 ---
 
@@ -885,6 +1039,28 @@ deliberately changed._
   principal+interest. The schema and the repayment waterfall both already
   support per-installment fees (`loan_schedules.fees_due_pesewas`) if a
   future product needs them — nothing populates that column today.
+- **Susu accounts are standalone, not a savings product variant.** The
+  spec lists `susu_accounts` as its own table with its own cycle fields,
+  so susu balances live in their own liability control (`2010`) and only
+  become ordinary savings on payout. The alternative (susu as a flavour of
+  `savings_accounts`) would have made "cycle completed vs uncompleted" and
+  the agent-collection flow awkward to model. A susu account optionally
+  points at a `payout_savings_account_id` for settlement.
+- **`agent_remittances` is a Module 4 table even though agent
+  reconciliation is Module 10's job.** Module 4 has to record *that* an
+  agent banked their cash (otherwise Cash-with-Agents never clears and the
+  GL is wrong), so the remittance event and its GL posting live here.
+  Module 10 owns the *reconciliation* — comparing these remittances and
+  their collections against what the cashier counted, and routing variances
+  to a supervisor. Module 10 should read this table, not create a parallel
+  one.
+- **A stored `savings_accounts.balance_pesewas` coexists with CLAUDE.md's
+  "no mutable running balances" rule.** That rule is about GL reporting,
+  which is untouched — this is a customer subledger the spec explicitly
+  asks for, backed by an immutable transaction ledger and two
+  reconciliation checks. Called out because a future session could
+  reasonably read the CLAUDE.md rule as forbidding it; it was a considered
+  decision, not an oversight. See the Savings service section.
 - **Customer `status: 'closed'` has no reactivation path**, unlike
   `branches.status: 'closed'` where the parallel doesn't even apply (both
   are terminal). This wasn't specified either way in the Module 2 prompt;

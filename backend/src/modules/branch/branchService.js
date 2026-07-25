@@ -92,12 +92,18 @@ const CONTROL_ACCOUNT_CODES = {
   cashInHand: '1000',
   vault: '1010',
   transit: '1020',
+  cashWithAgents: '1030', // added in Module 4
   loansReceivable: '1100', // added in Module 3
+  customerDeposits: '2000', // added in Module 4
+  susuDeposits: '2010', // added in Module 4
+  agentCommissionPayable: '2020', // added in Module 4
   income: '4000',
   loanInterestIncome: '4010', // added in Module 3
   loanFeeIncome: '4020', // added in Module 3
+  savingsFeeIncome: '4030', // added in Module 4
   expense: '5000',
   loanLossExpense: '5100', // added in Module 3
+  agentCommissionExpense: '5200', // added in Module 4
 };
 
 async function getControlAccounts(db) {
@@ -183,12 +189,20 @@ async function createBranch(pool, params) {
     const loanInterestIncomeAccount = await createSubAccount(controls.loanInterestIncome);
     const loanFeeIncomeAccount = await createSubAccount(controls.loanFeeIncome);
     const loanLossExpenseAccount = await createSubAccount(controls.loanLossExpense);
+    const cashWithAgentsAccount = await createSubAccount(controls.cashWithAgents);
+    const customerDepositsAccount = await createSubAccount(controls.customerDeposits);
+    const susuDepositsAccount = await createSubAccount(controls.susuDeposits);
+    const agentCommissionPayableAccount = await createSubAccount(controls.agentCommissionPayable);
+    const savingsFeeIncomeAccount = await createSubAccount(controls.savingsFeeIncome);
+    const agentCommissionExpenseAccount = await createSubAccount(controls.agentCommissionExpense);
 
     await client.query(
       `INSERT INTO branch_gl_accounts
          (branch_id, cash_in_hand_account_id, vault_account_id, income_account_id, expense_account_id,
-          loans_receivable_account_id, loan_interest_income_account_id, loan_fee_income_account_id, loan_loss_expense_account_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+          loans_receivable_account_id, loan_interest_income_account_id, loan_fee_income_account_id, loan_loss_expense_account_id,
+          cash_with_agents_account_id, customer_deposits_account_id, susu_deposits_account_id,
+          agent_commission_payable_account_id, savings_fee_income_account_id, agent_commission_expense_account_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
       [
         branch.id,
         cashInHandAccount.id,
@@ -199,6 +213,12 @@ async function createBranch(pool, params) {
         loanInterestIncomeAccount.id,
         loanFeeIncomeAccount.id,
         loanLossExpenseAccount.id,
+        cashWithAgentsAccount.id,
+        customerDepositsAccount.id,
+        susuDepositsAccount.id,
+        agentCommissionPayableAccount.id,
+        savingsFeeIncomeAccount.id,
+        agentCommissionExpenseAccount.id,
       ]
     );
 
@@ -219,6 +239,12 @@ async function createBranch(pool, params) {
         loanInterestIncome: loanInterestIncomeAccount,
         loanFeeIncome: loanFeeIncomeAccount,
         loanLossExpense: loanLossExpenseAccount,
+        cashWithAgents: cashWithAgentsAccount,
+        customerDeposits: customerDepositsAccount,
+        susuDeposits: susuDepositsAccount,
+        agentCommissionPayable: agentCommissionPayableAccount,
+        savingsFeeIncome: savingsFeeIncomeAccount,
+        agentCommissionExpense: agentCommissionExpenseAccount,
       },
     };
 

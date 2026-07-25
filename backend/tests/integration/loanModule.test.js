@@ -46,7 +46,16 @@ describeIfDb('Module 3: loan management', () => {
     await pool.query('TRUNCATE gl_journal_lines, gl_journal_entries RESTART IDENTITY CASCADE');
     await pool.query('TRUNCATE audit_log RESTART IDENTITY CASCADE');
     await pool.query('TRUNCATE loan_repayments RESTART IDENTITY CASCADE');
+    await pool.query('TRUNCATE savings_transactions, susu_collections RESTART IDENTITY CASCADE');
     for (const table of [
+      'standing_order_runs',
+      'standing_orders',
+      'susu_commissions',
+      'agent_remittances',
+      'susu_accounts',
+      'withdrawal_requests',
+      'savings_accounts',
+      'savings_products',
       'loan_group_liabilities',
       'loan_guarantors',
       'loan_collateral',
