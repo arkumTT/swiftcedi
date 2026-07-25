@@ -19,14 +19,16 @@ Finalized in Module 1 (migration 009_gl_control_accounts.sql):
 
 | Code Range | Category | Notes |
 |---|---|---|
-| 1000-1999 | Asset | Org-wide controls seeded: `1000` Cash in Hand, `1010` Vault Cash, `1020` Cash in Transit |
+| 1000-1999 | Asset | `1000` Cash in Hand, `1010` Vault Cash, `1020` Cash in Transit, `1100` Loans Receivable (Module 3) |
 | 2000-2999 | Liability | None seeded yet — no module has needed one |
 | 3000-3999 | Equity | None seeded yet |
-| 4000-4999 | Income | Org-wide control seeded: `4000` Operating Income |
-| 5000-5999 | Expense | Org-wide control seeded: `5000` Operating Expense |
+| 4000-4999 | Income | `4000` Operating Income, `4010` Loan Interest Income (Module 3), `4020` Loan Fee Income (Module 3) |
+| 5000-5999 | Expense | `5000` Operating Expense, `5100` Loan Loss Expense (Module 3) |
 
 Branch sub-account pattern: on branch creation, `branchService.createBranch()`
-auto-generates 4 sub-accounts (cash-in-hand, vault, income, expense) coded
+auto-generates a sub-account per control account (8 as of Module 3:
+cash-in-hand, vault, income, expense, loans-receivable,
+loan-interest-income, loan-fee-income, loan-loss-expense) coded
 `<control_code>.<branch_code>` (e.g. `1000.NRA-01`), each with
 `branch_id` = the new branch and `parent_account_id` = the matching
 org-wide control row — so a consolidated report can roll sub-accounts up to
@@ -39,6 +41,24 @@ characters** (enforced by `branches_code_shape_chk` and
 Liability/equity control accounts aren't seeded yet — add them (and this
 row) when a module first needs one (e.g. Module 4 for a customer-deposits
 liability control, or Module 5 for investor equity).
+
+**How to add a control account (the Module 3 recipe, follow it verbatim):**
+a new migration (a) `INSERT`s the org-wide control row(s) into
+`gl_accounts`, (b) `ALTER TABLE branch_gl_accounts ADD COLUMN
+<name>_account_id BIGINT REFERENCES gl_accounts(id)`, (c) backfills a
+sub-account for **every existing branch** in a `DO $$` loop and sets the
+new column, then (d) `ALTER COLUMN ... SET NOT NULL`. Then add the code to
+`branchService.CONTROL_ACCOUNT_CODES` and create the sub-account in
+`createBranch()` so *new* branches get it too. Miss either half and you
+get branches with a NULL account id (existing branches) or new branches
+that can't post (new branches). See migration
+`021_loan_gl_control_accounts.sql`.
+
+That migration also **repaired a latent Module 1 gap it uncovered**: the
+`HQ` branch was seeded directly by migration 001's `INSERT INTO branches`,
+bypassing `createBranch()`, so it never had a `branch_gl_accounts` row or
+any GL sub-accounts at all. The backfill now creates the full set for any
+branch missing one, so `HQ` is a complete branch like any other.
 
 ---
 
@@ -69,7 +89,20 @@ _Naming patterns adopted for the schema so later modules stay consistent
   `NNN_description.sql`, applied in filename order and tracked in a
   `schema_migrations` table by `backend/src/db/migrate.js`. Each file is
   additive (no down-migrations for this build) — a wrong migration gets a
-  new corrective migration, not an edited history.
+  new corrective migration, not an edited history. (A migration that has
+  not yet been committed/pushed may still be edited in place — it hasn't
+  been applied anywhere but the author's local db.)
+- **Integration-test cleanup is a shared cross-module concern.** Each
+  `tests/integration/*.test.js` wipes the tables it needs in `beforeAll`,
+  in FK order. Adding a table that FKs to `users`, `customers`,
+  `approval_requests`, or `gl_journal_entries` therefore breaks *other*
+  modules' suites (they run in one process against one database, in
+  arbitrary order) unless the new table is added to their cleanup lists
+  too. This has caught out every module so far — when you add tables,
+  run the **full** `npm test`, not just your own file, and verify with a
+  reversed file order. Note also that immutable tables (`audit_log`,
+  `gl_journal_lines`, `loan_repayments`) need `TRUNCATE`, since their
+  triggers block plain `DELETE`.
 - **`branches`** started as a stub in Module 11/7's migrations (just `id,
   code, name, status, created_at, updated_at`) so every other table could
   carry a real `branch_id` FK immediately. Module 1 (migration
@@ -113,7 +146,13 @@ authentication header, versioning approach._
   `/customers/:id/next-of-kin`, `/customers/:id/credit-bureau-lookups`,
   `/groups`, `/groups/:id/members`, `/groups/:id/leader`,
   `/account-closures/:id` (top-level — resolves a closure by its own id,
-  not nested under a customer, mirroring `getAccountClosure()`'s signature).
+  not nested under a customer, mirroring `getAccountClosure()`'s signature),
+  `/loans`, `/loans/products`, `/loans/calculator`,
+  `/loans/reports/arrears`, `/loans/:id/appraisals`,
+  `/loans/:id/approval-requests`, `/loans/:id/disburse`,
+  `/loans/:id/schedule`, `/loans/:id/repayments`,
+  `/loans/:id/restructure-requests`, `/loans/:id/write-off`,
+  `/loans/:id/collateral`, `/loans/:id/guarantors`.
 - Route file ordering rule (see `backend/src/routes/branches.js`): every
   fixed-prefix path (`/regions`, `/clusters`, `/transfers`,
   `/performance/compare`) must be registered before the `/:id` catch-all,
@@ -168,6 +207,13 @@ values, loan status values, account status values._
 | `customers.kyc_status` | `pending`, `verified`, `rejected` | 2 — no restrictive state machine; any value may follow any other (re-review after resubmission, or downgrading a verified customer if fraud surfaces later), just permission-gated and audited via `customerService.updateKycStatus()` |
 | `customers.customer_type` | `individual`, `group`, `sme` | 2 |
 | `credit_bureau_lookups.status` | `completed`, `failed` | 2 |
+| `loans.status` | `applied`, `appraised`, `pending_approval`, `approved`, `rejected`, `disbursed`, `closed`, `written_off` | 3 — see the lifecycle note below; `closed` (fully repaid) and `written_off` (bad debt) are both terminal and deliberately distinct, since Module 8/9 must be able to tell a performing payoff from a loss |
+| `loan_products.loan_type` / `loans.loan_type` | `individual`, `group`, `overdraft` | 3 — `overdraft` is in the enum but NOT implemented; it needs a savings account to attach to (Module 4). See Open Questions |
+| `loan_products.interest_method` / `loans.interest_method` | `flat`, `reducing_balance` | 3 |
+| `loan_products.status` | `active`, `inactive` | 3 |
+| `loan_schedules.status` | `pending`, `partially_paid`, `paid` | 3 |
+| `loan_appraisals.recommendation` | `recommend`, `decline` | 3 — a `decline` moves the loan straight to `rejected` |
+| `loan_collateral.verification_status` / `loan_guarantors.verification_status` | `pending`, `verified`, `rejected` | 3 |
 
 **`branches.status` transition table** (`branchService.VALID_STATUS_TRANSITIONS`):
 
@@ -193,6 +239,27 @@ endpoint. If a real "unclose" business need shows up, add it as its own
 explicit, audited, probably-approval-gated action rather than folding it
 into `reactivateCustomer`.
 
+**`loans.status` lifecycle** — each arrow is a distinct permissioned
+service call, never an implicit side effect:
+
+```
+applied ──appraise(recommend)──> appraised ──requestLoanApproval──> pending_approval
+   │                                                                      │
+   └──appraise(decline)──> rejected <────────approvalWorkflow reject───────┤
+                                                                          │
+                                          approvalWorkflow approve ───> approved
+                                                                          │
+                                                       disburseLoan ──> disbursed
+                                                                        │      │
+                                     final repayment ──> closed  <──────┘      │
+                                                       writeOffLoan ──> written_off
+```
+
+Disbursement is deliberately a **separate** action from approval (not
+something the approval handler does): maker-checker is already satisfied
+at the approval step, and disbursement is when cash actually moves, so it
+carries its own `loan.disburse` permission and its own audit entry.
+
 Follow this pattern for every future status column: app-layer values
 documented here **and** a DB `CHECK` constraint enumerating the same
 values (see migrations for examples) — never app-layer-only validation on
@@ -206,14 +273,20 @@ _Exact function/endpoint signatures for the audit-log service, the
 approval-workflow service, and the GL posting interface, once built —
 every other module should call these, not reimplement them._
 
-All three live under `backend/src/shared/` and take a `db` (a pg
-Client/PoolClient/Pool) as their first argument — pass the **same client
-your caller's transaction is running on** wherever you need the audit
-entry (or approval decision) to commit/rollback atomically with the write
-it's about. Every module MUST call these instead of writing to
-`audit_log`, `approval_requests`, or `gl_journal_lines`/`gl_journal_entries`
-directly — those tables also refuse direct-write shortcuts at the DB layer
-(see "Deviations" below for what's DB-enforced vs. convention-only).
+The three genuinely shared services live under `backend/src/shared/` and
+take a `db` (a pg Client/PoolClient/Pool) as their first argument — pass
+the **same client your caller's transaction is running on** wherever you
+need the audit entry (or approval decision) to commit/rollback atomically
+with the write it's about. Every module MUST call these instead of writing
+to `audit_log`, `approval_requests`, or
+`gl_journal_lines`/`gl_journal_entries` directly — those tables also refuse
+direct-write shortcuts at the DB layer (see "Deviations" below for what's
+DB-enforced vs. convention-only).
+
+The per-module service sections that follow (branch, customer, loan math,
+loan) are **not** shared services other modules call into — they're each
+module's own business logic, documented here because later modules read
+their tables and need the real shape and the decisions baked into them.
 
 ### Audit log — `backend/src/shared/auditLog.js`
 
@@ -320,7 +393,11 @@ validateBalancedLines(lines) -> void  // pure, throws UnbalancedEntryError; no d
   `customer.classify`, `customer.transfer_branch`,
   `customer.manage_documents`, `customer.manage_next_of_kin`,
   `customer.credit_bureau_lookup`, `customer.verify_kyc`,
-  `group.manage_members`. Add new codes via
+  `group.manage_members`, `loan.manage_products`, `loan.apply`,
+  `loan.appraise`, `loan.request_approval`, `loan.disburse`,
+  `loan.post_repayment`, `loan.restructure`, `loan.write_off`,
+  `loan.manage_collateral`, `loan.manage_guarantors`,
+  `loan.view_reports`. Add new codes via
   `POST /rbac/roles/:roleId/permissions`, not a new migration, unless you
   also need to seed a default grant.
 
@@ -454,7 +531,118 @@ getCustomer360(pool, { customerId }) -> Promise<{ customer, documents, nextOfKin
 - `getCustomer360()` follows the same honesty pattern as Module 1's branch
   performance dashboard — loans/savings/susu/transaction history are
   listed under `pendingModules` rather than faked, since Modules 3/4/5
-  don't exist yet.
+  don't exist yet. **Module 3 did NOT wire loans into this** — it stayed
+  in `pendingModules`; whoever needs a loans section on the 360 view
+  should add it deliberately (it's a `listLoans({ customerId })` call).
+
+### Loan math — `backend/src/modules/loan/loanMath.js` (Module 3)
+
+**Pure functions, no db, no side effects** — deliberately split out from
+`loanService.js` so the interest/allocation logic (the part CLAUDE.md and
+the module spec both single out for dedicated tests) is exhaustively
+testable in isolation. 29 unit tests in `tests/unit/loanMath.test.js`.
+
+```js
+generateLoanSchedule({ principalPesewas, termMonths, annualInterestRateBps, interestMethod, startDate }) -> [{ installmentNumber, dueDate, principalDuePesewas, interestDuePesewas }]
+allocateRepayment(scheduleRows, amountPesewas) -> { allocations, unallocatedPesewas }
+computeFeesPesewas(feeSchedule, principalPesewas) -> number
+computeOutstandingPrincipalPesewas(scheduleRows) -> number
+bucketArrearsDays(daysOverdue, bucketBoundaryDays) -> string | null
+addMonthsToDateString(dateStr, months) -> string
+```
+- **Interest rates are integer basis points of the ANNUAL nominal rate**
+  (`annual_interest_rate_bps`; 2400 = 24% p.a.) — never a float, same
+  reasoning as money. Amortization is always **monthly** (annual/12).
+- **The anti-drift guarantee** the spec demands ("reducing-balance
+  recalculation must handle early/partial/late payments without drifting
+  from the original schedule's total interest assumptions") is achieved
+  structurally, not by re-deriving anything: (a) the schedule's LAST
+  installment always absorbs the rounding remainder, so
+  `sum(principalDue) === principal` exactly, by construction, for every
+  method/term/rate; and (b) repayments never recalculate the schedule —
+  `allocateRepayment()` only decides how a payment *covers* fixed
+  installment amounts. Early/partial/late payment therefore cannot move
+  the totals at all.
+- **Repayment waterfall**: oldest installment first, and within an
+  installment **fees -> interest -> principal**, spilling into the next
+  installment once one is fully covered.
+- `bucketArrearsDays` produces portfolio-management PAR buckets
+  (`1-30`/`31-60`/`61-90`/`90+` by default, configurable per product).
+  These are **not** BOG's prudential loan classification categories
+  (current/OLEM/substandard/doubtful/loss) — that's Module 8's job, and it
+  must not reuse these buckets as if they were the same thing.
+
+### Loan service — `backend/src/modules/loan/loanService.js` (Module 3)
+
+```js
+createLoanProduct / listLoanProducts / getLoanProduct(pool, ...)
+calculateLoan(pool, { productId, principalPesewas, termMonths, startDate }) -> preview, creates nothing
+applyForLoan(pool, { customerId, productId, principalPesewas, termMonths, reasonCode, appliedBy }) -> loan
+submitAppraisal(pool, { loanId, checklist, recommendation, appraiserId }) -> { appraisal, loan }
+requestLoanApproval(pool, { loanId, requestedBy }) -> approval_request
+disburseLoan(pool, { loanId, disbursedBy, disbursementDate }) -> loan + { feesPesewas, netCashPesewas, journalEntry }
+postRepayment(pool, { loanId, amountPesewas, paymentDate, receivedBy }) -> { components, loanClosed, journalEntry }
+requestRestructure(pool, { loanId, newTermMonths, newAnnualInterestRateBps, reason, requestedBy }) -> restructure + approvalRequest
+writeOffLoan(pool, { loanId, reason, writtenOffBy }) -> loan + journalEntry
+getArrearsReport(pool, { branchId, asOfDate }) -> { loans, totals: { buckets, parRatio } }
+findGroupCreditBlockers(db, groupCustomerId) -> blocking members
+registerLoanExecutionHandlers()  // 'loan.approve' + 'loan.restructure'
+```
+
+**GL mapping — the contract every other module should read before posting
+anything loan-related** (all via `glPosting.postJournalEntry`, never
+direct writes):
+
+| Event | Debit | Credit |
+|---|---|---|
+| Disbursement | Loans Receivable `principal` | Cash in Hand `principal - fees`; Loan Fee Income `fees` |
+| Repayment | Cash in Hand `amount` | Loans Receivable `principal component`; Loan Interest Income `interest component`; Loan Fee Income `fee component` |
+| Write-off | Loan Loss Expense `outstanding principal` | Loans Receivable `outstanding principal` |
+
+- **Fees are charged once, at disbursement, netted from the cash handed
+  over** — the borrower owes the full principal, receives
+  `principal - fees`, and fee income is recognized immediately. The
+  alternative (billing fees across installments via
+  `loan_schedules.fees_due_pesewas`) is *supported by the schema and the
+  repayment waterfall* but nothing populates it yet; a future product type
+  that needs periodic fees can use it without a migration.
+- **Interest is recognized on RECEIPT, not on accrual.** Interest income
+  hits the GL only as repayments come in. This is why write-off only
+  reverses outstanding *principal* — unpaid interest was never booked as
+  income, so there is nothing to reverse. If Module 8 (BOG provisioning)
+  or Module 9 needs accrual-basis interest income, that is a real change
+  to this posting model, not a tweak — see Open Questions.
+- **`loans` snapshots `interest_method` and `annual_interest_rate_bps`
+  from the product at application time** rather than reading the product
+  live, so editing a product later never retroactively alters existing
+  loans' terms.
+- **Restructuring versions the schedule** (`loan_schedules.schedule_version`,
+  `loans.current_schedule_version`): approval inserts a brand-new set of
+  rows at version N+1 re-amortizing the *currently outstanding* principal;
+  version N's rows and every repayment posted against them are never
+  touched. That is how "preserving the original schedule and all prior
+  repayment history for audit" is satisfied. Read schedules via
+  `getLoanSchedule({ loanId })` (current version) or pass an explicit
+  `scheduleVersion` for history.
+- **Group loans**: `loans.customer_id` points at the *group's own*
+  `customers` row (`customer_type = 'group'`, Module 2's design), and
+  `loan_group_liabilities` snapshots which individual members were jointly
+  liable **at disbursement** — group membership can change afterward
+  without silently shifting liability on an existing loan.
+- **Group default rule** (the spec asks for one but doesn't specify it —
+  this is the decided rule): if any *current* member of a group has a
+  `written_off` loan of their own, or is jointly liable on a written-off
+  group loan, the group cannot take new group credit.
+  `findGroupCreditBlockers()` returns the offending members (so the error
+  names them) and `applyForLoan()` enforces it. See Deviations.
+- **No `loan_approvals` table** — the shared `approval_requests` row IS
+  the maker-checker trail, exactly as Modules 1 and 2 decided for branch
+  and customer closure. See Deviations.
+- `loan_repayments` is append-only at the DB layer, with **one narrow
+  exception**: stamping `journal_entry_id` once, NULL -> value. Necessary
+  because `postJournalEntry()` owns its own transaction, so the entry id
+  doesn't exist yet when the repayment row is inserted. Every financial
+  field stays immutable, and the trigger verifies nothing else changed.
 
 ---
 
@@ -554,7 +742,36 @@ knowledge — plus any module prompt conflicts that need a human call._
       configured. Must be replaced with a real integration (endpoint,
       credentials, response mapping) before any bureau-lookup result is
       treated as real by Module 3 (loan appraisal) or shown to staff as
-      more than a placeholder.
+      more than a placeholder. **Module 3 deliberately did NOT make a
+      bureau lookup a precondition of loan approval** precisely because
+      the stub's output is meaningless — wire that in when the real
+      integration lands.
+- [ ] **Overdraft loans are not implemented.** `overdraft` is a valid
+      `loan_type` in the enum (the spec lists it), but nothing supports
+      it: an overdraft is drawn against a savings account, and Module 4
+      (Savings/Susu) doesn't exist yet. `applyForLoan()` will happily
+      create one and it will amortize like a term loan, which is NOT
+      overdraft behavior. Either build it properly with Module 4 or
+      reject `overdraft` at the application boundary until then.
+- [ ] **Interest is recognized on receipt, not accrual** (see the Loan
+      service section). This is a coherent, simple model for a
+      cash-basis microfinance book, but Module 8 (BOG prudential returns,
+      provisioning) and Module 9 (profitability) may require
+      accrual-basis interest income. Confirm the required basis with the
+      compliance officer **before** building Module 8 — retrofitting
+      accrual after loans are live means restating income.
+- [ ] **PAR buckets vs. BOG loan classification are different things.**
+      `loan_products.par_bucket_days` drives portfolio-management aging
+      (default 30/60/90). BOG's classification categories
+      (current/OLEM/substandard/doubtful/loss) and their days-past-due
+      boundaries are a Module 8 concern and must come from current
+      official BOG guidance — do NOT assume the PAR buckets double as
+      the regulatory thresholds.
+- [ ] **No `approval_thresholds` row exists for `loan.approve` either**,
+      so every loan approval currently accepts any user holding
+      `approval.decide` regardless of loan size. The table supports
+      amount-banded routing (`amount_pesewas` is already stamped on loan
+      approval requests) — decide the real bands with the business.
 
 ---
 
@@ -638,6 +855,36 @@ deliberately changed._
   bespoke closure table at all) — extend the shared approval-workflow
   service, don't duplicate its state. See the Customer service section
   under Shared Services.
+- **No `loan_approvals` table**, which the Module 3 prompt's data model
+  explicitly lists ("`loan_approvals` implementing maker-checker
+  (requested_by, approved_by, cannot be the same user)"). The shared
+  `approval_requests` row IS that record — same call Modules 1 and 2 made
+  for branch/customer closure, and the "cannot be the same user"
+  requirement is already enforced there at BOTH the app layer and by a DB
+  `CHECK` constraint. A per-module approvals table would duplicate that
+  state and risk the two disagreeing. `loan_restructures` DOES exist as
+  its own table, but only because it carries restructure-specific data
+  (old/new schedule version, new term/rate); it FKs to the
+  `approval_requests` row rather than duplicating its status.
+- **The group-default rule is invented, because the spec asks for one
+  without specifying it** ("Group loans need a rule for how one member's
+  default affects the group's ability to access further group credit").
+  Decided rule: any *current* member with a written-off loan (their own
+  or a group loan they were jointly liable on) blocks the whole group
+  from new group credit until resolved. Deliberately strict — solidarity
+  lending's whole premise is joint liability — but it is a **business
+  policy choice that should be confirmed**, not a derived requirement.
+  If the business wants something softer (a grace threshold, a
+  time-decay, manager override), change `findGroupCreditBlockers()`; the
+  named-members error message is designed so staff can see exactly who
+  is blocking.
+- **Fees are netted from disbursement rather than billed across
+  installments.** The spec says products have a "fee schedule" without
+  saying when fees are charged. Netting at disbursement is the common
+  microfinance practice and keeps the repayment schedule to pure
+  principal+interest. The schema and the repayment waterfall both already
+  support per-installment fees (`loan_schedules.fees_due_pesewas`) if a
+  future product needs them — nothing populates that column today.
 - **Customer `status: 'closed'` has no reactivation path**, unlike
   `branches.status: 'closed'` where the parallel doesn't even apply (both
   are terminal). This wasn't specified either way in the Module 2 prompt;

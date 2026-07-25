@@ -92,8 +92,12 @@ const CONTROL_ACCOUNT_CODES = {
   cashInHand: '1000',
   vault: '1010',
   transit: '1020',
+  loansReceivable: '1100', // added in Module 3
   income: '4000',
+  loanInterestIncome: '4010', // added in Module 3
+  loanFeeIncome: '4020', // added in Module 3
   expense: '5000',
+  loanLossExpense: '5100', // added in Module 3
 };
 
 async function getControlAccounts(db) {
@@ -104,13 +108,7 @@ async function getControlAccounts(db) {
   if (missing.length > 0) {
     throw new Error(`GL control accounts missing (run migrations): ${missing.join(', ')}`);
   }
-  return {
-    cashInHand: byCode[CONTROL_ACCOUNT_CODES.cashInHand],
-    vault: byCode[CONTROL_ACCOUNT_CODES.vault],
-    transit: byCode[CONTROL_ACCOUNT_CODES.transit],
-    income: byCode[CONTROL_ACCOUNT_CODES.income],
-    expense: byCode[CONTROL_ACCOUNT_CODES.expense],
-  };
+  return Object.fromEntries(Object.entries(CONTROL_ACCOUNT_CODES).map(([key, code]) => [key, byCode[code]]));
 }
 
 async function getBranchGlAccounts(db, branchId) {
@@ -125,8 +123,10 @@ async function getBranchGlAccounts(db, branchId) {
 
 /**
  * Create a branch and auto-generate its GL sub-accounts (cash-in-hand,
- * vault, income, expense), each bound to branch_id and parented to the
- * matching org-wide control account. Everything commits in one transaction.
+ * vault, income, expense, plus loans-receivable/loan-interest-income/
+ * loan-fee-income/loan-loss-expense added in Module 3), each bound to
+ * branch_id and parented to the matching org-wide control account.
+ * Everything commits in one transaction.
  */
 async function createBranch(pool, params) {
   const {
@@ -179,11 +179,27 @@ async function createBranch(pool, params) {
     const vaultAccount = await createSubAccount(controls.vault);
     const incomeAccount = await createSubAccount(controls.income);
     const expenseAccount = await createSubAccount(controls.expense);
+    const loansReceivableAccount = await createSubAccount(controls.loansReceivable);
+    const loanInterestIncomeAccount = await createSubAccount(controls.loanInterestIncome);
+    const loanFeeIncomeAccount = await createSubAccount(controls.loanFeeIncome);
+    const loanLossExpenseAccount = await createSubAccount(controls.loanLossExpense);
 
     await client.query(
-      `INSERT INTO branch_gl_accounts (branch_id, cash_in_hand_account_id, vault_account_id, income_account_id, expense_account_id)
-       VALUES ($1, $2, $3, $4, $5)`,
-      [branch.id, cashInHandAccount.id, vaultAccount.id, incomeAccount.id, expenseAccount.id]
+      `INSERT INTO branch_gl_accounts
+         (branch_id, cash_in_hand_account_id, vault_account_id, income_account_id, expense_account_id,
+          loans_receivable_account_id, loan_interest_income_account_id, loan_fee_income_account_id, loan_loss_expense_account_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [
+        branch.id,
+        cashInHandAccount.id,
+        vaultAccount.id,
+        incomeAccount.id,
+        expenseAccount.id,
+        loansReceivableAccount.id,
+        loanInterestIncomeAccount.id,
+        loanFeeIncomeAccount.id,
+        loanLossExpenseAccount.id,
+      ]
     );
 
     await client.query(
@@ -199,6 +215,10 @@ async function createBranch(pool, params) {
         vault: vaultAccount,
         income: incomeAccount,
         expense: expenseAccount,
+        loansReceivable: loansReceivableAccount,
+        loanInterestIncome: loanInterestIncomeAccount,
+        loanFeeIncome: loanFeeIncomeAccount,
+        loanLossExpense: loanLossExpenseAccount,
       },
     };
 

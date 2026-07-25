@@ -40,7 +40,18 @@ describeIfDb('Module 2: customer & CRM', () => {
     // accounts other test files depend on).
     await pool.query('TRUNCATE gl_journal_lines, gl_journal_entries RESTART IDENTITY CASCADE');
     await pool.query('TRUNCATE audit_log RESTART IDENTITY CASCADE');
+    // loan_repayments needs TRUNCATE — plain DELETE is blocked by its
+    // immutability trigger. Module 3's tables are cleared here (FK order:
+    // loans before customers/users) because loans FK to customers.
+    await pool.query('TRUNCATE loan_repayments RESTART IDENTITY CASCADE');
     for (const table of [
+      'loan_group_liabilities',
+      'loan_guarantors',
+      'loan_collateral',
+      'loan_restructures',
+      'loan_schedules',
+      'loans',
+      'loan_products',
       'account_closures',
       'credit_bureau_lookups',
       'customer_documents',

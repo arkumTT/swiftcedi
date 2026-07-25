@@ -45,13 +45,24 @@ describeIfDb('Module 1: branch management', () => {
     // omitted from the DELETE loop below.
     await pool.query('TRUNCATE gl_journal_lines, gl_journal_entries RESTART IDENTITY CASCADE');
     await pool.query('TRUNCATE audit_log RESTART IDENTITY CASCADE');
+    await pool.query('TRUNCATE loan_repayments RESTART IDENTITY CASCADE');
 
-    // Module 2 tables are cleared here too (in FK order, ending with
-    // `customers` before `users`/`approval_requests`) since
-    // account_closures now FKs to approval_requests — leaving Module 2 data
-    // behind would break this suite's plain `DELETE FROM approval_requests`
-    // whenever customerModule.test.js runs first in the same `npm test`.
+    // Module 2 and 3 tables are cleared here too (in FK order, ending with
+    // `customers` before `users`/`approval_requests`) since account_closures
+    // and loan_restructures FK to approval_requests, and loans/loan_products
+    // FK to customers/users — leaving that data behind would break this
+    // suite's plain `DELETE FROM users` / `DELETE FROM approval_requests`
+    // whenever another module's suite runs first in the same `npm test`.
+    // loan_repayments needs TRUNCATE (DELETE is blocked by its immutability
+    // trigger) and is handled above.
     for (const table of [
+      'loan_group_liabilities',
+      'loan_guarantors',
+      'loan_collateral',
+      'loan_restructures',
+      'loan_schedules',
+      'loans',
+      'loan_products',
       'account_closures',
       'credit_bureau_lookups',
       'customer_documents',

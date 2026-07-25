@@ -1,0 +1,190 @@
+'use strict';
+
+/**
+ * Pure loan math for Module 3 — no db, no side effects. Kept separate from
+ * loanService.js so the interest/schedule/allocation logic (the part the
+ * module spec explicitly calls out for dedicated unit tests) is trivially
+ * testable in isolation.
+ */
+
+/** Adds `months` to a 'YYYY-MM-DD' date string, clamping to the target month's last day on overflow (e.g. Jan 31 + 1 month -> Feb 28/29, not Mar 3). */
+function addMonthsToDateString(dateStr, months) {
+  const d = new Date(`${dateStr}T00:00:00Z`);
+  const originalDay = d.getUTCDate();
+  d.setUTCMonth(d.getUTCMonth() + months);
+  if (d.getUTCDate() !== originalDay) {
+    d.setUTCDate(0); // rolled into the month after target — snap back to target month's last day
+  }
+  return d.toISOString().slice(0, 10);
+}
+
+/**
+ * Flat-rate schedule: total interest = principal * annual_rate * (term/12),
+ * split evenly across installments. Both principal and interest have their
+ * rounding remainder absorbed by the LAST installment, so
+ * sum(principalDue) === principalPesewas and sum(interestDue) === the
+ * exact computed total interest — no drift regardless of term/rate.
+ */
+function generateFlatSchedule({ principalPesewas, termMonths, annualInterestRateBps, startDate }) {
+  const totalInterestPesewas = Math.round((principalPesewas * annualInterestRateBps * termMonths) / (12 * 10000));
+  const basePrincipal = Math.floor(principalPesewas / termMonths);
+  const baseInterest = Math.floor(totalInterestPesewas / termMonths);
+
+  const rows = [];
+  let principalAccum = 0;
+  let interestAccum = 0;
+  for (let i = 1; i <= termMonths; i++) {
+    const isLast = i === termMonths;
+    const principalDuePesewas = isLast ? principalPesewas - principalAccum : basePrincipal;
+    const interestDuePesewas = isLast ? totalInterestPesewas - interestAccum : baseInterest;
+    principalAccum += principalDuePesewas;
+    interestAccum += interestDuePesewas;
+    rows.push({ installmentNumber: i, dueDate: addMonthsToDateString(startDate, i), principalDuePesewas, interestDuePesewas });
+  }
+  return rows;
+}
+
+/**
+ * Reducing-balance (amortizing) schedule: a level monthly installment
+ * computed via the standard annuity formula, with interest each period
+ * calculated on the REMAINING balance (rounded to the nearest pesewa) and
+ * principal = installment - interest. The last installment always pays
+ * off whatever balance remains exactly (principalDue = balance), which is
+ * the anti-drift guarantee: sum(principalDue) === principalPesewas always,
+ * by construction, regardless of rounding anywhere else in the schedule —
+ * this is what the module spec's "must handle ... without drifting from
+ * the original schedule's total interest assumptions" requires.
+ */
+function generateReducingBalanceSchedule({ principalPesewas, termMonths, annualInterestRateBps, startDate }) {
+  const monthlyRate = annualInterestRateBps / 12 / 10000;
+
+  let installmentAmount;
+  if (monthlyRate === 0) {
+    installmentAmount = Math.round(principalPesewas / termMonths);
+  } else {
+    const factor = (1 + monthlyRate) ** termMonths;
+    installmentAmount = Math.round((principalPesewas * monthlyRate * factor) / (factor - 1));
+  }
+
+  const rows = [];
+  let balance = principalPesewas;
+  for (let i = 1; i <= termMonths; i++) {
+    const isLast = i === termMonths;
+    const interestDuePesewas = Math.round(balance * monthlyRate);
+    let principalDuePesewas = isLast ? balance : Math.min(installmentAmount - interestDuePesewas, balance);
+    if (principalDuePesewas < 0) principalDuePesewas = 0; // guard: pathological high-rate/short-remainder edge case
+    balance -= principalDuePesewas;
+    rows.push({ installmentNumber: i, dueDate: addMonthsToDateString(startDate, i), principalDuePesewas, interestDuePesewas });
+  }
+  return rows;
+}
+
+function generateLoanSchedule({ principalPesewas, termMonths, annualInterestRateBps, interestMethod, startDate }) {
+  if (!Number.isInteger(principalPesewas) || principalPesewas <= 0) {
+    throw new Error('principalPesewas must be a positive integer');
+  }
+  if (!Number.isInteger(termMonths) || termMonths <= 0) {
+    throw new Error('termMonths must be a positive integer');
+  }
+  if (!Number.isInteger(annualInterestRateBps) || annualInterestRateBps < 0) {
+    throw new Error('annualInterestRateBps must be a non-negative integer');
+  }
+  if (interestMethod === 'flat') {
+    return generateFlatSchedule({ principalPesewas, termMonths, annualInterestRateBps, startDate });
+  }
+  if (interestMethod === 'reducing_balance') {
+    return generateReducingBalanceSchedule({ principalPesewas, termMonths, annualInterestRateBps, startDate });
+  }
+  throw new Error(`unknown interestMethod '${interestMethod}'`);
+}
+
+/**
+ * Waterfall allocation of a repayment across ordered (oldest-first)
+ * outstanding schedule rows: fees, then interest, then principal per
+ * installment, spilling over to the next installment once one is fully
+ * covered. This is what keeps early/partial/late payments from ever
+ * requiring the schedule itself to be recalculated — installment amounts
+ * are fixed at generation time and this function only decides how a given
+ * payment covers them, so "the original schedule's total interest
+ * assumptions" never drift regardless of payment timing.
+ *
+ * @param {Array<{id, principalDuePesewas, principalPaidPesewas, interestDuePesewas, interestPaidPesewas, feesDuePesewas, feesPaidPesewas}>} scheduleRows
+ * @param {number} amountPesewas
+ * @returns {{ allocations: Array<{scheduleId, feesPaidPesewas, interestPaidPesewas, principalPaidPesewas}>, unallocatedPesewas: number }}
+ */
+function allocateRepayment(scheduleRows, amountPesewas) {
+  if (!Number.isInteger(amountPesewas) || amountPesewas <= 0) {
+    throw new Error('amountPesewas must be a positive integer');
+  }
+
+  let remaining = amountPesewas;
+  const allocations = [];
+
+  for (const row of scheduleRows) {
+    if (remaining <= 0) break;
+
+    const feesOutstanding = Math.max(row.feesDuePesewas - row.feesPaidPesewas, 0);
+    const interestOutstanding = Math.max(row.interestDuePesewas - row.interestPaidPesewas, 0);
+    const principalOutstanding = Math.max(row.principalDuePesewas - row.principalPaidPesewas, 0);
+    if (feesOutstanding === 0 && interestOutstanding === 0 && principalOutstanding === 0) continue;
+
+    const feesPaidPesewas = Math.min(remaining, feesOutstanding);
+    remaining -= feesPaidPesewas;
+    const interestPaidPesewas = Math.min(remaining, interestOutstanding);
+    remaining -= interestPaidPesewas;
+    const principalPaidPesewas = Math.min(remaining, principalOutstanding);
+    remaining -= principalPaidPesewas;
+
+    if (feesPaidPesewas > 0 || interestPaidPesewas > 0 || principalPaidPesewas > 0) {
+      allocations.push({ scheduleId: row.id, feesPaidPesewas, interestPaidPesewas, principalPaidPesewas });
+    }
+  }
+
+  return { allocations, unallocatedPesewas: remaining };
+}
+
+/** Total remaining principal across the given schedule rows. */
+function computeOutstandingPrincipalPesewas(scheduleRows) {
+  return scheduleRows.reduce((sum, row) => sum + (row.principalDuePesewas - row.principalPaidPesewas), 0);
+}
+
+/**
+ * Buckets a days-overdue count using ascending boundaries, e.g. [30,60,90]
+ * -> "1-30" / "31-60" / "61-90" / "90+". Returns null for daysOverdue <= 0
+ * (not overdue). These are configurable portfolio-management buckets, not
+ * BOG's prudential loan classification categories (see loan_products
+ * migration comment).
+ */
+function bucketArrearsDays(daysOverdue, bucketBoundaryDays) {
+  if (daysOverdue <= 0) return null;
+  const sorted = [...bucketBoundaryDays].sort((a, b) => a - b);
+  let lower = 1;
+  for (const boundary of sorted) {
+    if (daysOverdue <= boundary) return `${lower}-${boundary}`;
+    lower = boundary + 1;
+  }
+  return `${sorted[sorted.length - 1]}+`;
+}
+
+/**
+ * Sums a product's fee_schedule against a principal. Each fee is either
+ * `{ type: 'flat', amountPesewas }` or `{ type: 'percent_of_principal',
+ * rateBps }`. Fees are charged once, at disbursement, netted from the
+ * disbursed cash — see Decisions_Log.md.
+ */
+function computeFeesPesewas(feeSchedule, principalPesewas) {
+  return (feeSchedule || []).reduce((total, fee) => {
+    if (fee.type === 'flat') return total + (fee.amountPesewas || 0);
+    if (fee.type === 'percent_of_principal') return total + Math.round((principalPesewas * (fee.rateBps || 0)) / 10000);
+    throw new Error(`unknown fee type '${fee.type}'`);
+  }, 0);
+}
+
+module.exports = {
+  addMonthsToDateString,
+  generateLoanSchedule,
+  allocateRepayment,
+  computeOutstandingPrincipalPesewas,
+  bucketArrearsDays,
+  computeFeesPesewas,
+};
