@@ -46,7 +46,20 @@ describeIfDb('Module 1: branch management', () => {
     await pool.query('TRUNCATE gl_journal_lines, gl_journal_entries RESTART IDENTITY CASCADE');
     await pool.query('TRUNCATE audit_log RESTART IDENTITY CASCADE');
 
+    // Module 2 tables are cleared here too (in FK order, ending with
+    // `customers` before `users`/`approval_requests`) since
+    // account_closures now FKs to approval_requests — leaving Module 2 data
+    // behind would break this suite's plain `DELETE FROM approval_requests`
+    // whenever customerModule.test.js runs first in the same `npm test`.
     for (const table of [
+      'account_closures',
+      'credit_bureau_lookups',
+      'customer_documents',
+      'next_of_kin',
+      'group_members',
+      'groups',
+      'customer_branch_transfers',
+      'customers',
       'cross_branch_access_grants',
       'branch_staff_assignments',
       'branch_vault_configs',

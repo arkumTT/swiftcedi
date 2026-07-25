@@ -60,7 +60,11 @@ _Naming patterns adopted for the schema so later modules stay consistent
   review.
 - Status columns are `status VARCHAR(20)` with a `CHECK` constraint
   enumerating allowed values at the DB layer (not just app-layer
-  validation) — see "Status Enums & Lifecycle States" below.
+  validation) — see "Status Enums & Lifecycle States" below. Exception:
+  `customers.classification` (Module 2) is a free-form tag, not a
+  lifecycle status — deliberately NOT `CHECK`-constrained, since the spec
+  wants it usable as an open, admin-extensible segmentation filter by
+  other modules, not a closed enum.
 - Migrations live in `backend/src/db/migrations/`, named
   `NNN_description.sql`, applied in filename order and tracked in a
   `schema_migrations` table by `backend/src/db/migrate.js`. Each file is
@@ -103,7 +107,13 @@ authentication header, versioning approach._
   `/branches`, `/branches/regions`, `/branches/clusters`,
   `/branches/transfers`, `/branches/:id/status`,
   `/branches/:id/staff-assignments`, `/branches/:id/cross-branch-grants`,
-  `/branches/:id/performance`.
+  `/branches/:id/performance`, `/customers`, `/customers/:id/360`,
+  `/customers/:id/kyc-status`, `/customers/:id/closure-requests`,
+  `/customers/:id/branch-transfer`, `/customers/:id/documents`,
+  `/customers/:id/next-of-kin`, `/customers/:id/credit-bureau-lookups`,
+  `/groups`, `/groups/:id/members`, `/groups/:id/leader`,
+  `/account-closures/:id` (top-level — resolves a closure by its own id,
+  not nested under a customer, mirroring `getAccountClosure()`'s signature).
 - Route file ordering rule (see `backend/src/routes/branches.js`): every
   fixed-prefix path (`/regions`, `/clusters`, `/transfers`,
   `/performance/compare`) must be registered before the `/:id` catch-all,
@@ -154,6 +164,10 @@ values, loan status values, account status values._
 | `gl_journal_entries.status` | `posted`, `reversed` | 7 — a "reversed" entry keeps its original immutable lines; reversal is a separate new entry, never an edit |
 | `approval_requests.status` | `pending`, `approved`, `rejected`, `cancelled` | 11 |
 | `branch_transfers.status` | `pending`, `in_transit`, `completed`, `cancelled` | 1 — `initiateTransfer()` moves straight from insert to `in_transit` (posts the outbound GL entry synchronously); `pending` exists in the enum for a future draft/pre-posting state but nothing produces it yet |
+| `customers.status` | `active`, `inactive`, `closed` | 2 — `active`/`inactive` toggle directly (`customerService.isValidDirectStatusTransition()`); `closed` is only reachable via the maker-checker closure flow, never a direct transition, and is terminal (no reactivation path — see Open Questions) |
+| `customers.kyc_status` | `pending`, `verified`, `rejected` | 2 — no restrictive state machine; any value may follow any other (re-review after resubmission, or downgrading a verified customer if fraud surfaces later), just permission-gated and audited via `customerService.updateKycStatus()` |
+| `customers.customer_type` | `individual`, `group`, `sme` | 2 |
+| `credit_bureau_lookups.status` | `completed`, `failed` | 2 |
 
 **`branches.status` transition table** (`branchService.VALID_STATUS_TRANSITIONS`):
 
@@ -169,6 +183,15 @@ A branch cannot close directly from `active` — it must pass through
 prompt's literal "active -> suspended -> under-review -> closed" chain
 requires, but is a deliberate governance rail (closing is highest-impact
 and irreversible), not an oversight — see Deviations.
+
+`customers.status` is simpler: `active <-> inactive` freely
+(`customerService.deactivateCustomer`/`reactivateCustomer`, no approval),
+but `closed` is reachable ONLY via `requestClosure()` +
+`approvalWorkflow.decide()` (never a direct transition, mirroring how
+branch closure works), and is terminal — there is no reactivate-from-closed
+endpoint. If a real "unclose" business need shows up, add it as its own
+explicit, audited, probably-approval-gated action rather than folding it
+into `reactivateCustomer`.
 
 Follow this pattern for every future status column: app-layer values
 documented here **and** a DB `CHECK` constraint enumerating the same
@@ -232,7 +255,11 @@ registerExecutionHandler(actionType, handler(approvalRequest, db) -> Promise<voi
   (`branchService.registerBranchExecutionHandlers()`, called once at app
   startup in `app.js`) — any future module with an approval-gated action
   that needs to *do* something on approval should register a handler the
-  same way rather than building its own decide endpoint.
+  same way rather than building its own decide endpoint. **Module 2 reused
+  it as-is** for customer closure
+  (`customerService.registerCustomerExecutionHandlers()`, also called at
+  app startup) with zero further changes to `approvalWorkflow.js` needed —
+  the pattern held up on its second real consumer.
 - `backend/src/routes/approvals.js`'s `POST /:id/decide` now wraps `decide()`
   in its own transaction (`pool.connect()` + `BEGIN`/`COMMIT`/`ROLLBACK`) —
   this was a gap in the original Module 11 build (it passed the raw `pool`)
@@ -288,7 +315,12 @@ validateBalancedLines(lines) -> void  // pure, throws UnbalancedEntryError; no d
   `gl.manage_accounts`, `gl.post_journal`, `gl.view_reports`,
   `branch.create`, `branch.update`, `branch.change_status`,
   `branch.manage_staff`, `branch.manage_vault_config`, `branch.transfer`,
-  `branch.view_performance`. Add new codes via
+  `branch.view_performance`, `customer.create`, `customer.update`,
+  `customer.close`, `customer.reactivate` (also gates deactivate),
+  `customer.classify`, `customer.transfer_branch`,
+  `customer.manage_documents`, `customer.manage_next_of_kin`,
+  `customer.credit_bureau_lookup`, `customer.verify_kyc`,
+  `group.manage_members`. Add new codes via
   `POST /rbac/roles/:roleId/permissions`, not a new migration, unless you
   also need to seed a default grant.
 
@@ -349,6 +381,81 @@ getBranchPerformance(pool, { branchId, asOfDate }) -> Promise<metrics>
   `resolveBranchScope` (below) but checked against a path param instead of
   derived from `?branchId=`.
 
+### Customer service — `backend/src/modules/customer/customerService.js` (Module 2)
+
+Same status as the branch service above — Module 2's own business logic,
+documented here for later modules (3, 4, 5, 9, 10) that will read
+`customers`/`groups`/`group_members` rather than re-deriving the shape.
+
+```js
+createCustomer(pool, { customerType: 'individual'|'sme', branchId, fullName, ghanaCardNo?, businessRegistrationNo?, contactPersonName?, ..., createdBy }) -> Promise<customer row + priorClosedMatches[]>
+createGroup(pool, { name, branchId, formationDate?, createdBy }) -> Promise<group row + customer>
+addGroupMember / removeGroupMember / setGroupLeader(pool, { groupId, customerId, ...By }) -> Promise<row>
+updateKycStatus(pool, { customerId, kycStatus, actorId, notes? }) -> Promise<customer row>
+requestClosure(pool, { customerId, reasonCode, reasonNotes?, requestedBy }) -> Promise<account_closure row + approvalRequest>
+transferCustomerBranch(pool, { customerId, toBranchId, transferredBy, reason? }) -> Promise<customer row>
+lookupCreditBureau(pool, { customerId, requestedBy }) -> Promise<credit_bureau_lookups row>  // STUB, see below
+getCustomer360(pool, { customerId }) -> Promise<{ customer, documents, nextOfKin, creditBureauLookups, groupInfo, pendingModules }>
+```
+- **`customers` is one polymorphic table** for all three types
+  (`individual`/`group`/`sme`), not three separate tables — type-specific
+  columns (`ghana_card_no`, `date_of_birth`, `gender` for individual;
+  `business_registration_no`, `contact_person_name` for sme) are simply
+  nullable, validated per-type by `customerService.validateCustomerFields()`
+  (pure, exported, directly unit-tested). `createCustomer()` REJECTS
+  `customer_type: 'group'` — a group's `customers` row is only ever created
+  atomically alongside its `groups` row via `createGroup()`, so there's no
+  path to a `customer_type: 'group'` row without the group structure that
+  has to come with it.
+- **Ghana Card format**: `GHA-XXXXXXXXX-X`
+  (`customerService.validateGhanaCardNo()`, pure). Flagged in Open
+  Questions for verification against the current official NIA spec.
+- **Ghana Card uniqueness** is enforced by a partial unique index
+  (`customers_ghana_card_active_uq`, migration 015) covering
+  non-`closed` customers only — `createCustomer()` pre-checks for a clean
+  409 (`CustomerConflictError`) and also catches the DB's `23505` as a
+  race-condition backstop, both mapped to the same error. Matches on
+  **closed** customers are returned as `priorClosedMatches` on the created
+  customer (fraud review signal) rather than blocking creation — see the
+  Module 2 business rule this implements.
+- **`account_closures` does not duplicate `approval_requests`'s
+  requested_by/decided_by/status** — it has a `UNIQUE` FK to the
+  `approval_requests` row that IS the maker-checker record
+  (`approval_request_id`), and `getAccountClosure()` joins to surface
+  `approval_status`/`requested_by`/`decided_by` rather than risking two
+  copies disagreeing. Same reasoning as why branch closure doesn't have
+  its own status column either. The module spec's literal data model
+  ("`account_closures` with reason_code, requested_by, approved_by,
+  closure_date") is satisfied via the join, not by literal duplicate
+  columns — see Deviations.
+- **No timed cooling-off period is implemented** for closure beyond the
+  maker-checker approval step itself — the spec never states a specific
+  duration, and inventing one (e.g. "7 days") would be fabricating a
+  business rule CLAUDE.md's spirit says not to guess. See Open Questions.
+- **Group members must be individually KYC-verified** (`kyc_status =
+  'verified'`) before `addGroupMember()` will add them — the literal
+  enforcement of the Module 2 business rule "group members should be
+  individually KYC'd even though they borrow under a group structure."
+  Removing a member who is currently the group leader auto-clears
+  `groups.group_leader_id` (no group is left with a leader who isn't a
+  current member).
+- **Customer branch transfers resolve Module 1's Open Question** on how
+  "home branch" interacts with the branch-to-branch transfer workflow:
+  `customer_branch_transfers` (migration 019) is a separate, independent
+  table from Module 1's `branch_transfers` — the two never overlap
+  (`branch_transfers` is cash-in-transit only; this is customer-record
+  reassignment only, direct/audited, not maker-checker gated since it has
+  no direct financial impact by itself).
+- **Credit bureau lookup is a labeled STUB**
+  (`backend/src/modules/customer/creditBureauClient.js`) — deterministic
+  fake score derived from a hash of the customer's ID, `stub: true` always
+  present in the response, no real bureau contract configured. Must be
+  replaced before this goes near production; see Open Questions.
+- `getCustomer360()` follows the same honesty pattern as Module 1's branch
+  performance dashboard — loans/savings/susu/transaction history are
+  listed under `pendingModules` rather than faked, since Modules 3/4/5
+  don't exist yet.
+
 ---
 
 ## Branch Scoping Convention
@@ -408,17 +515,11 @@ knowledge — plus any module prompt conflicts that need a human call._
       into the request pipeline. Whoever builds the module that needs
       VIP-account restriction or time-windowed access must add that
       enforcement, not assume the table's existence means it's enforced.
-- [ ] **Customer-account transfers between branches are NOT built.** The
-      Module 1 prompt's "branch-to-branch transfers" requirement has two
-      halves: cash-in-transit (built — `branch_transfers`,
-      `initiateTransfer`/`confirmTransfer`/`cancelTransfer`) and moving a
-      customer's accounts from one branch to another with history
-      preserved (not built — there is no `customers` table yet, that's
-      Module 2). Module 2's own "BEFORE YOU WRITE CODE" note already flags
-      confirming this interaction with the Branch module; when Module 2
-      is built, design the customer-transfer workflow then, using
-      `branch_transfers` cash-in-transit as a reference pattern if it
-      fits, not by retrofitting this table to also carry customer data.
+- [x] ~~Customer-account transfers between branches are NOT built.~~
+      **Resolved in Module 2**: `customer_branch_transfers` (migration 019)
+      + `customerService.transferCustomerBranch()`. Independent of Module
+      1's `branch_transfers` (cash-in-transit only) — see the Customer
+      service section under Shared Services above.
 - [ ] `req.user.crossBranchAccessibleBranchIds` (Module 1) is loaded with
       a fresh DB query on every single request in `requireAuth`. Fine at
       current scale; if this becomes a hot path, consider caching it
@@ -430,7 +531,30 @@ knowledge — plus any module prompt conflicts that need a human call._
       approval from anyone holding `approval.decide`, not specifically a
       more senior role. Decide the real threshold/role policy per
       action_type as modules mature; don't assume NULL is a permanent
-      choice.
+      choice. This now also applies to `customer.close` (Module 2) —
+      same gap, same fix when addressed.
+- [ ] **Ghana Card format** (`GHA-XXXXXXXXX-X`,
+      `customerService.validateGhanaCardNo()`) is the publicly documented
+      NIA format, implemented from general knowledge rather than a cited
+      official spec. Not a BOG/GRA monetary figure, but still flagged for
+      verification before this blocks real customer onboarding — same
+      caution CLAUDE.md asks for regulation-dependent figures, applied to
+      an ID format instead.
+- [ ] **No specific closure cooling-off duration is implemented.** The
+      Module 2 spec says "a mandatory closure reason code and a
+      cooling-off/approval step before a closure is final" — implemented
+      as the maker-checker approval step alone (a different user must
+      decide). If product/compliance actually wants a literal time delay
+      (e.g. "closure can't be approved until N days after the request"),
+      the value of N is not specified anywhere in the spec and was not
+      guessed — get it from an actual requirement, then enforce it in
+      `requestClosure`/the `'customer.close'` execution handler.
+- [ ] **`creditBureauClient.js` is a hardcoded stub** — deterministic fake
+      score, `stub: true` always in the response, no real bureau
+      configured. Must be replaced with a real integration (endpoint,
+      credentials, response mapping) before any bureau-lookup result is
+      treated as real by Module 3 (loan appraisal) or shown to staff as
+      more than a placeholder.
 
 ---
 
@@ -496,3 +620,29 @@ deliberately changed._
   approval trail for transfers specifically (the GL journal entries
   themselves are still a full, immutable audit trail of what moved and
   when).
+- **`customers` is one polymorphic table for individual/group/sme**, not
+  three type-specific tables — the module prompt's own data model
+  ("`customers` table: id, customer_type ...") reads as a single table
+  too, so this isn't really a deviation so much as a confirmation, but
+  it's called out because the alternative (per-type tables with a shared
+  parent) is a common enough pattern that a future session might
+  "refactor" toward it without realizing the single-table design was
+  deliberate — the join-heavy queries every other module will run
+  (Customer 360, group membership, loan/savings eligibility checks) are
+  simpler against one table.
+- **`account_closures` doesn't literally match the spec's column list**
+  ("reason_code, requested_by, approved_by, closure_date") — it has
+  `reason_code`/`closure_date` but gets `requested_by`/`approved_by`/
+  status via a `UNIQUE` FK join to `approval_requests` instead of storing
+  them twice. Same reasoning as Module 1's branch closure (which has no
+  bespoke closure table at all) — extend the shared approval-workflow
+  service, don't duplicate its state. See the Customer service section
+  under Shared Services.
+- **Customer `status: 'closed'` has no reactivation path**, unlike
+  `branches.status: 'closed'` where the parallel doesn't even apply (both
+  are terminal). This wasn't specified either way in the Module 2 prompt;
+  chosen for consistency with the branch closure precedent and because
+  "unclosing" a customer account is a big enough decision to deserve its
+  own explicit workflow if it's ever needed, not a side effect of the
+  existing reactivate endpoint. See Open Questions if this needs
+  revisiting.
