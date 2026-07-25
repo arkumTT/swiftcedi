@@ -9,14 +9,35 @@ const auditLog = require('./auditLog');
  * Decisions_Log.md "Shared Services".
  *
  * Callers are expected to pass a `db` that is a single pg Client/PoolClient
- * already inside a transaction (BEGIN'd by the caller) when `decide()` is
- * given an `execute` callback, so the approval decision and the side effect
- * it authorizes (e.g. a GL posting) commit or roll back together.
+ * already inside a transaction (BEGIN'd by the caller) whenever `decide()`
+ * may run an execute side effect (an explicit `execute` param, or an
+ * action_type with a registered handler), so the approval decision and the
+ * side effect it authorizes (e.g. a GL posting) commit or roll back
+ * together. `backend/src/routes/approvals.js` does this for the generic
+ * HTTP endpoint.
  */
 
 class ApprovalValidationError extends Error {}
 class ApprovalNotFoundError extends Error {}
 class MakerCheckerViolationError extends Error {}
+
+/**
+ * Registry of action_type -> execute handler, so the ONE generic
+ * `POST /approvals/:id/decide` HTTP endpoint can trigger a module-specific
+ * side effect on approval without that module reimplementing its own
+ * decide endpoint (which would mean duplicating the maker-checker HTTP
+ * plumbing per module). A module registers its handler once at startup;
+ * `decide()` looks it up by the request's `action_type` when the caller
+ * doesn't pass an explicit `execute` (an explicit `execute` always wins —
+ * this is what the unit tests exercise directly, without touching the
+ * registry). See Decisions_Log.md "Shared Services" for the Module 1
+ * addition this enabled (branch closure).
+ */
+const executionHandlers = new Map();
+
+function registerExecutionHandler(actionType, handler) {
+  executionHandlers.set(actionType, handler);
+}
 
 /**
  * Look up the approval threshold that applies to an action, preferring a
@@ -118,9 +139,13 @@ async function requestApproval(db, params) {
  * @param {number} params.decidedBy
  * @param {'approved'|'rejected'} params.decision
  * @param {string} [params.reason]
- * @param {(approvalRequest: object) => Promise<void>} [params.execute] -
+ * @param {(approvalRequest: object, db) => Promise<void>} [params.execute] -
  *   invoked only when decision === 'approved', for the caller to perform
  *   the side effect the approval authorizes (e.g. post the GL entry).
+ *   Receives the same `db` client `decide()` was called with, so it can run
+ *   further queries in the same transaction. If omitted, falls back to a
+ *   handler registered for this request's `action_type` via
+ *   `registerExecutionHandler()`, if any.
  */
 async function decide(db, { approvalId, decidedBy, decision, reason = null, execute = null }) {
   if (!approvalId || !decidedBy) {
@@ -166,8 +191,9 @@ async function decide(db, { approvalId, decidedBy, decision, reason = null, exec
   );
   const updated = rows[0];
 
-  if (decision === 'approved' && typeof execute === 'function') {
-    await execute(updated);
+  const handler = execute || executionHandlers.get(existing.action_type);
+  if (decision === 'approved' && typeof handler === 'function') {
+    await handler(updated, db);
   }
 
   await auditLog.record(db, {
@@ -188,6 +214,7 @@ module.exports = {
   decide,
   getApplicableThreshold,
   isApprovalRequired,
+  registerExecutionHandler,
   ApprovalValidationError,
   ApprovalNotFoundError,
   MakerCheckerViolationError,

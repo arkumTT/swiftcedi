@@ -15,15 +15,30 @@ _Exact GL account codes and structure, once finalized in Module 7 — e.g.,
 cash-in-hand account numbering scheme, per-branch account code pattern,
 income/expense account ranges._
 
-The `gl_accounts` table and `postJournalEntry()` interface are built
-(Module 7 shared infra), but the actual chart-of-accounts numbering scheme
-(code ranges per account type, per-branch sub-account pattern) is **not**
-decided — that's Module 1's "auto-generate branch-specific GL sub-accounts"
-requirement and should be settled when Module 1 is built, not guessed here.
+Finalized in Module 1 (migration 009_gl_control_accounts.sql):
 
 | Code Range | Category | Notes |
 |---|---|---|
-| _TBD — Module 1_ | _TBD_ | `gl_accounts.account_type` enum itself is decided (see below); numbering scheme is not |
+| 1000-1999 | Asset | Org-wide controls seeded: `1000` Cash in Hand, `1010` Vault Cash, `1020` Cash in Transit |
+| 2000-2999 | Liability | None seeded yet — no module has needed one |
+| 3000-3999 | Equity | None seeded yet |
+| 4000-4999 | Income | Org-wide control seeded: `4000` Operating Income |
+| 5000-5999 | Expense | Org-wide control seeded: `5000` Operating Expense |
+
+Branch sub-account pattern: on branch creation, `branchService.createBranch()`
+auto-generates 4 sub-accounts (cash-in-hand, vault, income, expense) coded
+`<control_code>.<branch_code>` (e.g. `1000.NRA-01`), each with
+`branch_id` = the new branch and `parent_account_id` = the matching
+org-wide control row — so a consolidated report can roll sub-accounts up to
+their control account by `parent_account_id`, and a branch report can
+filter `gl_accounts.branch_id`. **This is why branch codes are capped at 10
+characters** (enforced by `branches_code_shape_chk` and
+`branchService.validateBranchCode()`) — the composed code must fit
+`gl_accounts.code`'s `VARCHAR(20)`.
+
+Liability/equity control accounts aren't seeded yet — add them (and this
+row) when a module first needs one (e.g. Module 4 for a customer-deposits
+liability control, or Module 5 for investor equity).
 
 ---
 
@@ -51,13 +66,23 @@ _Naming patterns adopted for the schema so later modules stay consistent
   `schema_migrations` table by `backend/src/db/migrate.js`. Each file is
   additive (no down-migrations for this build) — a wrong migration gets a
   new corrective migration, not an edited history.
-- **`branches` is currently a stub** (`id, code, name, status,
-  created_at, updated_at`), created in Module 11/7's migrations only so
-  every other table can carry a real `branch_id` FK immediately. Module 1
-  will `ALTER TABLE branches` to add `region_id`, `cluster_id`, `address`,
-  `gps_lat`, `gps_lng`, `opening_date`, `operating_hours`, `licence_ref` —
-  it must not `DROP`/recreate the table, since `users`, `gl_accounts`,
-  `audit_log`, etc. already reference `branches.id`.
+- **`branches`** started as a stub in Module 11/7's migrations (just `id,
+  code, name, status, created_at, updated_at`) so every other table could
+  carry a real `branch_id` FK immediately. Module 1 (migration
+  010_branch_hierarchy.sql) `ALTER TABLE`'d it to add `region_id`,
+  `cluster_id`, `address`, `gps_lat`, `gps_lng`, `opening_date`,
+  `operating_hours`, `licence_ref` — it did NOT drop/recreate the table,
+  since `users`, `gl_accounts`, `audit_log`, etc. already referenced
+  `branches.id`. Any future module adding branch fields should extend the
+  same table the same way, not create a parallel `branch_details` table.
+- **Branch codes**: `VARCHAR(20)`, but constrained to 2-10 chars,
+  uppercase letters/digits/hyphens (`branches_code_shape_chk`,
+  `branchService.validateBranchCode()`) — see "Chart of Accounts" above
+  for why the 10-char cap exists. Immutable once the branch has any GL
+  activity (`branchService.updateBranch()` checks `gl_journal_lines` for
+  the branch before allowing a code change; enforced at the application
+  layer only, not the DB, since "has any journal line" isn't a static
+  constraint).
 - Head office is modeled as a real branch, seeded as `branches` row with
   `code = 'HQ'` — per the Module 1 prompt's "even if head office is
   modeled as a branch itself." Use this row's id, not `NULL`, when a
@@ -74,7 +99,27 @@ authentication header, versioning approach._
 - Resource paths are plural, kebab/lower-case, mounted at the app root
   (no `/api/v1` prefix yet — add versioning when a breaking change is
   actually needed, not preemptively): `/rbac/roles`, `/rbac/users`,
-  `/audit-log`, `/approvals`, `/gl/accounts`, `/gl/journal-entries`.
+  `/audit-log`, `/approvals`, `/gl/accounts`, `/gl/journal-entries`,
+  `/branches`, `/branches/regions`, `/branches/clusters`,
+  `/branches/transfers`, `/branches/:id/status`,
+  `/branches/:id/staff-assignments`, `/branches/:id/cross-branch-grants`,
+  `/branches/:id/performance`.
+- Route file ordering rule (see `backend/src/routes/branches.js`): every
+  fixed-prefix path (`/regions`, `/clusters`, `/transfers`,
+  `/performance/compare`) must be registered before the `/:id` catch-all,
+  or Express will match e.g. `GET /branches/performance/compare` as
+  `GET /branches/:id` with `id="performance"`.
+- Error handling: custom error classes may set `err.statusCode` (e.g.
+  `BranchValidationError` → 400, `BranchNotFoundError` → 404,
+  `BranchImmutableCodeError`/`InvalidStatusTransitionError`/
+  `BranchReconciliationError` → 409); `app.js`'s final error handler uses
+  `err.statusCode` if present, else 500. Older routes (rbac/gl/approvals)
+  still use explicit `instanceof` checks per error type — both patterns
+  coexist; new routes should prefer the `statusCode` property since it
+  needs no route-level knowledge of every module's error classes (this is
+  what let the generic `POST /approvals/:id/decide` endpoint surface a
+  `BranchReconciliationError` thrown deep inside a registered execution
+  handler as a clean 409 without approvals.js importing branchService).
 - Auth: `Authorization: Bearer <token>` header, token obtained from
   `POST /auth/login` (`{ email, password }` → `{ token }`). See "Open
   Questions" — this session's session store is an in-memory placeholder,
@@ -100,7 +145,7 @@ values, loan status values, account status values._
 
 | Entity | Status Values | Module |
 |---|---|---|
-| `branches.status` | `active`, `suspended`, `under_review`, `closed` | 1 (values taken from the Module 1 prompt's lifecycle; enforced now via a `branches` stub CHECK constraint since Module 11/7 needed the column to exist) |
+| `branches.status` | `active`, `suspended`, `under_review`, `closed` | 1. **Not a free graph** — see the transition table below; `CHECK` constraint enumerates the values but the DB doesn't (can't easily) enforce which transitions are legal, so `branchService.isValidStatusTransition()` does |
 | `users.status` | `active`, `suspended`, `disabled` | 11 |
 | `gl_accounts.status` | `active`, `inactive` | 7 |
 | `gl_accounts.account_type` | `asset`, `liability`, `equity`, `income`, `expense` | 7 |
@@ -108,6 +153,22 @@ values, loan status values, account status values._
 | `gl_journal_entries.entry_type` | `standard`, `prior_period_adjustment` | 7 — only `prior_period_adjustment` may post into a locked period |
 | `gl_journal_entries.status` | `posted`, `reversed` | 7 — a "reversed" entry keeps its original immutable lines; reversal is a separate new entry, never an edit |
 | `approval_requests.status` | `pending`, `approved`, `rejected`, `cancelled` | 11 |
+| `branch_transfers.status` | `pending`, `in_transit`, `completed`, `cancelled` | 1 — `initiateTransfer()` moves straight from insert to `in_transit` (posts the outbound GL entry synchronously); `pending` exists in the enum for a future draft/pre-posting state but nothing produces it yet |
+
+**`branches.status` transition table** (`branchService.VALID_STATUS_TRANSITIONS`):
+
+| From \ To | active | suspended | under_review | closed |
+|---|---|---|---|---|
+| active | — | ✅ | ✅ | ❌ |
+| suspended | ✅ | — | ✅ | ✅ |
+| under_review | ✅ | ✅ | — | ✅ |
+| closed | ❌ | ❌ | ❌ | — (terminal) |
+
+A branch cannot close directly from `active` — it must pass through
+`suspended` or `under_review` first. This reads stricter than the Module 1
+prompt's literal "active -> suspended -> under-review -> closed" chain
+requires, but is a deliberate governance rail (closing is highest-impact
+and irreversible), not an oversight — see Deviations.
 
 Follow this pattern for every future status column: app-layer values
 documented here **and** a DB `CHECK` constraint enumerating the same
@@ -152,15 +213,35 @@ requestApproval(db, { actionType, entityType, entityId, branchId, requestedBy, a
 decide(db, { approvalId, decidedBy, decision: 'approved'|'rejected', reason, execute }) -> Promise<approval_request row>
 getApplicableThreshold(db, { actionType, branchId }) -> Promise<approval_thresholds row | null>
 isApprovalRequired(threshold, amountPesewas) -> boolean   // pure, no db
+registerExecutionHandler(actionType, handler(approvalRequest, db) -> Promise<void>) -> void   // added in Module 1, see below
 ```
 - `requestApproval` always creates a row (status `pending`); it does NOT
   decide for you whether approval is needed for this specific call — check
   `isApprovalRequired(await getApplicableThreshold(...), amount)` first if
   your module wants to skip the workflow below a threshold.
-- `decide`'s `execute` callback runs only on `decision === 'approved'`, so
-  the caller performs the authorized side effect (e.g. calling
-  `glPosting.postJournalEntry`) from inside it — pass the same `db` client
-  through so approval + side effect commit together.
+- `decide`'s `execute` callback runs only on `decision === 'approved'` and
+  receives `(approvalRequest, db)` — `db` is the SAME client `decide()` was
+  called with, so the callback can run further queries in the same
+  transaction without closing over anything from outside. Pass an explicit
+  `execute` when calling `decide()` directly from code; **if you omit it**,
+  `decide()` falls back to whatever handler was registered for this
+  request's `action_type` via `registerExecutionHandler()` — this is what
+  lets the ONE generic `POST /approvals/:id/decide` HTTP endpoint trigger a
+  module-specific side effect (an HTTP handler can't accept a JS callback).
+  **Added in Module 1** for branch closure
+  (`branchService.registerBranchExecutionHandlers()`, called once at app
+  startup in `app.js`) — any future module with an approval-gated action
+  that needs to *do* something on approval should register a handler the
+  same way rather than building its own decide endpoint.
+- `backend/src/routes/approvals.js`'s `POST /:id/decide` now wraps `decide()`
+  in its own transaction (`pool.connect()` + `BEGIN`/`COMMIT`/`ROLLBACK`) —
+  this was a gap in the original Module 11 build (it passed the raw `pool`)
+  that only mattered once an execute handler could run real side effects
+  needing atomicity with the decision; fixed in Module 1 since branch
+  closure needed it. If an execute handler throws (e.g. reconciliation
+  fails again at decide-time), the whole transaction rolls back, so the
+  approval request reverts to `pending` rather than getting stuck
+  "approved but not applied."
 - Maker-checker (`decidedBy !== requestedBy`) is enforced both here (throws
   `MakerCheckerViolationError`) and by a DB `CHECK` constraint on
   `approval_requests` as defense in depth — do not remove either.
@@ -204,9 +285,69 @@ validateBalancedLines(lines) -> void  // pure, throws UnbalancedEntryError; no d
   and `resolveBranchScope(req)` (see Branch Scoping Convention).
 - Permission codes seeded so far: `audit.view`, `approval.request`,
   `approval.decide`, `rbac.manage_roles`, `rbac.manage_users`,
-  `gl.manage_accounts`, `gl.post_journal`, `gl.view_reports`. Add new codes
-  via `POST /rbac/roles/:roleId/permissions`, not a new migration, unless
-  you also need to seed a default grant.
+  `gl.manage_accounts`, `gl.post_journal`, `gl.view_reports`,
+  `branch.create`, `branch.update`, `branch.change_status`,
+  `branch.manage_staff`, `branch.manage_vault_config`, `branch.transfer`,
+  `branch.view_performance`. Add new codes via
+  `POST /rbac/roles/:roleId/permissions`, not a new migration, unless you
+  also need to seed a default grant.
+
+### Branch service — `backend/src/modules/branch/branchService.js` (Module 1)
+
+Not a "shared service" other modules call into (unlike the three above) —
+this is Module 1's own business logic, listed here because later modules
+(2, 3, 4, 6, 9, 10) will read `branches`/`branch_gl_accounts`/
+`branch_staff_assignments` and should know the real shape rather than
+re-deriving it from the migrations.
+
+```js
+createBranch(pool, { code, name, regionId, clusterId, address, gpsLat, gpsLng, openingDate, operatingHours, licenceRef, openingFloatPesewas, dailyCashLimitPesewas, createdBy }) -> Promise<branch row + glAccounts>
+updateBranch(pool, { branchId, updatedBy, fields }) -> Promise<branch row>
+changeBranchStatus(pool, { branchId, toStatus, requestedBy, reason }) -> Promise<branch row | pending approval_request row>
+assignStaff(pool, { branchId, userId, assignedBy }) -> Promise<{ assignment, user }>
+grantCrossBranchAccess(pool, { userId, branchId, startDate, endDate, grantedBy }) -> Promise<grant row>
+initiateTransfer / confirmTransfer / cancelTransfer(pool, {...}) -> Promise<branch_transfer row>
+getBranchPerformance(pool, { branchId, asOfDate }) -> Promise<metrics>
+```
+- `changeBranchStatus` is the one function with a split return type: for
+  `toStatus !== 'closed'` it applies immediately and returns the updated
+  branch; for `toStatus === 'closed'` it runs the GL-reconciliation check
+  (`assertZeroBalances` — cash-in-hand and vault must both be exactly 0)
+  and, if that passes, calls `approvalWorkflow.requestApproval()` and
+  returns the **pending approval request**, not an updated branch — the
+  branch doesn't actually close until a different user approves it via
+  `POST /approvals/:id/decide`, which dispatches to
+  `closeBranchOnApproval()` (registered as the `'branch.close'` execution
+  handler). If reconciliation fails, it throws
+  `BranchReconciliationError` immediately — no approval request is ever
+  created for a branch that can't reconcile, so there's nothing to clean
+  up or "expire."
+- `assignStaff` closes any existing open (`end_date IS NULL`)
+  `branch_staff_assignments` row for the user, inserts a new open row, and
+  updates `users.home_branch_id` to match — that column (Module 11) stays
+  the live/current pointer everywhere else in the app; this table is
+  purely the history of how it got there.
+- Cross-branch access grants "expire automatically" per the Module 11
+  prompt's requirement — checked lazily (`branchService.isGrantActive()`,
+  and `requireAuth` middleware loading a user's currently-active grants
+  onto `req.user.crossBranchAccessibleBranchIds` on every request) rather
+  than by a background job, since Module 12 (scheduler) doesn't exist yet.
+  See Open Questions.
+- Cash-in-transit transfers (`initiateTransfer`/`confirmTransfer`/
+  `cancelTransfer`) are NOT approval-gated through `approval_requests` —
+  the source-initiates / destination-confirms two-step *is* the dual
+  control (different branch, typically different staff). See Deviations
+  for why this was a deliberate choice rather than an oversight.
+- `getBranchPerformance` only returns metrics computable from what's
+  built so far (cash position, income/expense/net from GL, headcount from
+  staff assignments) — loan/deposit-derived metrics (portfolio size, PAR,
+  total deposits) are listed under a `pendingMetrics` array rather than
+  faked, since Modules 3/4/9 don't exist yet.
+- Branch-scoped read endpoints (`GET /branches/:id/performance`,
+  `GET /branches/performance/compare`) use
+  `requirePermission.canAccessBranch(req, branchId)` — same access rule as
+  `resolveBranchScope` (below) but checked against a path param instead of
+  derived from `?branchId=`.
 
 ---
 
@@ -217,19 +358,27 @@ scoping, row-level security, or application-layer filtering — decided
 once and applied everywhere._
 
 - Application-layer filtering (not Postgres row-level security) via
-  `resolveBranchScope(req)` in `backend/src/middleware/requirePermission.js`.
+  `resolveBranchScope(req)` (query-param-scoped endpoints) and
+  `canAccessBranch(req, branchId)` (path-param-scoped endpoints), both in
+  `backend/src/middleware/requirePermission.js`.
 - Default: every request is scoped to `req.user.homeBranchId`.
-- Only roles in `CROSS_BRANCH_ROLES` (currently `owner`, `system_admin`)
-  may override this with an explicit `?branchId=` query param. Any other
-  role's `?branchId=` is silently ignored — they always get their own
-  branch, so an API client can't escalate scope by editing the query
-  string themselves.
+- Roles in `CROSS_BRANCH_ROLES` (currently `owner`, `system_admin`) may
+  access any branch.
+- **Updated in Module 1**: any other role may also access a branch it
+  holds an active `cross_branch_access_grants` row for (time-bound,
+  revocable — Module 1's `grantCrossBranchAccess`/`revokeCrossBranchAccess`).
+  `requireAuth` middleware (`backend/src/middleware/auth.js`) loads a
+  user's currently-active grant branch ids onto
+  `req.user.crossBranchAccessibleBranchIds` on every request (a fresh DB
+  query each time — see Open Questions on caching), so `resolveBranchScope`/
+  `canAccessBranch` can check it synchronously with no extra query.
+  Otherwise the request falls back to `req.user.homeBranchId` — a
+  non-privileged role's `?branchId=` for a branch it has neither the home
+  branch nor an active grant for is silently ignored (query-param version)
+  or 403s (path-param version via `canAccessBranch`), so an API client
+  can't escalate scope by editing the query string or path.
 - This mirrors the CLAUDE.md rule that permission/scope checks happen
-  server-side, never trusting the frontend. Full cross-branch access
-  grants (time-bound, revocable, per Module 1's staff-assignment spec) are
-  NOT built yet — `CROSS_BRANCH_ROLES` is a role-level allowlist only, a
-  placeholder until Module 1's `cross_branch_access_grants` table exists.
-  Revisit this function when that lands.
+  server-side, never trusting the frontend.
 
 ---
 
@@ -259,6 +408,29 @@ knowledge — plus any module prompt conflicts that need a human call._
       into the request pipeline. Whoever builds the module that needs
       VIP-account restriction or time-windowed access must add that
       enforcement, not assume the table's existence means it's enforced.
+- [ ] **Customer-account transfers between branches are NOT built.** The
+      Module 1 prompt's "branch-to-branch transfers" requirement has two
+      halves: cash-in-transit (built — `branch_transfers`,
+      `initiateTransfer`/`confirmTransfer`/`cancelTransfer`) and moving a
+      customer's accounts from one branch to another with history
+      preserved (not built — there is no `customers` table yet, that's
+      Module 2). Module 2's own "BEFORE YOU WRITE CODE" note already flags
+      confirming this interaction with the Branch module; when Module 2
+      is built, design the customer-transfer workflow then, using
+      `branch_transfers` cash-in-transit as a reference pattern if it
+      fits, not by retrofitting this table to also carry customer data.
+- [ ] `req.user.crossBranchAccessibleBranchIds` (Module 1) is loaded with
+      a fresh DB query on every single request in `requireAuth`. Fine at
+      current scale; if this becomes a hot path, consider caching it
+      alongside the session rather than joining on every request — not
+      done now because there's no evidence yet it needs to be.
+- [ ] No `approval_thresholds` row exists for `branch.close` (or any
+      action_type yet) — every branch closure request currently has
+      `required_approver_role_id = NULL`, meaning `decide()` accepts
+      approval from anyone holding `approval.decide`, not specifically a
+      more senior role. Decide the real threshold/role policy per
+      action_type as modules mature; don't assume NULL is a permanent
+      choice.
 
 ---
 
@@ -293,3 +465,34 @@ deliberately changed._
   end-to-end, so a minimal login/session flow was added
   (`POST /auth/login`, in-memory bearer tokens). See Open Questions —
   this is explicitly a placeholder, not a considered auth design.
+- **Module 1's own "BEFORE YOU WRITE CODE" note names "Module 6" for the
+  GL counterpart to confirm account types against** — that's a numbering
+  inconsistency in `SwiftCedi_Module_Build_Prompts.md` itself (Module 6 is
+  Cashier/Till/Vault; the actual GL module is Section 7, "GL, Accounting &
+  Financial Reporting," per the same document's own numbering and table of
+  contents). Treated "the GL module" as Module 7 throughout — i.e. used
+  the real `gl_accounts`/`postJournalEntry()` built in this repo's Module
+  7 session, not a nonexistent "Module 6 GL." A couple of other module
+  prompts (e.g. Module 6 Cashier's own "BEFORE YOU WRITE CODE") have the
+  same "Module 6's GL counterpart" phrasing — same resolution applies
+  there when that module gets built.
+- **`branches.status` closure requires passing through `suspended` or
+  `under_review` first** (`branchService.VALID_STATUS_TRANSITIONS`) — the
+  prompt's literal lifecycle text ("active -> suspended -> under-review ->
+  closed") reads as a chain, but doesn't explicitly forbid closing
+  directly from active. Interpreted it as a chain deliberately: closure is
+  the one irreversible, highest-impact transition, and forcing a stop at
+  `suspended`/`under_review` first is a reasonable governance rail for a
+  banking platform. If a future session decides direct active->closed
+  should be legal after all, change
+  `VALID_STATUS_TRANSITIONS.active` — don't work around it per-caller.
+- **Cash-in-transit branch transfers are not routed through
+  `approval_requests`**, unlike every other financial-impact action in
+  this codebase so far. The source branch initiates (posts the outbound
+  leg) and the destination branch confirms (posts the inbound leg) — two
+  different actors, naturally providing dual control without a formal
+  maker-checker record. This was a deliberate scope call, not an
+  oversight: revisit if a future compliance requirement wants an explicit
+  approval trail for transfers specifically (the GL journal entries
+  themselves are still a full, immutable audit trail of what moved and
+  when).

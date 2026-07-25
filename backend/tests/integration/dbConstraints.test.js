@@ -37,10 +37,14 @@ describeIfDb('database-layer guarantees', () => {
     await client.connect();
 
     // Clean slate: financial tables are append-only in the app layer, but
-    // the test db is disposable, so TRUNCATE ... CASCADE is fine here.
-    await client.query(
-      'TRUNCATE gl_journal_lines, gl_journal_entries, approval_requests, audit_log, users, gl_accounts RESTART IDENTITY CASCADE'
-    );
+    // the test db is disposable, so TRUNCATE ... CASCADE is fine here for
+    // the tables this suite owns. gl_accounts is deliberately NOT truncated
+    // — it holds the org-wide GL control accounts migration 009 seeds
+    // (1000/1010/1020/4000/5000), which tests/integration/branchModule.test.js
+    // also depends on; this suite reuses those rows below instead of
+    // truncating and re-seeding a partial set that would break test-file
+    // ordering within the same `npm test` run.
+    await client.query('TRUNCATE gl_journal_lines, gl_journal_entries, approval_requests, audit_log, users RESTART IDENTITY CASCADE');
 
     const { rows: branchRows } = await client.query("SELECT id FROM branches WHERE code = 'HQ'");
     branchId = branchRows[0].id;
@@ -56,11 +60,9 @@ describeIfDb('database-layer guarantees', () => {
     );
     [makerId, checkerId] = userRows.map((r) => r.id);
 
-    const { rows: acctRows } = await client.query(
-      `INSERT INTO gl_accounts (code, name, account_type) VALUES ('1000', 'Cash in Hand', 'asset'), ('4000', 'Interest Income', 'income')
-       RETURNING id`
-    );
-    [cashAccountId, incomeAccountId] = acctRows.map((r) => r.id);
+    const { rows: acctRows } = await client.query("SELECT id, code FROM gl_accounts WHERE code IN ('1000', '4000')");
+    cashAccountId = acctRows.find((r) => r.code === '1000').id;
+    incomeAccountId = acctRows.find((r) => r.code === '4000').id;
   });
 
   afterAll(async () => {

@@ -4,6 +4,7 @@ const {
   isApprovalRequired,
   requestApproval,
   decide,
+  registerExecutionHandler,
   ApprovalValidationError,
   ApprovalNotFoundError,
   MakerCheckerViolationError,
@@ -137,7 +138,7 @@ describe('decide', () => {
     const result = await decide(db, { approvalId: 1, decidedBy: 2, decision: 'approved', execute });
 
     expect(result).toBe(updated);
-    expect(execute).toHaveBeenCalledWith(updated);
+    expect(execute).toHaveBeenCalledWith(updated, db);
     expect(db.query).toHaveBeenCalledTimes(3);
   });
 
@@ -157,5 +158,45 @@ describe('decide', () => {
     await decide(db, { approvalId: 1, decidedBy: 2, decision: 'rejected', reason: 'insufficient collateral', execute });
 
     expect(execute).not.toHaveBeenCalled();
+  });
+
+  test('dispatches to a handler registered for the request action_type when no explicit execute is given', async () => {
+    const existing = {
+      id: 1,
+      requested_by: 7,
+      status: 'pending',
+      required_approver_role_id: null,
+      action_type: 'branch.close.test',
+      branch_id: 1,
+    };
+    const updated = { ...existing, status: 'approved', decided_by: 2 };
+    const db = makeSequentialDb([{ rows: [existing] }, { rows: [updated] }, { rows: [{ id: 99 }] }]);
+    const handler = jest.fn().mockResolvedValue(undefined);
+    registerExecutionHandler('branch.close.test', handler);
+
+    await decide(db, { approvalId: 1, decidedBy: 2, decision: 'approved' });
+
+    expect(handler).toHaveBeenCalledWith(updated, db);
+  });
+
+  test('an explicit execute callback takes precedence over a registered handler', async () => {
+    const existing = {
+      id: 1,
+      requested_by: 7,
+      status: 'pending',
+      required_approver_role_id: null,
+      action_type: 'branch.close.test2',
+      branch_id: 1,
+    };
+    const updated = { ...existing, status: 'approved', decided_by: 2 };
+    const db = makeSequentialDb([{ rows: [existing] }, { rows: [updated] }, { rows: [{ id: 99 }] }]);
+    const registeredHandler = jest.fn();
+    const explicitExecute = jest.fn().mockResolvedValue(undefined);
+    registerExecutionHandler('branch.close.test2', registeredHandler);
+
+    await decide(db, { approvalId: 1, decidedBy: 2, decision: 'approved', execute: explicitExecute });
+
+    expect(explicitExecute).toHaveBeenCalledWith(updated, db);
+    expect(registeredHandler).not.toHaveBeenCalled();
   });
 });
