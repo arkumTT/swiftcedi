@@ -1995,6 +1995,24 @@ is completed._
     approval outcome the backend actually returned (200 vs. 202), instead
     of a generic "submitted" message — same honesty-about-outcome pattern
     as the Customer 360 closure-request modal.
+- **Investments (`src/features/main/investments/`) needed zero backend
+  additions.** `InvestmentsListPage` (list + booking modal + product
+  catalog) and `InvestmentDetailPage` (activate, accrue interest, request
+  payout, request redemption, settle a pending payout, confirm a
+  redemption payout) map directly onto the existing route set.
+  - "Request payout" is only offered when the product's
+    `payout_frequency === 'monthly'` — an `at_maturity` product's interest
+    only ever surfaces through redemption, matching `investmentService`'s
+    own model (no periodic payout path exists for it).
+  - A pending payout can only be settled from this screen once
+    `threshold_flag` is false; a payout above the product's approval
+    threshold must clear maker-checker first, and the screen says so
+    rather than offering a Settle button that would just 409.
+  - Early-redemption penalties are shown as a distinct KPI
+    (`penalty_pesewas`) next to `interest_payable_pesewas`, making
+    visible on-screen the rule already enforced server-side and
+    documented elsewhere in this log: the penalty only ever reduces
+    payable interest, never principal.
 
 ---
 

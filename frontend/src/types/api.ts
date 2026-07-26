@@ -309,6 +309,60 @@ export interface OverdraftStatus {
   availablePesewas: number;
 }
 
+export interface InvestmentProduct {
+  id: string;
+  name: string;
+  code: string;
+  tenor_months: number;
+  annual_interest_rate_bps: number;
+  min_principal_pesewas: number;
+  max_principal_pesewas: number | null;
+  payout_frequency: 'monthly' | 'at_maturity';
+  early_withdrawal_penalty_bps: number;
+  payout_approval_threshold_pesewas: number;
+  status: 'active' | 'inactive';
+}
+
+export interface InvestmentAccrual {
+  id: string;
+  investment_id: string;
+  accrual_date: string;
+  principal_balance_pesewas: number;
+  interest_pesewas: number;
+}
+
+export interface InvestmentPayout {
+  id: string;
+  investment_id: string;
+  amount_pesewas: number;
+  threshold_flag: boolean;
+  status: 'pending' | 'paid' | 'rejected';
+  payment_reference: string | null;
+  created_at: string;
+}
+
+export interface InvestmentRedemption {
+  id: string;
+  investment_id: string;
+  is_early: boolean;
+  principal_pesewas: number;
+  accrued_interest_pesewas: number;
+  penalty_pesewas: number;
+  interest_payable_pesewas: number;
+  total_payout_pesewas: number;
+  status: 'pending' | 'paid' | 'rejected';
+  payment_reference: string | null;
+}
+
+export interface InvestorStatement {
+  investment: Investment;
+  accruals: InvestmentAccrual[];
+  payouts: InvestmentPayout[];
+  redemption: InvestmentRedemption | null;
+  totalAccruedPesewas: number;
+  totalPaidOutPesewas: number;
+}
+
 export interface Investment {
   id: string;
   customer_id: string;
