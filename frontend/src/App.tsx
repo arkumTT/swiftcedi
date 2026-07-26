@@ -29,6 +29,8 @@ import { TillDetailPage } from './features/main/cashier/TillDetailPage';
 import { TransactionsPage } from './features/main/transactions/TransactionsPage';
 import { BranchesPage } from './features/main/branches/BranchesPage';
 import { BranchDetailPage } from './features/main/branches/BranchDetailPage';
+import { FieldAgentsPage } from './features/main/agents/FieldAgentsPage';
+import { FieldAgentDetailPage } from './features/main/agents/FieldAgentDetailPage';
 
 const ADMIN_ANY_OF = [
   'rbac.manage_users',
@@ -154,7 +156,8 @@ function App() {
         <Route path="transactions" element={<TransactionsPage />} />
         <Route path="branches" element={<BranchesPage />} />
         <Route path="branches/:id" element={<BranchDetailPage />} />
-        <Route path="agents" element={<PlaceholderPage title="Field Agents" />} />
+        <Route path="agents" element={<FieldAgentsPage />} />
+        <Route path="agents/:id" element={<FieldAgentDetailPage />} />
         <Route path="reports" element={<PlaceholderPage title="Reports & Analytics" />} />
         <Route path="compliance" element={<PlaceholderPage title="Compliance & Regulatory" />} />
         <Route path="settings" element={<SettingsPage />} />

@@ -2,7 +2,7 @@
 
 const express = require('express');
 const { requireAuth } = require('../middleware/auth');
-const { requirePermission, resolveAnalyticsBranchScope } = require('../middleware/requirePermission');
+const { requirePermission, resolveConsolidatedBranchScope } = require('../middleware/requirePermission');
 const { asyncHandler } = require('../utils/asyncHandler');
 const analyticsService = require('../modules/analytics/analyticsService');
 
@@ -18,7 +18,7 @@ function analyticsRouter(pool) {
     auth,
     requirePermission('analytics.view'),
     asyncHandler(async (req, res) => {
-      const branchId = resolveAnalyticsBranchScope(req);
+      const branchId = resolveConsolidatedBranchScope(req);
       const { date } = req.query;
       res.json(await analyticsService.getLiveStats(pool, { branchId, date }));
     })
@@ -29,7 +29,7 @@ function analyticsRouter(pool) {
     auth,
     requirePermission('analytics.view'),
     asyncHandler(async (req, res) => {
-      const branchId = resolveAnalyticsBranchScope(req);
+      const branchId = resolveConsolidatedBranchScope(req);
       const { asOfDate, loanOfficerId, largestExposuresLimit } = req.query;
       res.json(
         await analyticsService.getPortfolioQuality(pool, {
@@ -48,7 +48,7 @@ function analyticsRouter(pool) {
     auth,
     requirePermission('analytics.view'),
     asyncHandler(async (req, res) => {
-      const branchId = resolveAnalyticsBranchScope(req);
+      const branchId = resolveConsolidatedBranchScope(req);
       const { fromDate, toDate } = req.query;
       res.json(await analyticsService.getProfitability(pool, { fromDate, toDate, branchId }));
     })
@@ -59,7 +59,7 @@ function analyticsRouter(pool) {
     auth,
     requirePermission('analytics.view'),
     asyncHandler(async (req, res) => {
-      const branchId = resolveAnalyticsBranchScope(req);
+      const branchId = resolveConsolidatedBranchScope(req);
       const { fromDate, toDate, limit } = req.query;
       res.json(
         await analyticsService.getTopLoanCustomersByRevenue(pool, {
@@ -77,7 +77,7 @@ function analyticsRouter(pool) {
     auth,
     requirePermission('analytics.view'),
     asyncHandler(async (req, res) => {
-      const branchId = resolveAnalyticsBranchScope(req);
+      const branchId = resolveConsolidatedBranchScope(req);
       const { fromDate, toDate, granularity } = req.query;
       res.json(await analyticsService.getGrowthTrends(pool, { fromDate, toDate, branchId, granularity }));
     })
@@ -105,7 +105,7 @@ function analyticsRouter(pool) {
     auth,
     requirePermission('analytics.view'),
     asyncHandler(async (req, res) => {
-      const branchId = resolveAnalyticsBranchScope(req);
+      const branchId = resolveConsolidatedBranchScope(req);
       const { asOfDate, fromDate, toDate } = req.query;
       res.json(await analyticsService.generateExecutiveReportPack(pool, { asOfDate, fromDate, toDate, branchId }));
     })

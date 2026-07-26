@@ -44,14 +44,16 @@ function resolveBranchScope(req) {
  * itself always falls back to the caller's OWN home branch when no branchId
  * is given (a deliberate default so "no query param" means "my branch" for
  * every role, not an accident), which left owner/system_admin with no way
- * to ask for the consolidated view every analytics function already
- * supports at the service layer (`branchId: null`). Only recognizes 'all'
- * for CROSS_BRANCH_ROLES; every other caller (and every other branchId
- * value) defers to the exact same resolveBranchScope behavior as before —
- * see Decisions_Log.md. Used by the analytics routes the frontend
- * dashboard needs a real consolidated view from.
+ * to ask for the consolidated view every list/analytics function already
+ * supports at the service layer (`branchId: null`/undefined). Only
+ * recognizes 'all' for CROSS_BRANCH_ROLES; every other caller (and every
+ * other branchId value) defers to the exact same resolveBranchScope
+ * behavior as before — see Decisions_Log.md. First added for the
+ * analytics routes the dashboard needs a consolidated view from; also used
+ * by the agents routes for the same reason (a supervisor's own roster/
+ * reconciliation list otherwise silently narrowed to their home branch).
  */
-function resolveAnalyticsBranchScope(req) {
+function resolveConsolidatedBranchScope(req) {
   if (req.query.branchId === 'all' && CROSS_BRANCH_ROLES.has(req.user.roleName)) return null;
   return resolveBranchScope(req);
 }
@@ -69,4 +71,4 @@ function canAccessBranch(req, branchId) {
   return Boolean(req.user.crossBranchAccessibleBranchIds && req.user.crossBranchAccessibleBranchIds.has(id));
 }
 
-module.exports = { requirePermission, resolveBranchScope, resolveAnalyticsBranchScope, canAccessBranch, CROSS_BRANCH_ROLES };
+module.exports = { requirePermission, resolveBranchScope, resolveConsolidatedBranchScope, canAccessBranch, CROSS_BRANCH_ROLES };

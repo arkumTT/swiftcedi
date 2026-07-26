@@ -1,6 +1,6 @@
 'use strict';
 
-const { resolveBranchScope, resolveAnalyticsBranchScope, canAccessBranch } = require('../../src/middleware/requirePermission');
+const { resolveBranchScope, resolveConsolidatedBranchScope, canAccessBranch } = require('../../src/middleware/requirePermission');
 
 function makeReq({ roleName, homeBranchId = 1, branchId, crossBranchAccessibleBranchIds = new Set() }) {
   return {
@@ -28,23 +28,23 @@ describe('resolveBranchScope', () => {
   });
 });
 
-describe('resolveAnalyticsBranchScope', () => {
+describe('resolveConsolidatedBranchScope', () => {
   test('?branchId=all resolves to null (consolidated) for a cross-branch role', () => {
-    expect(resolveAnalyticsBranchScope(makeReq({ roleName: 'owner', branchId: 'all' }))).toBeNull();
-    expect(resolveAnalyticsBranchScope(makeReq({ roleName: 'system_admin', branchId: 'all' }))).toBeNull();
+    expect(resolveConsolidatedBranchScope(makeReq({ roleName: 'owner', branchId: 'all' }))).toBeNull();
+    expect(resolveConsolidatedBranchScope(makeReq({ roleName: 'system_admin', branchId: 'all' }))).toBeNull();
   });
 
   test('?branchId=all for a non-cross-branch role falls back to their home branch, not an error', () => {
-    expect(resolveAnalyticsBranchScope(makeReq({ roleName: 'loan_officer', homeBranchId: 3, branchId: 'all' }))).toBe(3);
+    expect(resolveConsolidatedBranchScope(makeReq({ roleName: 'loan_officer', homeBranchId: 3, branchId: 'all' }))).toBe(3);
   });
 
   test('an explicit numeric branchId behaves exactly like resolveBranchScope for every role', () => {
-    expect(resolveAnalyticsBranchScope(makeReq({ roleName: 'owner', branchId: '7' }))).toBe(7);
-    expect(resolveAnalyticsBranchScope(makeReq({ roleName: 'loan_officer', homeBranchId: 2, branchId: '7' }))).toBe(2);
+    expect(resolveConsolidatedBranchScope(makeReq({ roleName: 'owner', branchId: '7' }))).toBe(7);
+    expect(resolveConsolidatedBranchScope(makeReq({ roleName: 'loan_officer', homeBranchId: 2, branchId: '7' }))).toBe(2);
   });
 
   test('no branchId at all still defaults to home branch, same as resolveBranchScope', () => {
-    expect(resolveAnalyticsBranchScope(makeReq({ roleName: 'owner', homeBranchId: 4 }))).toBe(4);
+    expect(resolveConsolidatedBranchScope(makeReq({ roleName: 'owner', homeBranchId: 4 }))).toBe(4);
   });
 });
 

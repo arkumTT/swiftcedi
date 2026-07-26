@@ -83,6 +83,44 @@ export interface BranchPerformance {
   pendingMetrics: string[];
 }
 
+export interface FieldAgent {
+  id: string;
+  user_id: string;
+  home_branch_id: string;
+  territory: string | null;
+  status: 'active' | 'inactive';
+  created_at: string;
+}
+
+export interface AgentAssignment {
+  id: string;
+  agent_id: string;
+  branch_id: string;
+  territory: string | null;
+  start_date: string;
+  end_date: string | null;
+  reason: string | null;
+}
+
+export interface AgentLocation {
+  id: string;
+  agent_id: string;
+  gps_lat: number;
+  gps_lng: number;
+  recorded_at: string;
+}
+
+export interface AgentReconciliation {
+  id: string;
+  agent_id: string;
+  reconciliation_date: string;
+  expected_amount_pesewas: number;
+  received_amount_pesewas: number;
+  variance_pesewas: number;
+  status: 'matched' | 'pending_review' | 'resolved';
+  resolution_notes: string | null;
+}
+
 export interface Customer {
   id: string;
   customer_type: 'individual' | 'sme' | 'group';

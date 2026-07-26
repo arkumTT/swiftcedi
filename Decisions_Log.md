@@ -2082,6 +2082,36 @@ is completed._
     covered by the Admin Back Office's Access & Approval Rules page;
     duplicating either here would be scope creep past what
     `branch.view_performance` (a view-only permission) implies.
+- **Field Agents (`src/features/main/agents/`) surfaced a real cross-
+  branch-supervisor gap identical to the one already fixed for
+  analytics: `GET /agents` and `GET /agents/reconciliations` used the
+  plain `resolveBranchScope`, which — same as before the analytics
+  fix — always falls back to the caller's OWN home branch when no
+  `?branchId=` is given, even for owner/system_admin. A cross-branch
+  supervisor's roster/reconciliation screens would have silently shown
+  only their own home branch's agents. Rather than re-invent the same
+  `?branchId=all` sentinel a second time, `resolveAnalyticsBranchScope`
+  was renamed to `resolveConsolidatedBranchScope` (its behavior was
+  never analytics-specific, just first needed there) and wired into
+  both agent routes; `FieldAgentsPage` sends `branchId: 'all'` for
+  cross-branch roles the same way `DashboardPage` already does. Caught
+  live by registering a test agent in a non-home branch and watching
+  the supervisor roster come back empty — exactly the bug the rename
+  fixes.
+  - The screen renders two entirely different things behind one nav
+    entry, gated on which of `agent.manage` / `agent.view_locations` /
+    `agent.reconcile` / `agent.ping_location` the caller actually holds
+    (mirroring `agent.ping_location`'s own migration comment that it's
+    "the ONE action an ordinary field_agent-role user needs for
+    themselves"): a supervisor gets the roster + reconciliation
+    console; a plain field_agent (who holds only `agent.ping_location`
+    per the Module 10 permission seed) gets a single "record my
+    location" action and nothing else — honestly, since that role has
+    no read permission to show its own location history back to itself.
+  - The ping button uses the browser's real `navigator.geolocation` API
+    (Playwright-verified with a mocked coordinate), not a manually-typed
+    lat/lng, matching how an actual field agent would use this in the
+    field.
 
 ---
 
