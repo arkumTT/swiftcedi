@@ -81,6 +81,122 @@ function rbacRouter(pool) {
     })
   );
 
+  // Powers the Roles & Permissions matrix screen — one row of granted
+  // codes per role, checked against the full /rbac/permissions list to
+  // render each cell.
+  router.get(
+    '/roles/:roleId/permissions',
+    auth,
+    asyncHandler(async (req, res) => {
+      const { rows } = await pool.query(
+        `SELECT p.code FROM role_permissions rp
+         JOIN permissions p ON p.id = rp.permission_id
+         WHERE rp.role_id = $1
+         ORDER BY p.code`,
+        [req.params.roleId]
+      );
+      res.json(rows.map((r) => r.code));
+    })
+  );
+
+  router.delete(
+    '/roles/:roleId/permissions/:permissionCode',
+    auth,
+    requirePermission('rbac.manage_roles'),
+    asyncHandler(async (req, res) => {
+      const { roleId, permissionCode } = req.params;
+      const { rows: permRows } = await pool.query('SELECT id FROM permissions WHERE code = $1', [permissionCode]);
+      if (!permRows[0]) return res.status(404).json({ error: `permission '${permissionCode}' not found` });
+
+      await pool.query('DELETE FROM role_permissions WHERE role_id = $1 AND permission_id = $2', [
+        roleId,
+        permRows[0].id,
+      ]);
+      await auditLog.record(pool, {
+        userId: req.user.id,
+        branchId: req.user.homeBranchId,
+        action: 'rbac.permission_revoked',
+        entityType: 'role',
+        entityId: roleId,
+        afterState: { permissionCode },
+      });
+      res.status(204).end();
+    })
+  );
+
+  // Powers the Users & Roles admin table — filterable by role/branch/status
+  // plus a name/email search, matching the design spec's "filterable table
+  // (role, branch, status)" requirement.
+  router.get(
+    '/users',
+    auth,
+    requirePermission('rbac.manage_users'),
+    asyncHandler(async (req, res) => {
+      const { roleId, branchId, status, search } = req.query;
+      const clauses = [];
+      const params = [];
+      if (roleId) {
+        params.push(roleId);
+        clauses.push(`u.role_id = $${params.length}`);
+      }
+      if (branchId) {
+        params.push(branchId);
+        clauses.push(`u.home_branch_id = $${params.length}`);
+      }
+      if (status) {
+        params.push(status);
+        clauses.push(`u.status = $${params.length}`);
+      }
+      if (search) {
+        params.push(`%${search}%`);
+        clauses.push(`(u.full_name ILIKE $${params.length} OR u.email ILIKE $${params.length})`);
+      }
+      const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+      const { rows } = await pool.query(
+        `SELECT u.id, u.full_name, u.email, u.status, u.role_id, r.name AS role_name,
+                u.home_branch_id, b.name AS home_branch_name, u.last_login_at, u.created_at
+           FROM users u
+           JOIN roles r ON r.id = u.role_id
+           JOIN branches b ON b.id = u.home_branch_id
+           ${where}
+          ORDER BY u.full_name`,
+        params
+      );
+      res.json(rows);
+    })
+  );
+
+  router.patch(
+    '/users/:userId/status',
+    auth,
+    requirePermission('rbac.manage_users'),
+    asyncHandler(async (req, res) => {
+      const { userId } = req.params;
+      const { status } = req.body || {};
+      if (!['active', 'suspended', 'disabled'].includes(status)) {
+        return res.status(400).json({ error: "status must be 'active', 'suspended', or 'disabled'" });
+      }
+      const { rows: beforeRows } = await pool.query('SELECT * FROM users WHERE id = $1', [userId]);
+      if (!beforeRows[0]) return res.status(404).json({ error: 'user not found' });
+
+      const { rows } = await pool.query(
+        `UPDATE users SET status = $1, updated_at = now() WHERE id = $2
+         RETURNING id, full_name, email, role_id, home_branch_id, status`,
+        [status, userId]
+      );
+      await auditLog.record(pool, {
+        userId: req.user.id,
+        branchId: req.user.homeBranchId,
+        action: 'rbac.user_status_changed',
+        entityType: 'user',
+        entityId: userId,
+        beforeState: { status: beforeRows[0].status },
+        afterState: { status },
+      });
+      res.json(rows[0]);
+    })
+  );
+
   router.post(
     '/users',
     auth,

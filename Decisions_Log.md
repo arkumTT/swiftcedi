@@ -169,7 +169,9 @@ authentication header, versioning approach._
 
 - Resource paths are plural, kebab/lower-case, mounted at the app root
   (no `/api/v1` prefix yet — add versioning when a breaking change is
-  actually needed, not preemptively): `/rbac/roles`, `/rbac/users`,
+  actually needed, not preemptively): `/auth/me`, `/rbac/roles`,
+  `/rbac/roles/:roleId/permissions`, `/rbac/users`,
+  `/rbac/users/:userId/status`,
   `/audit-log`, `/approvals`, `/gl/accounts`, `/gl/journal-entries`,
   `/branches`, `/branches/regions`, `/branches/clusters`,
   `/branches/transfers`, `/branches/:id/status`,
@@ -551,6 +553,28 @@ validateBalancedLines(lines) -> void  // pure, throws UnbalancedEntryError; no d
   Add new codes via
   `POST /rbac/roles/:roleId/permissions`, not a new migration, unless you
   also need to seed a default grant.
+- **Frontend-enabling additions** (`backend/src/routes/auth.js`,
+  `backend/src/routes/rbac.js`, no new migrations — all read/write existing
+  `users`/`roles`/`permissions`/`role_permissions` tables): `GET /auth/me`
+  (current user + role + full permission set, so the SPA can gate nav
+  without decoding anything client-side), `GET /rbac/users` (filterable by
+  `roleId`/`branchId`/`status`/`search`, `rbac.manage_users`-gated — powers
+  the Admin Back Office's Users & Roles table), `GET
+  /rbac/roles/:roleId/permissions` (granted codes for one role) and `DELETE
+  /rbac/roles/:roleId/permissions/:permissionCode` (the missing revoke
+  counterpart to the existing grant endpoint — together these power the
+  Roles & Permissions checkbox matrix), and `PATCH /rbac/users/:userId/status`
+  (suspend/unlock/disable, mirroring the existing `PATCH .../role` shape).
+  Covered by `backend/tests/integration/rbacAuthModule.test.js` — the first
+  supertest-based (real Express app, not direct service calls) integration
+  test in this codebase, since these are route-layer additions with no
+  dedicated service module of their own.
+- **CORS middleware added to `app.js`** — a small hand-rolled middleware
+  (`Access-Control-Allow-Origin` from a `CORS_ORIGIN` env var, default `*`),
+  not the `cors` npm package, since the app's actual CORS surface (plain
+  methods + a Bearer header, no cookies) doesn't need it. Required once a
+  frontend SPA (necessarily a different origin from this API in any real
+  deployment) exists to call it from a browser.
 
 ### Branch service — `backend/src/modules/branch/branchService.js` (Module 1)
 
