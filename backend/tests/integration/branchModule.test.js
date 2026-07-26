@@ -59,6 +59,16 @@ describeIfDb('Module 1: branch management', () => {
     // loan_repayments needs TRUNCATE (DELETE is blocked by its immutability
     // trigger) and is handled above.
     for (const table of [
+      'aml_flags',
+      'aml_rules',
+      'sanctions_screening_results',
+      'sanctions_list_entries',
+      'regulatory_report_submissions',
+      'regulatory_report_templates',
+      'tax_rates',
+      'regulatory_ratio_definitions',
+      'loan_classifications',
+      'loan_classification_configs',
       'agent_reconciliations',
       'agent_locations',
       'agent_assignments',

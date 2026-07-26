@@ -51,6 +51,16 @@ describeIfDb('Module 3: loan management', () => {
     await pool.query('TRUNCATE overdraft_interest_accruals RESTART IDENTITY CASCADE');
     await pool.query('TRUNCATE investment_accruals RESTART IDENTITY CASCADE');
     for (const table of [
+      'aml_flags',
+      'aml_rules',
+      'sanctions_screening_results',
+      'sanctions_list_entries',
+      'regulatory_report_submissions',
+      'regulatory_report_templates',
+      'tax_rates',
+      'regulatory_ratio_definitions',
+      'loan_classifications',
+      'loan_classification_configs',
       'agent_reconciliations',
       'agent_locations',
       'agent_assignments',

@@ -203,7 +203,16 @@ authentication header, versioning approach._
   `/agents/ping`, `/agents/reconciliations`,
   `/agents/reconciliations/run-branch`, `/agents/reconciliations/:id/resolve`,
   `/agents/:id/reassign`, `/agents/:id/assignments`, `/agents/:id/location`,
-  `/agents/:id/locations`, `/agents/:id/reconciliations`.
+  `/agents/:id/locations`, `/agents/:id/reconciliations`,
+  `/compliance/loan-classification-configs`, `/compliance/loan-classification/run`,
+  `/compliance/loan-classification/summary`, `/compliance/ratio-definitions/:name`,
+  `/compliance/ratios/:name/compute`, `/compliance/tax-rates/:taxType`,
+  `/compliance/tax/withholding-summary`, `/compliance/tax/vat-summary`,
+  `/compliance/report-templates/:id/status`, `/compliance/reports/generate`,
+  `/compliance/reports/:id/submit`, `/compliance/aml/rules/:id/status`,
+  `/compliance/aml/screen`, `/compliance/aml/flags/:id/review`,
+  `/compliance/sanctions/screen`, `/compliance/sanctions/screen-batch`,
+  `/compliance/sanctions/results/:id/resolve`.
 - Route file ordering rule (see `backend/src/routes/branches.js`): every
   fixed-prefix path (`/regions`, `/clusters`, `/transfers`,
   `/performance/compare`) must be registered before the `/:id` catch-all,
@@ -288,6 +297,12 @@ values, loan status values, account status values._
 | `bank_statement_lines.status` | `unmatched`, `matched` | 7 — `matched` requires (and is the only status paired with) a non-null `matched_journal_line_id`, enforced by a CHECK constraint |
 | `field_agents.status` | `active`, `inactive` | 10 |
 | `agent_reconciliations.status` | `matched`, `pending_review`, `resolved` | 10 — `matched`/`pending_review` are set automatically from the computed variance; `resolved` is reachable ONLY via `resolveReconciliation()`, never automatically — a CHECK constraint ties `resolved` 1:1 to `reviewed_by`/`reviewed_at` both being set |
+| `loan_classification_configs.category` / `loan_classifications.category` | `current`, `olem`, `substandard`, `doubtful`, `loss` | 8 — BOG's prudential loan classification categories; thresholds/rates are configurable data, never hardcoded (see the Compliance service section) |
+| `regulatory_report_templates.status` | `active`, `retired` | 8 — a lifecycle flag only; template CONTENT (`field_mappings`) is immutable once created, a layout change is always a new `version` |
+| `regulatory_report_submissions.status` | `generated`, `submitted` | 8 — `submitted` requires (and is the only status paired with) non-null `submitted_by`/`submitted_at`, enforced by a CHECK constraint |
+| `aml_rules.status` | `active`, `inactive` | 8 |
+| `aml_flags.status` | `open`, `reviewed`, `cleared` | 8 — NEVER auto-clears (module prompt's own rule); `reviewAmlFlag()` is the only path off `open`, and never back to it. A CHECK constraint ties `open` 1:1 to `reviewed_by`/`reviewed_at`/`review_notes` all being null |
+| `sanctions_screening_results.match_status` | `no_match`, `potential_match`, `confirmed_match`, `cleared` | 8 — the automatic screening pass can only ever produce `no_match`/`potential_match`; `confirmed_match`/`cleared` are reachable ONLY via `resolveScreeningMatch()`, same "never auto-resolve a compliance finding" discipline as `aml_flags.status` |
 
 **`branches.status` transition table** (`branchService.VALID_STATUS_TRANSITIONS`):
 
@@ -1441,6 +1456,118 @@ resolveReconciliation(pool, { reconciliationId, resolvedBy, resolutionNotes }) -
   "server-side, never trust the path param" rule as
   `GET /branches/:id/performance`.
 
+### Regulatory & compliance service — `backend/src/modules/compliance/complianceService.js` (Module 8)
+
+**CLAUDE.md rule 7 governs almost every table this module owns**: "Never
+hardcode BOG thresholds, provisioning rules, or GRA tax rates from
+general knowledge." None of `loan_classification_configs`,
+`regulatory_ratio_definitions`, or `tax_rates` ship with ANY seeded
+numeric figure (migration 048's own header comment) — every function that
+reads one throws `ComplianceNotFoundError` with an explicit "a compliance
+officer must configure this first" message if nothing has been
+configured, rather than silently assuming a default. See Open Questions
+for the full list of what needs verification before this module is used
+for a real submission.
+
+```js
+// complianceService.js
+createLoanClassificationConfigSet(pool, { categories, effectiveDate, createdBy, actorBranchId }) -> rows[]  // must cover all 5 BOG categories in one call
+runLoanClassification(pool, { asOfDate, branchId, createdBy }) -> loan_classifications[]  // reuses analyticsService.getLoanBookSnapshot for days-overdue, never a second computation
+getLoanClassificationSummary(pool, { asOfDate, branchId }) -> reads the PERSISTED snapshot, not a live recompute
+createRatioDefinition(pool, { name, numeratorGlCodes, denominatorGlCodes, minimumRatioBps, effectiveDate, createdBy })
+computeRatio(pool, { name, asOfDate, branchId }) -> { numeratorPesewas, denominatorPesewas, ratioBps, minimumRatioBps, compliant }  // compliant is null until a minimum is configured
+createTaxRate(pool, { taxType, rateBps, vatApplicableGlCodes, effectiveDate, createdBy })
+getWithholdingTaxSummary(pool, { periodStart, periodEnd }) / getVatSummary(pool, { periodStart, periodEnd, branchId })
+createReportTemplate(pool, { name, targetAuthority, fieldMappings, effectiveDate, createdBy }) -> versioned, never mutates an old version
+generateReport(pool, { templateId, periodStart, periodEnd, asOfDate, branchId, generatedBy, actorBranchId }) -> snapshots report_data onto a NEW regulatory_report_submissions row
+markReportSubmitted(pool, { submissionId, submittedBy, fileReference })
+createAmlRule(pool, {...}) / runAmlScreening(pool, { fromDate, toDate }) / reviewAmlFlag(pool, { flagId, reviewedBy, newStatus, reviewNotes })  // NEVER auto-clears
+addSanctionsListEntry(pool, {...}) / screenCustomer(pool, { customerId, screenedBy }) / resolveScreeningMatch(pool, { screeningResultId, resolvedBy, resolution, notes })  // NEVER auto-confirms a match
+```
+
+- **Loan classification reuses `analyticsService.getLoanBookSnapshot`
+  rather than re-deriving days-overdue a second way** — the exact same
+  per-loan snapshot Module 9's portfolio-quality report is built on.
+  `loan_classification_configs` requires a FULL generation (all five BOG
+  categories: current/OLEM/substandard/doubtful/loss) inserted together
+  for one `effective_date` — a partial generation would leave
+  `classifyLoan` unable to categorize a loan whose arrears fall in an
+  ungapped range, so `createLoanClassificationConfigSet` rejects anything
+  less than full coverage. `loan_classifications` is a deliberate
+  point-in-time SNAPSHOT table (unlike Module 7/9's always-live reports) —
+  a regulatory submission must reflect exactly what was classified at
+  generation time, not silently drift if the loan book changes afterward.
+- **Capital adequacy ratio and liquidity ratio are NOT hardcoded
+  formulas** — `regulatory_ratio_definitions` is a fully generic
+  "numerator GL codes (with optional weights) / denominator GL codes"
+  computation engine, reusing `glService.getAccountRollup` (never a
+  second balance-aggregation path) so ANY ratio a regulator asks for —
+  not just CAR/liquidity — can be defined as data. Which GL control
+  accounts belong in a real CAR/liquidity numerator/denominator, at what
+  risk-weight, and what the actual minimum ratio is, are exactly "the
+  current BOG guidelines" the module prompt says must be verified with a
+  compliance officer — so `minimum_ratio_bps` is nullable, and
+  `computeRatio`'s `compliant` field is `null` (never a guessed
+  true/false) until an admin has configured a verified minimum.
+- **GRA withholding tax / VAT are configurable `tax_rates`, effective-
+  dated the same "latest effective_date <= asOfDate wins" way as
+  `regulatory_ratio_definitions`/`loan_classification_configs`.**
+  Withholding tax sums `investment_payouts` actually PAID in the period
+  (`updated_at`, stamped at settlement by
+  `investmentService.settleApprovedInvestmentPayout` — there's no
+  separate "paid_at" column). VAT requires `vat_applicable_gl_codes` to
+  be explicitly configured on the tax_rates row (which GL fee-income
+  accounts are VAT-scoped is itself a classification decision, not
+  assumed) and sums that code list's PERIOD activity via
+  `glService.getAccountRollup`, same reuse as the ratio engine.
+- **Report templates are versioned by NEVER mutating a row** — creating
+  another template with the same `name` always inserts version
+  `max(version) + 1`; the OLD version's `field_mappings` stay exactly as
+  they were, satisfying the module prompt's "a report generated last year
+  can be regenerated using the template version that was active then."
+  Only `status` (`active`/`retired`) is togglable in place — that's a
+  lifecycle flag, not report content.
+- **`generateReport` is a small dispatcher over `REPORT_DATA_SOURCES`**, a
+  fixed map of named data sources (`loan_classification_summary`,
+  `capital_adequacy_ratio`, `liquidity_ratio`, `social_performance_summary`,
+  `withholding_tax_summary`, `vat_summary`) — a template's
+  `field_mappings.fields` just says which source populates which report
+  key. `social_performance_summary` calls
+  `analyticsService.getSocialPerformanceSummary` directly (extracted from
+  Module 9's `generateExecutiveReportPack` specifically so this module
+  doesn't duplicate that aggregation for a different audience).
+- **An AML flag never auto-clears** (module prompt's own explicit rule,
+  same discipline as Module 10's `agent_reconciliations`): `runAmlScreening`
+  only ever creates flags at `status = 'open'`; `reviewAmlFlag` is the
+  ONLY path to `'reviewed'`/`'cleared'`, always requires `reviewNotes`,
+  and can never move a flag back to `'open'`. Re-scanning an
+  already-scanned window never creates a duplicate flag for the same
+  transaction/rule pair (`UNIQUE (rule_id, transaction_type,
+  transaction_id)`, `ON CONFLICT DO NOTHING`). Only `rule_type =
+  'single_transaction_threshold'` has real evaluation logic today — the
+  column allows for future rule types, but nothing else is implemented,
+  and that's documented rather than silently pretended to be complete.
+- **Sanctions screening never auto-produces a `'confirmed_match'`** —
+  applying the same "a human must resolve it" discipline the module
+  prompt states explicitly for AML flags to this equally sensitive
+  finding, even though the prompt doesn't say it in so many words for
+  sanctions specifically. The automatic screening pass can only produce
+  `'no_match'` or `'potential_match'`; only `resolveScreeningMatch` (always
+  requiring `notes`) can move a `'potential_match'` to `'cleared'` or
+  `'confirmed_match'`. **`sanctions_list_entries` starts and stays EMPTY**
+  — there is no legitimate way to embed a real OFAC/UN/Ghana-FIC list in
+  application code, and fabricating placeholder "sanctions" names would
+  be actively dangerous for a compliance feature. The screening WORKFLOW
+  is real and fully wired; only the underlying list DATA is a deliberate,
+  loudly-flagged gap — see Open Questions.
+- **No dedicated "compliance officer" role exists yet** — permissions
+  split `compliance.manage_config` (system_admin only, the technical
+  "define the regulatory engine's parameters" action, same grain as
+  `gl.manage_accounts`) from `compliance.generate_reports`/
+  `compliance.manage_aml`/`compliance.manage_sanctions` (owner +
+  system_admin, the actual day-to-day compliance work) — see Open
+  Questions.
+
 ---
 
 ## Branch Scoping Convention
@@ -1736,6 +1863,56 @@ knowledge — plus any module prompt conflicts that need a human call._
       or field-agent workflow research — revisit if real agent usage shows
       it's too strict (missed genuine movement) or too loose (excessive
       data usage).
+- [ ] **Module 8 (Regulatory & Compliance) ships with ZERO regulatory
+      figures configured — this is deliberate, per CLAUDE.md rule 7, and
+      every one of the following MUST be verified with SwiftCedi's actual
+      compliance officer against current official guidance before this
+      module is used for a real BOG/GRA submission:**
+      - `loan_classification_configs` — no rows exist. The BOG
+        current/OLEM/substandard/doubtful/loss days-past-due boundaries
+        and provisioning rates used in this session's own tests
+        (0/1-30/31-90/91-180/181+ days; 0%/5%/25%/50%/100% provisioning)
+        are illustrative test fixtures ONLY, not sourced from any actual
+        current BOG prudential guideline — do not carry them into a real
+        deployment's seed data.
+      - `regulatory_ratio_definitions` — no rows exist for a real
+        capital-adequacy or liquidity ratio. Which GL control accounts
+        belong in the numerator/denominator, at what risk-weight, and
+        what the actual minimum ratio BOG requires for a licensed
+        microfinance institution, are all unknowns this session did not
+        attempt to guess.
+      - `tax_rates` — no rows exist for GRA withholding tax on investor
+        interest or VAT on fee income. Ghana's actual current rates were
+        deliberately NOT hardcoded from training-data "general knowledge"
+        per CLAUDE.md's explicit instruction, since tax rates change and
+        stale/wrong figures in a live compliance report are worse than an
+        obvious `ComplianceNotFoundError`.
+      - `sanctions_list_entries` — starts and stays EMPTY. There is no
+        legitimate way to embed a real OFAC/UN/Ghana-FIC sanctions list in
+        application code; a real deployment MUST load a genuine,
+        currently-maintained list feed before sanctions screening means
+        anything. Until then, every screening will report `no_match`,
+        which must NOT be mistaken for "screened clean" in the real
+        compliance sense.
+      - `aml_rules` — no rows exist. Real AML transaction-threshold
+        amounts are a compliance-policy decision (and may be tied to
+        actual FIC/BOG reporting thresholds), not a number this session
+        invented.
+      See the Compliance service section above for how each of these
+      resolves to a clear, typed "not configured yet" error rather than a
+      silent default when nothing has been set.
+- [ ] **No dedicated "compliance officer" role exists in this codebase's
+      role set** (owner, branch_manager, loan_officer, cashier,
+      field_agent, system_admin) — Module 8's compliance-work permissions
+      (`compliance.generate_reports`/`manage_aml`/`manage_sanctions`) are
+      granted to `owner` as the closest fit for now. If a real dedicated
+      compliance-officer position is created, add a proper role for it
+      (Module 11's RBAC CRUD) rather than continuing to overload `owner`.
+- [ ] **AML screening only covers `single_transaction_threshold`
+      rules** — `aml_rules.rule_type` allows for future rule types (e.g.
+      structuring/smurfing detection, velocity rules) but none of those
+      have real evaluation logic yet; only flag this as a gap if/when a
+      real compliance requirement needs them.
 
 ---
 

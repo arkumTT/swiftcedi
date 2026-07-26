@@ -490,35 +490,71 @@ async function getAgentProductivity(pool, { agentId, fromDate, toDate, requestin
   };
 }
 
+// --- Social performance summary -----------------------------------------------
+
+/**
+ * Standard microfinance outreach figures this schema can actually
+ * support (active customer/borrower counts, gender split, susu
+ * participation, average loan size, a sector breakdown of active
+ * borrowers) — the module prompt's own "social performance" term is
+ * otherwise undefined, so this doesn't invent a metric beyond what's
+ * derivable. Extracted as its own function (not inlined into
+ * `generateExecutiveReportPack`) since Module 8's own donor/investor-
+ * facing compliance reporting needs the exact same figures — see
+ * Decisions_Log.md.
+ */
+async function getSocialPerformanceSummary(pool, { branchId = null } = {}) {
+  const params = branchId ? [branchId] : [];
+  const branchClause = branchId ? 'AND branch_id = $1' : '';
+
+  const { rows: customerRows } = await pool.query(
+    `SELECT gender, COUNT(*)::int AS count FROM customers WHERE status = 'active' ${branchClause} GROUP BY gender`,
+    params
+  );
+  const { rows: susuParticipationRows } = await pool.query(
+    `SELECT COUNT(*)::int AS count FROM susu_accounts WHERE status = 'active' ${branchId ? 'AND branch_id = $1' : ''}`,
+    params
+  );
+  const { rows: borrowerRows } = await pool.query(
+    `SELECT COUNT(DISTINCT customer_id)::int AS borrower_count,
+            COUNT(*)::int AS loan_count,
+            COALESCE(AVG(principal_pesewas), 0)::bigint AS avg_principal_pesewas
+       FROM loans WHERE status = 'disbursed' ${branchClause}`,
+    params
+  );
+  const { rows: sectorRows } = await pool.query(
+    `SELECT COALESCE(c.classification, 'unspecified') AS sector, COUNT(DISTINCT l.customer_id)::int AS borrower_count
+       FROM loans l JOIN customers c ON c.id = l.customer_id
+      WHERE l.status = 'disbursed' ${branchId ? 'AND l.branch_id = $1' : ''}
+      GROUP BY sector ORDER BY borrower_count DESC`,
+    params
+  );
+
+  return {
+    branchId: branchId ? Number(branchId) : null,
+    activeCustomersByGender: customerRows.map((r) => ({ gender: r.gender || 'unspecified', count: r.count })),
+    activeSusuParticipants: susuParticipationRows[0].count,
+    activeBorrowerCount: borrowerRows[0].borrower_count,
+    averageLoanSizePesewas: Number(borrowerRows[0].avg_principal_pesewas),
+    activeBorrowersBySector: sectorRows.map((r) => ({ sector: r.sector, borrowerCount: r.borrower_count })),
+  };
+}
+
 // --- Executive report pack ----------------------------------------------------
 
 /**
  * A single combined report: balance sheet + income statement (Module 7),
- * portfolio quality summary, and a "social performance" section — the
- * spec's own vague term, interpreted here as the standard microfinance
- * outreach figures this schema can actually support (active customer/
- * borrower counts, gender split, susu participation) rather than
- * inventing an undefined metric.
+ * portfolio quality summary, and the social performance summary above.
  */
 async function generateExecutiveReportPack(pool, { asOfDate = todayIso(), fromDate, toDate, branchId = null } = {}) {
   if (!fromDate || !toDate) throw new AnalyticsValidationError('fromDate and toDate are required');
 
-  const [balanceSheet, incomeStatement, portfolioQuality] = await Promise.all([
+  const [balanceSheet, incomeStatement, portfolioQuality, socialPerformance] = await Promise.all([
     glService.getBalanceSheet(pool, { asOfDate, branchId }),
     glService.getIncomeStatement(pool, { fromDate, toDate, branchId }),
     getPortfolioQuality(pool, { asOfDate, branchId }),
+    getSocialPerformanceSummary(pool, { branchId }),
   ]);
-
-  const customerParams = branchId ? [branchId] : [];
-  const branchClause = branchId ? 'AND branch_id = $1' : '';
-  const { rows: customerRows } = await pool.query(
-    `SELECT gender, COUNT(*)::int AS count FROM customers WHERE status = 'active' ${branchClause} GROUP BY gender`,
-    customerParams
-  );
-  const { rows: susuParticipationRows } = await pool.query(
-    `SELECT COUNT(*)::int AS count FROM susu_accounts WHERE status = 'active' ${branchId ? 'AND branch_id = $1' : ''}`,
-    customerParams
-  );
 
   return {
     asOfDate,
@@ -534,10 +570,7 @@ async function generateExecutiveReportPack(pool, { asOfDate = todayIso(), fromDa
       par60: portfolioQuality.par60,
       par90: portfolioQuality.par90,
     },
-    socialPerformance: {
-      activeCustomersByGender: customerRows.map((r) => ({ gender: r.gender || 'unspecified', count: r.count })),
-      activeSusuParticipants: susuParticipationRows[0].count,
-    },
+    socialPerformance,
   };
 }
 
@@ -642,6 +675,7 @@ module.exports = {
   getTopLoanCustomersByRevenue,
   getGrowthTrends,
   getAgentProductivity,
+  getSocialPerformanceSummary,
   generateExecutiveReportPack,
   listWidgetConfigs,
   upsertWidgetConfig,

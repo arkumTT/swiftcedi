@@ -16,6 +16,7 @@ const { investmentsRouter } = require('./routes/investments');
 const { cashierRouter } = require('./routes/cashier');
 const { analyticsRouter } = require('./routes/analytics');
 const { agentsRouter } = require('./routes/agents');
+const { complianceRouter } = require('./routes/compliance');
 const { registerBranchExecutionHandlers } = require('./modules/branch/branchService');
 const { registerCustomerExecutionHandlers, getAccountClosure } = require('./modules/customer/customerService');
 const { registerLoanExecutionHandlers } = require('./modules/loan/loanService');
@@ -61,6 +62,7 @@ function createApp(pool) {
   app.use('/cashier', cashierRouter(pool));
   app.use('/analytics', analyticsRouter(pool));
   app.use('/agents', agentsRouter(pool));
+  app.use('/compliance', complianceRouter(pool));
 
   app.get(
     '/account-closures/:id',
