@@ -135,6 +135,72 @@ export interface SavingsAccount {
   opened_at: string;
 }
 
+export interface CashierTill {
+  id: string;
+  branch_id: string;
+  cashier_id: string;
+  business_date: string;
+  opening_balance_pesewas: number;
+  closing_balance_pesewas: number | null;
+  expected_closing_balance_pesewas: number | null;
+  variance_pesewas: number | null;
+  status: 'open' | 'closed';
+  opened_at: string;
+  closed_at: string | null;
+}
+
+export interface CashBackRequest {
+  id: string;
+  till_id: string;
+  amount_pesewas: number;
+  threshold_flag: boolean;
+  status: 'pending' | 'paid' | 'rejected';
+  created_at: string;
+}
+
+export interface TransactionReversal {
+  id: string;
+  branch_id: string;
+  original_journal_entry_id: string;
+  reason_code: string;
+  notes: string | null;
+  status: 'pending' | 'approved' | 'reversed' | 'rejected';
+  reversal_journal_entry_id: string | null;
+  created_at: string;
+}
+
+export interface DayCloseSnapshot {
+  id: string;
+  branch_id: string;
+  period_type: 'day' | 'month' | 'year';
+  period_start: string;
+  period_end: string;
+  cash_in_hand_balance_pesewas: number;
+  vault_balance_pesewas: number;
+  tills_closed_count: number;
+  closed_at: string;
+}
+
+export interface BranchCashPosition {
+  branchId: number;
+  cashInHandBalancePesewas: number;
+  vaultBalancePesewas: number;
+  totalCashPositionPesewas: number;
+  openTillCount: number;
+  totalOpenTillFloatPesewas: number;
+  openTills: CashierTill[];
+}
+
+export interface ConsolidatedCashPosition {
+  branches: BranchCashPosition[];
+  totals: {
+    cashInHandBalancePesewas: number;
+    vaultBalancePesewas: number;
+    totalCashPositionPesewas: number;
+    openTillCount: number;
+  };
+}
+
 export interface SavingsProduct {
   id: string;
   name: string;

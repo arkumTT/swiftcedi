@@ -24,6 +24,8 @@ import { SavingsAccountDetailPage } from './features/main/savings/SavingsAccount
 import { SusuAccountDetailPage } from './features/main/savings/SusuAccountDetailPage';
 import { InvestmentsListPage } from './features/main/investments/InvestmentsListPage';
 import { InvestmentDetailPage } from './features/main/investments/InvestmentDetailPage';
+import { CashierVaultPage } from './features/main/cashier/CashierVaultPage';
+import { TillDetailPage } from './features/main/cashier/TillDetailPage';
 
 const ADMIN_ANY_OF = [
   'rbac.manage_users',
@@ -144,7 +146,8 @@ function App() {
         <Route path="savings/susu/:id" element={<SusuAccountDetailPage />} />
         <Route path="investments" element={<InvestmentsListPage />} />
         <Route path="investments/:id" element={<InvestmentDetailPage />} />
-        <Route path="cashier" element={<PlaceholderPage title="Cashier & Vault" />} />
+        <Route path="cashier" element={<CashierVaultPage />} />
+        <Route path="cashier/tills/:id" element={<TillDetailPage />} />
         <Route path="transactions" element={<PlaceholderPage title="Transactions" />} />
         <Route path="branches" element={<PlaceholderPage title="Branches" />} />
         <Route path="agents" element={<PlaceholderPage title="Field Agents" />} />

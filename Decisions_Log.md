@@ -2013,6 +2013,33 @@ is completed._
     visible on-screen the rule already enforced server-side and
     documented elsewhere in this log: the penalty only ever reduces
     payable interest, never principal.
+- **Cashier & Vault (`src/features/main/cashier/`) needed two small backend
+  additions: `cashierService.listCashBackRequests` (`GET
+  /cashier/tills/:id/cashback-requests`) and `cashierService.listReversals`
+  (`GET /cashier/reversals`, `cashier.view`-gated).** Module 6 shipped
+  `POST` routes for both cash-back requests and reversals but no way to
+  read them back — a teller had no way to see a till's own cash-back
+  history, and nobody had a worklist of reversals waiting to be executed
+  once approved. Both are straightforward filtered `SELECT`s over their
+  existing tables (mirroring `listCollateral`/`listGuarantors`'s
+  no-permission-gate-on-nested-GET pattern for the till-scoped one), with
+  assertions added to the existing `cashierModule.test.js` cases that
+  already build the fixtures these functions read back, rather than new
+  test blocks duplicating that setup.
+  - `CashierVaultPage` is one page: cash position (consolidated across
+    branches for owner/system_admin via the existing
+    `getConsolidatedCashPosition`, single-branch otherwise), tills,
+    reversals, and period close-outs — the same "single page, permission-
+    gated sections" shape used throughout the Main Banking Application.
+  - `TillDetailPage` is where a till's cash-back requests actually live
+    and get settled, since `cash_back_requests` has no independent
+    identity outside its till.
+  - Prior-period adjustments (`POST /cashier/prior-period-adjustments`)
+    are deliberately NOT built into this screen — the endpoint takes
+    arbitrary balanced GL debit/credit lines, and a rushed line-item
+    editor here would be worse than none; it belongs with a proper GL
+    journal-entry UI (Reports & Compliance), not bolted onto Cashier &
+    Vault.
 
 ---
 
