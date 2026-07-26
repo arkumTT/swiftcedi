@@ -20,10 +20,10 @@ Finalized in Module 1 (migration 009_gl_control_accounts.sql):
 | Code Range | Category | Notes |
 |---|---|---|
 | 1000-1999 | Asset | `1000` Cash in Hand, `1010` Vault Cash, `1020` Cash in Transit, `1030` Cash with Agents (Module 4), `1100` Loans Receivable (Module 3) |
-| 2000-2999 | Liability | `2000` Customer Deposits (Module 4), `2010` Susu Deposits (Module 4), `2020` Agent Commission Payable (Module 4) |
-| 3000-3999 | Equity | None seeded yet |
-| 4000-4999 | Income | `4000` Operating Income, `4010` Loan Interest Income (Module 3), `4020` Loan Fee Income (Module 3), `4030` Savings Fee Income (Module 4) |
-| 5000-5999 | Expense | `5000` Operating Expense, `5100` Loan Loss Expense (Module 3), `5200` Agent Commission Expense (Module 4) |
+| 2000-2999 | Liability | `2000` Customer Deposits (Module 4), `2010` Susu Deposits (Module 4), `2020` Agent Commission Payable (Module 4), `2030` Investment Deposits Payable (Module 5) |
+| 3000-3999 | Equity | None seeded yet — see below, this stays true even after Module 5 |
+| 4000-4999 | Income | `4000` Operating Income, `4010` Loan Interest Income (Module 3), `4020` Loan Fee Income (Module 3), `4030` Savings Fee Income (Module 4), `4040` Early Withdrawal Penalty Income (Module 5) |
+| 5000-5999 | Expense | `5000` Operating Expense, `5100` Loan Loss Expense (Module 3), `5200` Agent Commission Expense (Module 4), `5300` Investment Interest Expense (Module 5) |
 
 Branch sub-account pattern: on branch creation, `branchService.createBranch()`
 auto-generates a sub-account per control account (14 as of Module 4 — the
@@ -38,9 +38,19 @@ characters** (enforced by `branches_code_shape_chk` and
 `branchService.validateBranchCode()`) — the composed code must fit
 `gl_accounts.code`'s `VARCHAR(20)`.
 
-Equity control accounts aren't seeded yet — add them (and a row above)
-when a module first needs one (e.g. Module 5 for investor equity).
-Liability controls arrived with Module 4's deposit accounting.
+Equity control accounts aren't seeded yet. **Correction to this note's own
+earlier guess**: it used to say "add them ... e.g. Module 5 for investor
+equity" — Module 5 (Investments) turned out to need a LIABILITY control
+(`2030` Investment Deposits Payable), not equity. The spec describes a
+fixed-term deposit with a `maturity_date` and a redemption/payout, i.e.
+money the institution owes back to the investor on a schedule — that's
+debt, not an ownership stake (no dividend-contingent-on-profit language,
+no implied governance/ownership rights). If the business later wants
+genuine investor equity/shareholding, that is a different, unbuilt
+product and needs its own explicit decision, not a relabeling of this
+one — see Open Questions for the regulatory classification question this
+raises. Liability controls first arrived with Module 4's deposit
+accounting and Module 5 added to the same range.
 
 **How to add a control account (the Module 3 recipe, follow it verbatim):**
 a new migration (a) `INSERT`s the org-wide control row(s) into
@@ -102,8 +112,8 @@ _Naming patterns adopted for the schema so later modules stay consistent
   run the **full** `npm test`, not just your own file, and verify with a
   reversed file order. Note also that immutable tables (`audit_log`,
   `gl_journal_lines`, `loan_repayments`, `savings_transactions`,
-  `susu_collections`, `overdraft_interest_accruals`) need `TRUNCATE`, since
-  their triggers block plain `DELETE`.
+  `susu_collections`, `overdraft_interest_accruals`, `investment_accruals`)
+  need `TRUNCATE`, since their triggers block plain `DELETE`.
 - **`branches`** started as a stub in Module 11/7's migrations (just `id,
   code, name, status, created_at, updated_at`) so every other table could
   carry a real `branch_id` FK immediately. Module 1 (migration
@@ -232,6 +242,11 @@ values, loan status values, account status values._
 | `susu_commissions.basis` | `per_collection`, `per_cycle` | 4 — only `per_collection` is produced today |
 | `standing_orders.status` | `active`, `paused`, `suspended`, `completed`, `cancelled` | 4 — `suspended` is set automatically after `max_consecutive_failures`; `paused`/`cancelled` are deliberate human actions |
 | `standing_order_runs.status` | `success`, `failed` | 4 — every run writes one, so a failure is never silent |
+| `investment_products.status` | `active`, `inactive` | 5 |
+| `investment_products.payout_frequency` / `investments.payout_frequency` | `monthly`, `at_maturity` | 5 — the spec's own examples; other frequencies are a future extension, not guessed at |
+| `investments.status` | `applied`, `pending_approval`, `rejected`, `approved`, `active`, `matured`, `redeemed` | 5 — mirrors the loan lifecycle's applied/pending_approval/approved/disbursed shape; `matured` exists in the enum but nothing sets it yet (no Module 12 sweep — see Open Questions), same as savings' unused `dormant` |
+| `investment_payouts.status` | `pending`, `paid`, `rejected` | 5 |
+| `investment_redemptions.status` | `pending`, `approved`, `paid`, `rejected` | 5 — never jumps straight to `paid`; see the Investment service section |
 
 **`branches.status` transition table** (`branchService.VALID_STATUS_TRANSITIONS`):
 
@@ -863,6 +878,115 @@ customer), which is why a deposit *credits* the control account:
   (Investments). If a savings product ever needs to pay interest, that is
   a new accrual posting model, not a config tweak.
 
+### Investment service — `backend/src/modules/investment/` (Module 5)
+
+Built ahead of Module 6 (Cashier/Till/Vault) in CLAUDE.md's suggested
+build order, on explicit instruction — see Deviations.
+
+`investmentMath.js` is pure (no db) and separately unit-tested, same split
+as every other module's math file: maturity-date calculation, simple
+(non-compounding) interest accrual, and the early-withdrawal penalty/
+redemption payout calculation. **Deliberately does not import
+loanMath.js/savingsMath.js** even though the month-clamp and
+simple-interest formulas are identical — each module's math file stays
+self-contained, the same choice Module 4 made for its own date helpers.
+
+```js
+// investmentService.js
+createInvestmentProduct / listInvestmentProducts / getInvestmentProduct(pool, ...)
+bookInvestment(pool, { customerId, productId, principalPesewas, appliedBy }) -> { investment, approvalRequest }
+activateInvestment(pool, { investmentId, activatedBy, startDate }) -> investment + journalEntry
+accrueInterest(pool, { investmentId, accrualDate, days, accruedBy }) -> { accrued, interestPesewas, journalEntry? }
+requestInvestmentPayout(pool, { investmentId, amountPesewas?, requestedBy }) -> pays out OR queues for approval
+settleApprovedInvestmentPayout(pool, { payoutId, paidBy, paymentReference })
+requestRedemption(pool, { investmentId, redemptionDate, requestedBy }) -> { redemption, approvalRequest }  // ALWAYS maker-checker
+confirmRedemptionPayout(pool, { redemptionId, paymentReference, confirmedBy }) -> { redemption, investment, journalEntry }
+getInvestorStatement(pool, { investmentId }) -> { accruals, payouts, redemption, totals }
+registerInvestmentExecutionHandlers()  // 'investment.book' + 'investment.payout' + 'investment.redeem'
+```
+
+**Investments are booked as a LIABILITY** (Investment Deposits Payable),
+not equity — see the Chart of Accounts section above for why.
+
+**GL mapping:**
+
+| Event | Debit | Credit |
+|---|---|---|
+| Activation (funds received) | Cash in Hand `principal` | Investment Deposits Payable `principal` |
+| Interest accrual | Investment Interest Expense `interest` | Investment Deposits Payable `interest` |
+| Periodic interest payout | Investment Deposits Payable `amount` | Cash in Hand `amount` |
+| Redemption | Investment Deposits Payable `principal + accrued interest` | Cash in Hand `total payout`; Early Withdrawal Penalty Income `penalty` (if any) |
+
+- **Booking and redemption ALWAYS require maker-checker approval** — no
+  threshold escape hatch, per the module spec's own "pending-approval
+  queue for new investments and disinvestments" (same treatment as
+  `loan.approve`). **Periodic interest payouts are threshold-gated**,
+  same convention as Module 4's `savings.withdraw`: a branch-specific
+  `approval_thresholds` row for `'investment.payout'` wins if present,
+  else `investment_products.payout_approval_threshold_pesewas` (default 0
+  — everything needs approval until a real threshold is configured, the
+  same safe default Module 4 established).
+- **No schedule is generated and nothing posts to GL at booking** — only
+  at activation (a separate, explicitly-permissioned step after approval,
+  same `approve` vs. `disburse` split as loans). `principal_pesewas` is
+  the actual amount received (unlike an overdraft, where it means a
+  limit) — the whole principal is funded up front, same as a term loan.
+- **Interest does NOT compound.** Each `accrueInterest` call computes
+  simple interest on the ORIGINAL principal for the given period, never on
+  a running balance that includes prior accruals — a fixed-term deposit,
+  not a compounding one. `UNIQUE(investment_id, accrual_date)` blocks
+  double-accruing the same day, and a computed interest of exactly 0
+  (a 0%-rate product) is a no-op rather than an error — same lesson
+  learned fixing Module 3's overdraft interest accrual.
+- **`investment_accruals` needs no two-phase `journal_entry_id` stamp**,
+  unlike `loan_repayments`/`savings_transactions`: the GL entry is posted
+  FIRST (nothing else needs this row to exist first), then the row is
+  inserted with `journal_entry_id` already known. Fully immutable at the
+  DB layer (plain BEFORE UPDATE/DELETE block, no stamp exception needed).
+- **Principal is never penalized on early redemption — only accrued
+  interest is**, up to `investment_products.early_withdrawal_penalty_bps`
+  (a fraction of accrued interest, 0-10000 bps). A redemption at or after
+  maturity applies no penalty regardless of the product's configured
+  rate, even if requested against an early-withdrawal-eligible investment
+  — `investmentMath.isEarlyRedemption()` decides this from the actual
+  redemption date vs. `maturity_date`, not from a flag the caller sets.
+- **Redemption extinguishes the FULL liability in one entry**: `Dr
+  Investment Deposits Payable` for `principal + accrued_interest` (the
+  entire balance built up by activation + every accrual), split on the
+  credit side between what's actually paid out (`Cr Cash in Hand`) and
+  what's forfeited as a penalty (`Cr Early Withdrawal Penalty Income`).
+  This is why `investment_redemptions` has DB `CHECK` constraints tying
+  `interest_payable_pesewas = accrued_interest_pesewas - penalty_pesewas`
+  and `total_payout_pesewas = principal_pesewas + interest_payable_pesewas`
+  — the arithmetic invariant is enforced at the DB layer, not just
+  trusted from the application.
+- **`investment_payouts`/`investment_redemptions` never mark `paid`
+  optimistically** — same reasoning as the module spec's own "use a
+  pending -> confirmed status, not an optimistic update." Both follow the
+  same two-phase shape Module 4 established for threshold-gated
+  withdrawals: the maker-checker execution handler
+  (`payOutInvestmentPayoutOnApproval` / `applyRedemptionApprovalDecision`)
+  only records the approval outcome inside `decide()`'s transaction
+  (glPosting can't run there — it owns its own transaction); the actual
+  payout/GL posting happens afterward via a separate explicit call
+  (`settleApprovedInvestmentPayout` / `confirmRedemptionPayout`), which is
+  also where `payment_reference` (a manually-entered MoMo/bank reference
+  or cashier voucher number) gets recorded — see Open Questions for why
+  this is manual rather than a live payments-integration callback.
+- **A DATE column read back from Postgres is a JS `Date` object, not a
+  `'YYYY-MM-DD'` string** — `node-postgres`'s default behavior. Feeding one
+  straight into `investmentMath`'s string-based date functions (which do
+  `` `${d}T00:00:00Z` ``) silently produces an `Invalid Date`, and every
+  comparison against an `Invalid Date` is `false` — this specific bug
+  made `requestRedemption` classify EVERY redemption as "not early"
+  regardless of the actual date, caught in smoke-testing before it
+  shipped. Fixed with `investmentService.toDateString()`, applied
+  wherever a DB-read date feeds back into date arithmetic. Watch for the
+  same trap in any future module that round-trips a DATE column through
+  loanMath/savingsMath's equivalent string-based helpers — none of the
+  existing call sites happen to do this today, but nothing stops a future
+  one from introducing it.
+
 ---
 
 ## Branch Scoping Convention
@@ -1034,6 +1158,52 @@ knowledge — plus any module prompt conflicts that need a human call._
       no payout flow — that plausibly belongs with Module 10 (Agent & Field
       Ops) or payroll. The liability will therefore grow monotonically
       until someone builds the settlement side.
+- [ ] **Module 5's "investments" haven't been checked against actual BOG
+      (or, if structured as a collective investment scheme, Ghana SEC)
+      regulatory classification.** They're booked as a deposit-taking
+      liability here (see Chart of Accounts / Investment service above),
+      which is the coherent reading of the spec's own language, but
+      whether this specific product actually falls under the
+      institution's deposit-taking licence, needs a separate CIS
+      registration, or something else entirely is a real compliance
+      question that wasn't answered from general knowledge — confirm with
+      the compliance officer before this product is offered to a real
+      investor, per CLAUDE.md's rule on regulation-dependent figures.
+- [ ] **No live payments integration exists yet** (the Suggested Build
+      Order's separate "Payments integration" step, still unbuilt) — so
+      Module 5's redemption/payout "confirm the transfer succeeded" step
+      is a manual staff action: `confirmRedemptionPayout`/
+      `settleApprovedInvestmentPayout` take a free-text
+      `payment_reference` the staff member types in after actually moving
+      the money via MoMo/bank/cashier, rather than a real callback from a
+      payment rail. Wire a real confirmation callback in when MoMo/GHIPSS/
+      Paystack/Hubtel integration lands — don't treat `payment_reference`
+      as verified proof of anything until then.
+- [ ] **A rejected `investment.book` approval leaves `investments.status`
+      at `pending_approval`, not `rejected`** — because
+      `approvalWorkflow.decide()` only invokes an action_type's registered
+      execution handler when `decision === 'approved'`, never on
+      rejection, so there is no hook for the investment module (or any
+      module) to react to a rejection by updating its own entity's
+      status. The `approval_requests` row itself is correct (`status:
+      'rejected'`), the information isn't lost, just not mirrored onto
+      `investments.status`. **This is not new** — Module 3's
+      `loan.approve` has the exact same gap (a rejected loan approval
+      never flips `loans.status` to `rejected` either; only appraisal
+      decline does). Fixing it properly means changing
+      `approvalWorkflow.decide()` to invoke the handler on both outcomes
+      and updating every existing handler (branch/customer closure, loan
+      approve/restructure, savings withdrawal, all three new investment
+      handlers) to branch on the outcome — a cross-cutting change touching
+      every module built so far, deliberately NOT done as a drive-by fix
+      here. Do it as its own explicit, tested change.
+- [ ] **Nothing sweeps `investments.status` to `matured` when
+      `maturity_date` passes.** Same shape as savings' unbuilt dormancy
+      sweep — belongs to Module 12's scheduler. Until then, `matured` is a
+      valid enum value that nothing ever sets; `requestRedemption` works
+      correctly regardless (it derives "early or not" from comparing dates
+      directly, not from this status), so this is a reporting gap, not a
+      correctness one.
 
 ---
 
@@ -1177,3 +1347,26 @@ deliberately changed._
   own explicit workflow if it's ever needed, not a side effect of the
   existing reactivate endpoint. See Open Questions if this needs
   revisiting.
+- **Module 5 (Investment) was built before Module 6 (Cashier/Till/Vault)**,
+  out of CLAUDE.md's suggested order (`... 5. Module 6 ... 6. Module 5
+  ...`) — done on an explicit instruction to start Module 5 next, not a
+  discovered dependency reason. Checked before starting: nothing in
+  Module 5's actual functional requirements needs Module 6 to exist first
+  (it needs a customer, a branch, and the shared GL/approval services, all
+  already built) — the payout/redemption confirmation is a manual staff
+  step precisely because neither Module 6's cashier/till flow nor real
+  payments integration exist yet, see Open Questions. If Module 6 later
+  wants investment payouts to actually run through a till, that's a
+  genuine integration point to build then, not something this session
+  blocked on.
+- **Module 5's own "BEFORE YOU WRITE CODE" note references "Module 7"
+  for the payments layer** (MoMo/bank payout) — same
+  `SwiftCedi_Module_Build_Prompts.md` numbering inconsistency already
+  flagged for Module 1 (see above): Module 7 in this document is "GL,
+  Accounting & Financial Reporting," not payments, and no payments module
+  exists in the prompt document at all — payments integration is only the
+  Suggested Build Order's separate, undetailed step 7. Resolved the same
+  way: GL posting in Module 5 uses the real `glPosting.js`/Module 7 GL
+  built in this repo; the actual payments-rail question is answered by
+  the manual-confirmation stub described in Open Questions, not by a
+  nonexistent "Module 7 payments layer."

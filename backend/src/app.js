@@ -12,10 +12,12 @@ const { groupsRouter } = require('./routes/groups');
 const { loansRouter } = require('./routes/loans');
 const { savingsRouter } = require('./routes/savings');
 const { susuRouter } = require('./routes/susu');
+const { investmentsRouter } = require('./routes/investments');
 const { registerBranchExecutionHandlers } = require('./modules/branch/branchService');
 const { registerCustomerExecutionHandlers, getAccountClosure } = require('./modules/customer/customerService');
 const { registerLoanExecutionHandlers } = require('./modules/loan/loanService');
 const { registerSavingsExecutionHandlers } = require('./modules/savings/savingsService');
+const { registerInvestmentExecutionHandlers } = require('./modules/investment/investmentService');
 const { requireAuth } = require('./middleware/auth');
 const { asyncHandler } = require('./utils/asyncHandler');
 
@@ -31,6 +33,7 @@ function createApp(pool) {
   registerCustomerExecutionHandlers();
   registerLoanExecutionHandlers();
   registerSavingsExecutionHandlers();
+  registerInvestmentExecutionHandlers();
 
   app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
@@ -45,6 +48,7 @@ function createApp(pool) {
   app.use('/loans', loansRouter(pool));
   app.use('/savings', savingsRouter(pool));
   app.use('/susu', susuRouter(pool));
+  app.use('/investments', investmentsRouter(pool));
 
   app.get(
     '/account-closures/:id',

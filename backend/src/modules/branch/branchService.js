@@ -104,6 +104,9 @@ const CONTROL_ACCOUNT_CODES = {
   expense: '5000',
   loanLossExpense: '5100', // added in Module 3
   agentCommissionExpense: '5200', // added in Module 4
+  investmentDepositsPayable: '2030', // added in Module 5
+  earlyWithdrawalPenaltyIncome: '4040', // added in Module 5
+  investmentInterestExpense: '5300', // added in Module 5
 };
 
 async function getControlAccounts(db) {
@@ -195,14 +198,18 @@ async function createBranch(pool, params) {
     const agentCommissionPayableAccount = await createSubAccount(controls.agentCommissionPayable);
     const savingsFeeIncomeAccount = await createSubAccount(controls.savingsFeeIncome);
     const agentCommissionExpenseAccount = await createSubAccount(controls.agentCommissionExpense);
+    const investmentDepositsPayableAccount = await createSubAccount(controls.investmentDepositsPayable);
+    const earlyWithdrawalPenaltyIncomeAccount = await createSubAccount(controls.earlyWithdrawalPenaltyIncome);
+    const investmentInterestExpenseAccount = await createSubAccount(controls.investmentInterestExpense);
 
     await client.query(
       `INSERT INTO branch_gl_accounts
          (branch_id, cash_in_hand_account_id, vault_account_id, income_account_id, expense_account_id,
           loans_receivable_account_id, loan_interest_income_account_id, loan_fee_income_account_id, loan_loss_expense_account_id,
           cash_with_agents_account_id, customer_deposits_account_id, susu_deposits_account_id,
-          agent_commission_payable_account_id, savings_fee_income_account_id, agent_commission_expense_account_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
+          agent_commission_payable_account_id, savings_fee_income_account_id, agent_commission_expense_account_id,
+          investment_deposits_payable_account_id, early_withdrawal_penalty_income_account_id, investment_interest_expense_account_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`,
       [
         branch.id,
         cashInHandAccount.id,
@@ -219,6 +226,9 @@ async function createBranch(pool, params) {
         agentCommissionPayableAccount.id,
         savingsFeeIncomeAccount.id,
         agentCommissionExpenseAccount.id,
+        investmentDepositsPayableAccount.id,
+        earlyWithdrawalPenaltyIncomeAccount.id,
+        investmentInterestExpenseAccount.id,
       ]
     );
 
@@ -245,6 +255,9 @@ async function createBranch(pool, params) {
         agentCommissionPayable: agentCommissionPayableAccount,
         savingsFeeIncome: savingsFeeIncomeAccount,
         agentCommissionExpense: agentCommissionExpenseAccount,
+        investmentDepositsPayable: investmentDepositsPayableAccount,
+        earlyWithdrawalPenaltyIncome: earlyWithdrawalPenaltyIncomeAccount,
+        investmentInterestExpense: investmentInterestExpenseAccount,
       },
     };
 

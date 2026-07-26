@@ -48,6 +48,7 @@ describeIfDb('Module 1: branch management', () => {
     await pool.query('TRUNCATE loan_repayments RESTART IDENTITY CASCADE');
     await pool.query('TRUNCATE savings_transactions, susu_collections RESTART IDENTITY CASCADE');
     await pool.query('TRUNCATE overdraft_interest_accruals RESTART IDENTITY CASCADE');
+    await pool.query('TRUNCATE investment_accruals RESTART IDENTITY CASCADE');
 
     // Module 2 and 3 tables are cleared here too (in FK order, ending with
     // `customers` before `users`/`approval_requests`) since account_closures
@@ -58,6 +59,10 @@ describeIfDb('Module 1: branch management', () => {
     // loan_repayments needs TRUNCATE (DELETE is blocked by its immutability
     // trigger) and is handled above.
     for (const table of [
+      'investment_redemptions',
+      'investment_payouts',
+      'investments',
+      'investment_products',
       'standing_order_runs',
       'standing_orders',
       'susu_commissions',
