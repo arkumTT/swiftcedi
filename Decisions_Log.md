@@ -1906,6 +1906,34 @@ is completed._
   screen read from** — one query, one component
   (`RecentTransactionsWidget`), reused in both places rather than two
   separate implementations.
+- **Customers & CRM (`src/features/main/customers/`) needed zero backend
+  additions** — `GET /customers`, `GET /loans`, `GET /savings`, and
+  `GET /investments` already all accept a `customerId`/filter set, and
+  `GET /customers/:id/360` already aggregates documents, next-of-kin,
+  credit bureau lookups, and group info in one call. `Customer360Page`
+  fetches that 360 payload plus the three list endpoints (each filtered
+  by `customerId`) in parallel, since `getCustomer360` itself
+  deliberately excludes loans/savings/investments (its own
+  `pendingModules` field says so) — those three modules' real list
+  endpoints already covered the gap.
+  - `CustomersListPage` follows the same no-text-search honesty already
+    established for `CommandPalette`: filters are branch/type/status/
+    classification dropdowns (plus a free-text exact-match input for the
+    free-form `classification` column), not a fake name search box.
+  - The create-customer modal only covers `individual`/`sme` — `group` is
+    a deliberately separate backend flow (`createGroup`/`groups.js`, not
+    `createCustomer`), so groups are formed from an existing customer's
+    360 page once members are onboarded individually, matching
+    `validateCustomerFields`'s own rejection of `customerType: 'group'`.
+  - Document upload has no file-storage backend — `AddDocumentModal`
+    takes a `fileUrl` text field (an already-hosted link) rather than a
+    fake file picker, consistent with the `customer_documents` table
+    schema itself (`file_url TEXT`, no blob storage).
+  - `customer.close` (closure request) posts to `/customers/:id/closure-
+    requests`, which returns 202/pending — the modal explicitly tells the
+    user this is a maker-checker request, not an immediate closure, so
+    the UI doesn't imply an action completed when it's actually now
+    sitting in the Approvals queue.
 
 ---
 
