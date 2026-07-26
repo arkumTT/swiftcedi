@@ -37,6 +37,15 @@ function requireAuth(pool) {
       return res.status(401).json({ error: 'user not found or not active' });
     }
 
+    // Module 1: active (non-revoked, within date range) cross-branch access
+    // grants also let a user scope requests to a branch that isn't their
+    // home branch — see requirePermission.js's resolveBranchScope.
+    const { rows: grantRows } = await pool.query(
+      `SELECT branch_id FROM cross_branch_access_grants
+       WHERE user_id = $1 AND revoked_at IS NULL AND start_date <= current_date AND end_date >= current_date`,
+      [user.id]
+    );
+
     req.user = {
       id: user.id,
       fullName: user.full_name,
@@ -45,6 +54,7 @@ function requireAuth(pool) {
       roleId: user.role_id,
       roleName: user.role_name,
       permissions: new Set(user.permissions),
+      crossBranchAccessibleBranchIds: new Set(grantRows.map((r) => r.branch_id)),
     };
     return next();
   };

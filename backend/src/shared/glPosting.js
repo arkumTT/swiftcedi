@@ -1,6 +1,7 @@
 'use strict';
 
 const auditLog = require('./auditLog');
+const approvalWorkflow = require('./approvalWorkflow');
 
 /**
  * Shared GL posting interface (Module 7). No module writes to
@@ -11,9 +12,30 @@ const auditLog = require('./auditLog');
  * and gives callers a clear, typed error.
  */
 
-class GlPostingValidationError extends Error {}
+// statusCode is set here (400/409) so newer routes can rely on the
+// generic err.statusCode fallback in app.js's error handler, per
+// Decisions_Log.md's API Conventions — older routes (routes/gl.js) still
+// use explicit `instanceof` checks and both patterns coexist fine, since
+// adding a property doesn't change instanceof behavior.
+class GlPostingValidationError extends Error {
+  constructor(message) {
+    super(message);
+    this.statusCode = 400;
+  }
+}
 class UnbalancedEntryError extends GlPostingValidationError {}
-class PeriodLockedError extends Error {}
+class PeriodLockedError extends Error {
+  constructor(message) {
+    super(message);
+    this.statusCode = 409;
+  }
+}
+class GlPostingConflictError extends Error {
+  constructor(message) {
+    super(message);
+    this.statusCode = 409;
+  }
+}
 
 /**
  * Pure validation: every line has exactly one of debit/credit set, amounts
@@ -175,6 +197,211 @@ async function postJournalEntry(pool, params) {
 }
 
 /**
+ * Reverses a posted journal entry: builds a NEW entry with every line's
+ * debit/credit swapped (same accounts, same amounts — a true offsetting
+ * entry), links it back via `reverses_entry_id`, and flips the ORIGINAL
+ * entry's status to 'reversed'. The original's lines are never touched —
+ * they're immutable at the DB layer regardless. Reuses `postJournalEntry`
+ * for the actual insert (period-lock check, balance validation, audit
+ * log) rather than duplicating any of that.
+ *
+ * Added in Module 6 to activate `gl_journal_entries.status = 'reversed'`,
+ * which has existed in the CHECK constraint (and Decisions_Log) since
+ * Module 7 but had no producer until now — see Decisions_Log.md.
+ *
+ * @param {import('pg').Pool} pool
+ * @param {object} params
+ * @param {number} params.originalEntryId
+ * @param {string} params.reason
+ * @param {number} params.reversedBy
+ * @param {string} params.entryDate - 'YYYY-MM-DD'
+ * @param {'standard'|'prior_period_adjustment'} [params.entryType='standard']
+ */
+async function reverseJournalEntry(pool, { originalEntryId, reason, reversedBy, entryDate, entryType = 'standard' }) {
+  if (!originalEntryId || !reason || !reversedBy || !entryDate) {
+    throw new GlPostingValidationError(
+      `reverseJournalEntry missing required field(s): ${['originalEntryId', 'reason', 'reversedBy', 'entryDate']
+        .filter((f) => !{ originalEntryId, reason, reversedBy, entryDate }[f])
+        .join(', ')}`
+    );
+  }
+
+  const { rows: entryRows } = await pool.query('SELECT * FROM gl_journal_entries WHERE id = $1', [originalEntryId]);
+  const original = entryRows[0];
+  if (!original) {
+    throw new GlPostingValidationError(`gl_journal_entries ${originalEntryId} not found`);
+  }
+  if (original.status !== 'posted') {
+    throw new GlPostingValidationError(
+      `gl_journal_entries ${originalEntryId} is not posted (status: ${original.status}); it may already be reversed`
+    );
+  }
+
+  const { rows: lineRows } = await pool.query('SELECT * FROM gl_journal_lines WHERE journal_entry_id = $1', [
+    originalEntryId,
+  ]);
+  const swappedLines = lineRows.map((line) => ({
+    accountId: line.account_id,
+    debitPesewas: Number(line.credit_pesewas),
+    creditPesewas: Number(line.debit_pesewas),
+    branchId: line.branch_id,
+  }));
+
+  const reversalEntry = await postJournalEntry(pool, {
+    branchId: original.branch_id,
+    reference: `REV-${original.reference}`,
+    description: `Reversal of entry ${originalEntryId}: ${reason}`,
+    entryDate,
+    sourceModule: original.source_module,
+    createdBy: reversedBy,
+    entryType,
+    lines: swappedLines,
+  });
+
+  const client = await pool.connect();
+  let updatedOriginal;
+  try {
+    await client.query('BEGIN');
+    await client.query('UPDATE gl_journal_entries SET reverses_entry_id = $1 WHERE id = $2', [
+      originalEntryId,
+      reversalEntry.id,
+    ]);
+    const { rows: updatedRows } = await client.query(
+      "UPDATE gl_journal_entries SET status = 'reversed' WHERE id = $1 RETURNING *",
+      [originalEntryId]
+    );
+    updatedOriginal = updatedRows[0];
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+
+  await auditLog.record(pool, {
+    userId: reversedBy,
+    branchId: original.branch_id,
+    action: 'gl.reversed',
+    entityType: 'gl_journal_entry',
+    entityId: originalEntryId,
+    beforeState: { status: 'posted' },
+    afterState: { status: 'reversed', reversalEntryId: reversalEntry.id, reason },
+  });
+
+  return { reversalEntry: { ...reversalEntry, reverses_entry_id: originalEntryId }, originalEntry: updatedOriginal };
+}
+
+// --- Prior-period adjustments (back-dated corrections into a locked period) -
+
+/**
+ * Requests a back-dated correction into a LOCKED gl_periods row — the
+ * module spec's "distinct back-dated adjustment workflow with extra
+ * approval" (added while building Module 6, but deliberately not
+ * Module-6-specific — any module could need this). ALWAYS requires
+ * maker-checker, no threshold escape hatch. Snapshots the proposed
+ * `lines` at request time so what eventually posts can never silently
+ * drift from what a checker reviewed.
+ */
+async function requestPriorPeriodAdjustment(pool, { branchId, entryDate, description, lines, requestedBy }) {
+  if (!branchId || !entryDate || !description || !requestedBy) {
+    throw new GlPostingValidationError('branchId, entryDate, description, and requestedBy are required');
+  }
+  const { totalDebit } = validateBalancedLines(lines);
+
+  const { rows } = await pool.query(
+    `INSERT INTO gl_prior_period_adjustments (branch_id, entry_date, description, lines, requested_by)
+     VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+    [branchId, entryDate, description, JSON.stringify(lines), requestedBy]
+  );
+  const adjustment = rows[0];
+
+  const approvalRequest = await approvalWorkflow.requestApproval(pool, {
+    actionType: 'gl.prior_period_adjustment',
+    entityType: 'gl_prior_period_adjustment',
+    entityId: adjustment.id,
+    branchId,
+    requestedBy,
+    amountPesewas: totalDebit,
+  });
+
+  const { rows: updatedRows } = await pool.query(
+    'UPDATE gl_prior_period_adjustments SET approval_request_id = $1, updated_at = now() WHERE id = $2 RETURNING *',
+    [approvalRequest.id, adjustment.id]
+  );
+
+  return { adjustment: updatedRows[0], approvalRequest };
+}
+
+/**
+ * Registered as the 'gl.prior_period_adjustment' execution handler —
+ * only flips the adjustment to `approved` here. The actual posting
+ * (`postJournalEntry` owns its own transaction) happens afterward via
+ * `postApprovedPriorPeriodAdjustment`, same two-phase shape every other
+ * approval-gated GL posting in this codebase uses.
+ */
+async function applyPriorPeriodAdjustmentApprovalDecision(approvalRequest, db) {
+  const { rows: adjustmentRows } = await db.query(
+    'SELECT * FROM gl_prior_period_adjustments WHERE approval_request_id = $1 FOR UPDATE',
+    [approvalRequest.id]
+  );
+  const adjustment = adjustmentRows[0];
+  if (!adjustment) {
+    throw new GlPostingValidationError(`no gl_prior_period_adjustments row for approval_request ${approvalRequest.id}`);
+  }
+
+  const { rows } = await db.query(
+    "UPDATE gl_prior_period_adjustments SET status = 'approved', updated_at = now() WHERE id = $1 RETURNING *",
+    [adjustment.id]
+  );
+
+  await auditLog.record(db, {
+    userId: approvalRequest.decided_by,
+    branchId: approvalRequest.branch_id,
+    action: 'gl.prior_period_adjustment_approved',
+    entityType: 'gl_prior_period_adjustment',
+    entityId: adjustment.id,
+    beforeState: { status: adjustment.status },
+    afterState: { status: rows[0].status },
+  });
+}
+
+/** Posts an approved prior-period adjustment, using entryType = 'prior_period_adjustment' — the only value assertPeriodOpen() lets through a locked period. */
+async function postApprovedPriorPeriodAdjustment(pool, { adjustmentId, postedBy }) {
+  const { rows } = await pool.query('SELECT * FROM gl_prior_period_adjustments WHERE id = $1', [adjustmentId]);
+  const adjustment = rows[0];
+  if (!adjustment) throw new GlPostingValidationError(`gl_prior_period_adjustments ${adjustmentId} not found`);
+  if (adjustment.status !== 'approved') {
+    throw new GlPostingConflictError(
+      `gl_prior_period_adjustments ${adjustmentId} is not approved (status: ${adjustment.status})`
+    );
+  }
+
+  const journalEntry = await postJournalEntry(pool, {
+    branchId: adjustment.branch_id,
+    reference: `PPA-${adjustmentId}`,
+    description: adjustment.description,
+    entryDate: adjustment.entry_date,
+    sourceModule: 'gl_prior_period_adjustment',
+    createdBy: postedBy,
+    entryType: 'prior_period_adjustment',
+    lines: adjustment.lines,
+  });
+
+  const { rows: updatedRows } = await pool.query(
+    "UPDATE gl_prior_period_adjustments SET status = 'posted', journal_entry_id = $1, updated_at = now() WHERE id = $2 RETURNING *",
+    [journalEntry.id, adjustmentId]
+  );
+
+  return { adjustment: updatedRows[0], journalEntry };
+}
+
+/** Call once at app startup so decide() can dispatch prior-period-adjustment approvals. */
+function registerGlExecutionHandlers() {
+  approvalWorkflow.registerExecutionHandler('gl.prior_period_adjustment', applyPriorPeriodAdjustmentApprovalDecision);
+}
+
+/**
  * Reconstruct an account's balance as of a given date from
  * `gl_journal_lines` directly (never from a mutable running-balance
  * column), so restated/corrected history stays accurate.
@@ -211,10 +438,16 @@ async function getAccountBalance(db, { accountId, asOfDate = null, branchId = nu
 
 module.exports = {
   postJournalEntry,
+  reverseJournalEntry,
+  requestPriorPeriodAdjustment,
+  applyPriorPeriodAdjustmentApprovalDecision,
+  postApprovedPriorPeriodAdjustment,
+  registerGlExecutionHandlers,
   getAccountBalance,
   validateBalancedLines,
   normalizeBalance,
   GlPostingValidationError,
   UnbalancedEntryError,
   PeriodLockedError,
+  GlPostingConflictError,
 };

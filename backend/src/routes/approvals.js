@@ -42,15 +42,23 @@ function approvalsRouter(pool) {
     requirePermission('approval.decide'),
     asyncHandler(async (req, res) => {
       const { decision, reason } = req.body || {};
+      // decide() may dispatch to a registered execution handler (e.g. Module
+      // 1's branch closure), so this runs in its own transaction — the
+      // decision and whatever side effect it authorizes commit or roll back
+      // together.
+      const client = await pool.connect();
       try {
-        const result = await approvalWorkflow.decide(pool, {
+        await client.query('BEGIN');
+        const result = await approvalWorkflow.decide(client, {
           approvalId: req.params.id,
           decidedBy: req.user.id,
           decision,
           reason,
         });
+        await client.query('COMMIT');
         res.json(result);
       } catch (err) {
+        await client.query('ROLLBACK');
         if (err instanceof approvalWorkflow.ApprovalNotFoundError) {
           return res.status(404).json({ error: err.message });
         }
@@ -61,6 +69,8 @@ function approvalsRouter(pool) {
           return res.status(400).json({ error: err.message });
         }
         throw err;
+      } finally {
+        client.release();
       }
     })
   );
