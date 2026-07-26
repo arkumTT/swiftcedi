@@ -1,7 +1,7 @@
 import { useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useQueries, useQuery } from '@tanstack/react-query';
-import { Landmark, HandCoins, Wallet, ShieldAlert, Users, PiggyBank, Receipt } from 'lucide-react';
+import { Landmark, HandCoins, Wallet, ShieldAlert, Users, PiggyBank, Receipt, MapPinned } from 'lucide-react';
 import { useAuth } from '../../../auth/AuthContext';
 import { isCrossBranchRole } from '../../../lib/roleScope';
 import { api } from '../../../lib/apiClient';
@@ -48,6 +48,11 @@ export function DashboardPage() {
   const navigate = useNavigate();
   const crossBranch = isCrossBranchRole(user!.roleName);
   const canViewTransactions = hasPermission('gl.view_reports');
+  // cashier and field_agent roles are deliberately not analytics audiences
+  // (see migration 045's role_permissions seed) — their dashboard queries
+  // must be gated the same way, or they'd fire 403s against
+  // /analytics/live-stats etc. and show misleading all-zero KPI tiles.
+  const canViewAnalytics = hasPermission('analytics.view');
   // 'all' is a real, backend-recognized sentinel (resolveAnalyticsBranchScope,
   // see Decisions_Log.md) — without it, omitting branchId defaults to the
   // caller's OWN home branch even for owner/system_admin, which would
@@ -58,6 +63,7 @@ export function DashboardPage() {
   const liveStats = useQuery({
     queryKey: ['live-stats', analyticsScopeBranchId],
     queryFn: () => api.get<LiveStats>('/analytics/live-stats', { branchId: analyticsScopeBranchId }),
+    enabled: canViewAnalytics,
   });
   const portfolioQuality = useQuery({
     queryKey: ['portfolio-quality', analyticsScopeBranchId, user!.roleName === 'loan_officer' ? user!.id : undefined],
@@ -66,6 +72,7 @@ export function DashboardPage() {
         branchId: analyticsScopeBranchId,
         loanOfficerId: user!.roleName === 'loan_officer' ? user!.id : undefined,
       }),
+    enabled: canViewAnalytics,
   });
   const growthTrends = useQuery({
     queryKey: ['growth-trends', analyticsScopeBranchId],
@@ -76,11 +83,12 @@ export function DashboardPage() {
         branchId: analyticsScopeBranchId,
         granularity: 'month',
       }),
+    enabled: canViewAnalytics,
   });
   const branchesQuery = useQuery({
     queryKey: ['branches'],
     queryFn: () => api.get<Branch[]>('/branches'),
-    enabled: crossBranch,
+    enabled: crossBranch && canViewAnalytics,
   });
   const branchParQueries = useQueries({
     queries: (crossBranch ? branchesQuery.data ?? [] : []).map((b) => ({
@@ -126,27 +134,31 @@ export function DashboardPage() {
         <p className="text-[13px] text-text-secondary">Welcome back, {user!.fullName}.</p>
       </div>
 
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <KpiCard label="Today's disbursements" value={formatGhs(liveStats.data?.todaysDisbursements.totalPesewas)} icon={<Landmark size={16} />} />
-        <KpiCard label="Today's collections" value={formatGhs(totalCollectedToday)} icon={<HandCoins size={16} />} />
-        <KpiCard
-          label="Cash position"
-          value={formatGhs(typeof liveStats.data?.cashPosition.totalPesewas === 'number' ? liveStats.data.cashPosition.totalPesewas : 0)}
-          icon={<Wallet size={16} />}
-        />
-        <KpiCard
-          label="Portfolio at risk (30d)"
-          value={portfolioQuality.data?.par30.ratio != null ? `${(portfolioQuality.data.par30.ratio * 100).toFixed(1)}%` : '—'}
-          higherIsBetter={false}
-          icon={<ShieldAlert size={16} />}
-        />
-      </div>
+      {canViewAnalytics && (
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          <KpiCard label="Today's disbursements" value={formatGhs(liveStats.data?.todaysDisbursements.totalPesewas)} icon={<Landmark size={16} />} />
+          <KpiCard label="Today's collections" value={formatGhs(totalCollectedToday)} icon={<HandCoins size={16} />} />
+          <KpiCard
+            label="Cash position"
+            value={formatGhs(typeof liveStats.data?.cashPosition.totalPesewas === 'number' ? liveStats.data.cashPosition.totalPesewas : 0)}
+            icon={<Wallet size={16} />}
+          />
+          <KpiCard
+            label="Portfolio at risk (30d)"
+            value={portfolioQuality.data?.par30.ratio != null ? `${(portfolioQuality.data.par30.ratio * 100).toFixed(1)}%` : '—'}
+            higherIsBetter={false}
+            icon={<ShieldAlert size={16} />}
+          />
+        </div>
+      )}
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-        <Card title="Disbursements vs. collections">
-          <TrendChart data={trendData} />
-        </Card>
-        {crossBranch ? (
+        {canViewAnalytics && (
+          <Card title="Disbursements vs. collections">
+            <TrendChart data={trendData} />
+          </Card>
+        )}
+        {crossBranch && canViewAnalytics ? (
           <Card title="Branch PAR30 comparison">
             <BranchParChart data={branchParData} />
           </Card>
@@ -163,7 +175,7 @@ export function DashboardPage() {
                   <Landmark size={14} /> Loans & Credit
                 </Button>
               )}
-              {hasPermission('savings.view') && (
+              {(hasPermission('savings.view') || hasPermission('susu.view') || hasPermission('susu.record_collection')) && (
                 <Button variant="secondary" size="sm" onClick={() => navigate('/app/savings')}>
                   <PiggyBank size={14} /> Savings & Susu
                 </Button>
@@ -176,6 +188,11 @@ export function DashboardPage() {
               {canViewTransactions && (
                 <Button variant="secondary" size="sm" onClick={() => navigate('/app/transactions')}>
                   <Receipt size={14} /> Transactions
+                </Button>
+              )}
+              {(hasPermission('agent.manage') || hasPermission('agent.view_locations') || hasPermission('agent.ping_location')) && (
+                <Button variant="secondary" size="sm" onClick={() => navigate('/app/agents')}>
+                  <MapPinned size={14} /> Field Agents
                 </Button>
               )}
             </div>

@@ -22,7 +22,14 @@ export function SavingsSusuPage() {
   const queryClient = useQueryClient();
   const crossBranch = isCrossBranchRole(user!.roleName);
   const { data: branches } = useBranches();
-  const [view, setView] = useState<'savings' | 'susu'>('savings');
+  // Field agents hold susu.view/susu.record_collection but not
+  // savings.view (they never handle a till — see migration 031's
+  // role_permissions seed), so the default tab must follow what the role
+  // can actually see; otherwise it fires an unconditioned GET /savings
+  // that 403s for them.
+  const canSeeSavings = hasPermission('savings.view');
+  const canSeeSusu = hasPermission('susu.view') || hasPermission('susu.record_collection');
+  const [view, setView] = useState<'savings' | 'susu'>(canSeeSavings ? 'savings' : 'susu');
 
   const [branchId, setBranchId] = useState(crossBranch ? '' : user!.homeBranchId);
   const [status, setStatus] = useState('');
@@ -33,12 +40,12 @@ export function SavingsSusuPage() {
   const savingsQuery = useQuery({
     queryKey: ['savings-accounts', { branchId, status }],
     queryFn: () => api.get<SavingsAccount[]>('/savings', { branchId: crossBranch ? branchId : user!.homeBranchId, status }),
-    enabled: view === 'savings',
+    enabled: view === 'savings' && canSeeSavings,
   });
   const susuQuery = useQuery({
     queryKey: ['susu-accounts', { branchId, status }],
     queryFn: () => api.get<SusuAccount[]>('/susu', { branchId: crossBranch ? branchId : user!.homeBranchId, status }),
-    enabled: view === 'susu',
+    enabled: view === 'susu' && canSeeSusu,
   });
 
   const savingsColumns: Column<SavingsAccount>[] = [
@@ -72,8 +79,8 @@ export function SavingsSusuPage() {
       >
         <FilterToolbar
           chips={[
-            { label: 'Savings accounts', active: view === 'savings', onClick: () => setView('savings') },
-            { label: 'Susu accounts', active: view === 'susu', onClick: () => setView('susu') },
+            ...(canSeeSavings ? [{ label: 'Savings accounts', active: view === 'savings', onClick: () => setView('savings') }] : []),
+            ...(canSeeSusu ? [{ label: 'Susu accounts', active: view === 'susu', onClick: () => setView('susu') }] : []),
           ]}
         >
           {crossBranch && (

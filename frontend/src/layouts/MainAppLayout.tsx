@@ -40,7 +40,7 @@ const NAV_GROUPS: NavGroup[] = [
     label: 'Operations',
     items: [
       { to: '/app/cashier', label: 'Cashier & Vault', icon: Wallet, anyOf: ['cashier.view'] },
-      { to: '/app/transactions', label: 'Transactions', icon: Receipt, anyOf: ['gl.view_reports', 'cashier.view', 'loan.view_reports'] },
+      { to: '/app/transactions', label: 'Transactions', icon: Receipt, anyOf: ['gl.view_reports'] },
       { to: '/app/branches', label: 'Branches', icon: Building2, anyOf: ['branch.view_performance'] },
       { to: '/app/agents', label: 'Field Agents', icon: MapPinned, anyOf: ['agent.manage', 'agent.view_locations', 'agent.ping_location'] },
     ],

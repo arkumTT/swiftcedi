@@ -43,6 +43,22 @@ const ADMIN_ANY_OF = [
   'sysadmin.manage_backups',
 ];
 
+// Mirrors each nav item's `anyOf` in MainAppLayout.tsx exactly — a role that
+// can't see a link in the sidebar must also be blocked from reaching the
+// same screen by typing the URL directly, with the same honest "you don't
+// have access" message RequirePermission already gives Admin routes,
+// instead of the page silently firing 403 API calls.
+const CUSTOMERS_ANY_OF = ['customer.create', 'customer.update', 'customer.verify_kyc'];
+const LOANS_ANY_OF = ['loan.apply', 'loan.appraise', 'loan.disburse', 'loan.view_reports'];
+const SAVINGS_ANY_OF = ['savings.view', 'susu.view', 'susu.record_collection'];
+const INVESTMENTS_ANY_OF = ['investment.view', 'investment.book'];
+const CASHIER_ANY_OF = ['cashier.view'];
+const TRANSACTIONS_ANY_OF = ['gl.view_reports'];
+const BRANCHES_ANY_OF = ['branch.view_performance'];
+const AGENTS_ANY_OF = ['agent.manage', 'agent.view_locations', 'agent.ping_location'];
+const REPORTS_ANY_OF = ['analytics.view', 'gl.view_reports'];
+const COMPLIANCE_ANY_OF = ['compliance.generate_reports', 'compliance.manage_aml', 'compliance.manage_sanctions'];
+
 function App() {
   return (
     <Routes>
@@ -143,24 +159,69 @@ function App() {
         }
       >
         <Route index element={<DashboardPage />} />
-        <Route path="customers" element={<CustomersListPage />} />
-        <Route path="customers/:id" element={<Customer360Page />} />
-        <Route path="loans" element={<LoansListPage />} />
-        <Route path="loans/:id" element={<LoanDetailPage />} />
-        <Route path="savings" element={<SavingsSusuPage />} />
-        <Route path="savings/accounts/:id" element={<SavingsAccountDetailPage />} />
-        <Route path="savings/susu/:id" element={<SusuAccountDetailPage />} />
-        <Route path="investments" element={<InvestmentsListPage />} />
-        <Route path="investments/:id" element={<InvestmentDetailPage />} />
-        <Route path="cashier" element={<CashierVaultPage />} />
-        <Route path="cashier/tills/:id" element={<TillDetailPage />} />
-        <Route path="transactions" element={<TransactionsPage />} />
-        <Route path="branches" element={<BranchesPage />} />
-        <Route path="branches/:id" element={<BranchDetailPage />} />
-        <Route path="agents" element={<FieldAgentsPage />} />
-        <Route path="agents/:id" element={<FieldAgentDetailPage />} />
-        <Route path="reports" element={<ReportsPage />} />
-        <Route path="compliance" element={<CompliancePage />} />
+        <Route
+          path="customers"
+          element={<RequirePermission anyOf={CUSTOMERS_ANY_OF}><CustomersListPage /></RequirePermission>}
+        />
+        <Route
+          path="customers/:id"
+          element={<RequirePermission anyOf={CUSTOMERS_ANY_OF}><Customer360Page /></RequirePermission>}
+        />
+        <Route path="loans" element={<RequirePermission anyOf={LOANS_ANY_OF}><LoansListPage /></RequirePermission>} />
+        <Route
+          path="loans/:id"
+          element={<RequirePermission anyOf={LOANS_ANY_OF}><LoanDetailPage /></RequirePermission>}
+        />
+        <Route
+          path="savings"
+          element={<RequirePermission anyOf={SAVINGS_ANY_OF}><SavingsSusuPage /></RequirePermission>}
+        />
+        <Route
+          path="savings/accounts/:id"
+          element={<RequirePermission anyOf={SAVINGS_ANY_OF}><SavingsAccountDetailPage /></RequirePermission>}
+        />
+        <Route
+          path="savings/susu/:id"
+          element={<RequirePermission anyOf={SAVINGS_ANY_OF}><SusuAccountDetailPage /></RequirePermission>}
+        />
+        <Route
+          path="investments"
+          element={<RequirePermission anyOf={INVESTMENTS_ANY_OF}><InvestmentsListPage /></RequirePermission>}
+        />
+        <Route
+          path="investments/:id"
+          element={<RequirePermission anyOf={INVESTMENTS_ANY_OF}><InvestmentDetailPage /></RequirePermission>}
+        />
+        <Route
+          path="cashier"
+          element={<RequirePermission anyOf={CASHIER_ANY_OF}><CashierVaultPage /></RequirePermission>}
+        />
+        <Route
+          path="cashier/tills/:id"
+          element={<RequirePermission anyOf={CASHIER_ANY_OF}><TillDetailPage /></RequirePermission>}
+        />
+        <Route
+          path="transactions"
+          element={<RequirePermission anyOf={TRANSACTIONS_ANY_OF}><TransactionsPage /></RequirePermission>}
+        />
+        <Route
+          path="branches"
+          element={<RequirePermission anyOf={BRANCHES_ANY_OF}><BranchesPage /></RequirePermission>}
+        />
+        <Route
+          path="branches/:id"
+          element={<RequirePermission anyOf={BRANCHES_ANY_OF}><BranchDetailPage /></RequirePermission>}
+        />
+        <Route path="agents" element={<RequirePermission anyOf={AGENTS_ANY_OF}><FieldAgentsPage /></RequirePermission>} />
+        <Route
+          path="agents/:id"
+          element={<RequirePermission anyOf={AGENTS_ANY_OF}><FieldAgentDetailPage /></RequirePermission>}
+        />
+        <Route path="reports" element={<RequirePermission anyOf={REPORTS_ANY_OF}><ReportsPage /></RequirePermission>} />
+        <Route
+          path="compliance"
+          element={<RequirePermission anyOf={COMPLIANCE_ANY_OF}><CompliancePage /></RequirePermission>}
+        />
         <Route path="settings" element={<SettingsPage />} />
       </Route>
 

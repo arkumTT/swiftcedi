@@ -2177,6 +2177,75 @@ is completed._
     list was judged out of scope; flagged as a candidate for a real
     changelog endpoint if this becomes a maintained product rather than a
     single build session.
+- **Final verification pass: a scripted Playwright sweep (5 real seeded
+  users spanning every role — owner, system_admin, branch_manager,
+  loan_officer, field_agent — across light/dark theme × desktop/tablet/
+  narrow viewports, ~121 page loads total) caught four real bugs that
+  typechecking/linting alone had missed, all now fixed:**
+  - **No `/app/*` route was actually permission-gated** — the sidebar
+    hid links a role couldn't use, but typing the URL directly (or a
+    stale bookmark/back-button) still rendered the full page and fired
+    its data queries, which came back 403 and surfaced as raw console
+    errors with no explanation to the user. Fixed by wrapping every
+    `/app/*` route in `RequirePermission` in `App.tsx`, using the exact
+    same `anyOf` list already declared for that route's nav item in
+    `MainAppLayout.tsx` — same honest "you don't have access" pattern
+    `RequirePermission` already gave Admin routes, now applied
+    consistently to the Main App tree too.
+  - **`DashboardPage`'s KPI/trend-chart queries (`live-stats`,
+    `portfolio-quality`, `growth-trends`) had no permission gate at
+    all**, so cashier and field_agent — deliberately NOT analytics
+    audiences per migration 045's role_permissions seed — got 403s on
+    every dashboard load and a "Branch dashboard" showing four KPI tiles
+    reading GH₵0.00/"—", which reads as real data ("nothing happened
+    today") rather than "you can't see this." Fixed by gating those
+    three queries and the whole KPI/trend-chart section behind
+    `hasPermission('analytics.view')`; a role without it now gets the
+    welcome header plus a Quick Actions card only. Also added two Quick
+    Action buttons (Savings & Susu, Field Agents) gated on
+    `susu.view`/`susu.record_collection` and
+    `agent.manage`/`agent.view_locations`/`agent.ping_location`
+    respectively — field_agent previously had zero buttons it could see
+    in that card, which was itself a smaller instance of the same gap.
+  - **`SavingsSusuPage` defaulted its tab to `'savings'` unconditionally**,
+    so field_agent (who holds `susu.view`/`susu.record_collection` but
+    not `savings.view` — they never handle a till, per migration 031)
+    got a 403 on page load and an unreachable "Savings accounts" tab
+    they could still click into. Fixed by defaulting the tab to whichever
+    the caller can actually see (`savings.view` ? 'savings' : 'susu'),
+    additionally gating each tab's query on its own permission, and
+    hiding the tab-chip entirely for a permission the caller lacks.
+  - **The Transactions nav item and route both advertised
+    `cashier.view`/`loan.view_reports` as alternate ways in**, but the
+    page's sole data source (`GET /gl/journal-entries`) has only ever
+    required `gl.view_reports` (see the GL routes section above) — a
+    permission only owner/system_admin hold. branch_manager and
+    loan_officer could therefore see "Transactions" in the nav and reach
+    the page, but every load 403'd with an empty ledger. Rather than
+    extend the backend to honor a scoped view those roles were never
+    actually given, narrowed both the nav item's and the route's
+    `anyOf` to `['gl.view_reports']` alone, matching what the endpoint
+    genuinely allows — the GL ledger is a report-level screen, the same
+    tier as the Reports page's financial statements, which already gate
+    on `gl.view_reports` only.
+  - Also caught, while reviewing the same dashboard screenshots (not a
+    403/console-error, so the sweep's automated check didn't flag it,
+    but eyeballing the rendered charts per the dataviz skill's "render it
+    and look at it" step did): `TrendChart`'s Y-axis used a fixed
+    ÷1,000,000 divisor labeled "k", which reads as GH₵10,000 increments —
+    for any institution whose daily disbursement/collection volumes run
+    under that (a realistic range for a microfinance book, and this
+    session's own live seed data), every tick collapsed to "0k",
+    an uninformative axis. Replaced with `Intl.NumberFormat`'s
+    `notation: 'compact'`, which scales its own label ("GH₵3.1K",
+    "GH₵150K", "GH₵0") to whatever range the data actually falls in,
+    instead of a divisor tuned to one assumed scale.
+  - No visual/layout defects (overflow, broken responsive collapse,
+    dark-mode contrast failures) turned up at any of the three tested
+    viewport widths in either theme — the design system's dark-mode
+    token overrides, sidebar icon-rail collapse below desktop width, and
+    `DataTable`'s internal horizontal-scroll-on-overflow behavior all
+    held up under the sweep.
 
 ---
 

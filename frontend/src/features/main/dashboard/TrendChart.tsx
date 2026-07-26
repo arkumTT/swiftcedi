@@ -7,6 +7,12 @@ export interface TrendPoint {
   collectedPesewas: number;
 }
 
+// Compact notation ("K"/"M") scales to the data instead of a fixed
+// divisor — a fixed ÷1,000,000 (labeled "k") collapsed to "0k" on every
+// tick for any institution whose typical disbursement/collection volumes
+// run under GH₵10,000, which is a realistic range for a microfinance book.
+const ghsCompactFormatter = new Intl.NumberFormat('en-GH', { notation: 'compact', maximumFractionDigits: 1 });
+
 /**
  * Disbursement-vs-collection trend (Section 7.4). One shared Y axis (both
  * series are pesewas amounts) — never a dual-axis chart. Fixed categorical
@@ -20,11 +26,11 @@ export function TrendChart({ data }: { data: TrendPoint[] }) {
         <CartesianGrid strokeDasharray="3 3" stroke="var(--color-border)" vertical={false} />
         <XAxis dataKey="period" tick={{ fontSize: 11, fill: 'var(--color-text-secondary)' }} axisLine={{ stroke: 'var(--color-border)' }} tickLine={false} />
         <YAxis
-          tickFormatter={(v) => `${(v / 100_00_00).toFixed(0)}k`}
+          tickFormatter={(v) => `GH₵${ghsCompactFormatter.format(v / 100)}`}
           tick={{ fontSize: 11, fill: 'var(--color-text-secondary)' }}
           axisLine={false}
           tickLine={false}
-          width={46}
+          width={58}
         />
         <Tooltip
           formatter={(value) => formatGhs(Number(value))}
