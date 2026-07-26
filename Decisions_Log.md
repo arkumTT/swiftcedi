@@ -199,7 +199,11 @@ authentication header, versioning approach._
   `/analytics/portfolio-quality`, `/analytics/profitability`,
   `/analytics/top-loan-customers`, `/analytics/growth-trends`,
   `/analytics/agent-productivity`, `/analytics/report-pack`,
-  `/analytics/dashboard-configs/mine`, `/analytics/dashboard-configs/:roleId`.
+  `/analytics/dashboard-configs/mine`, `/analytics/dashboard-configs/:roleId`,
+  `/agents/ping`, `/agents/reconciliations`,
+  `/agents/reconciliations/run-branch`, `/agents/reconciliations/:id/resolve`,
+  `/agents/:id/reassign`, `/agents/:id/assignments`, `/agents/:id/location`,
+  `/agents/:id/locations`, `/agents/:id/reconciliations`.
 - Route file ordering rule (see `backend/src/routes/branches.js`): every
   fixed-prefix path (`/regions`, `/clusters`, `/transfers`,
   `/performance/compare`) must be registered before the `/:id` catch-all,
@@ -282,6 +286,8 @@ values, loan status values, account status values._
 | `gl_manual_entries.status` | `pending`, `approved`, `posted`, `rejected` | 7 — same shape as `gl_prior_period_adjustments.status`, deliberately a separate table (see the GL service section) |
 | `bank_accounts.status` | `active`, `inactive` | 7 |
 | `bank_statement_lines.status` | `unmatched`, `matched` | 7 — `matched` requires (and is the only status paired with) a non-null `matched_journal_line_id`, enforced by a CHECK constraint |
+| `field_agents.status` | `active`, `inactive` | 10 |
+| `agent_reconciliations.status` | `matched`, `pending_review`, `resolved` | 10 — `matched`/`pending_review` are set automatically from the computed variance; `resolved` is reachable ONLY via `resolveReconciliation()`, never automatically — a CHECK constraint ties `resolved` 1:1 to `reviewed_by`/`reviewed_at` both being set |
 
 **`branches.status` transition table** (`branchService.VALID_STATUS_TRANSITIONS`):
 
@@ -1341,6 +1347,100 @@ resolveLoanOfficerScope(requestingUser, requestedOfficerId)  // the own-book enf
   ignoring anything else); only `analytics.manage_dashboards` (owner/
   system_admin) can view another role's config or write.
 
+### Field agent & operations service — `backend/src/modules/agent/agentService.js` (Module 10)
+
+`field_agents` is a 1:1 EXTENSION of a staff/user record, not a
+replacement for one — Module 4's own build already pre-answered this
+module's "confirm the join key" question (see 029_susu.sql's comment):
+`susu_collections.agent_id`/`susu_accounts.assigned_agent_id`/
+`agent_remittances.agent_id` all reference `users(id)` directly, NOT
+`field_agents`. So Module 10's own tables (`agent_assignments`,
+`agent_locations`, `agent_reconciliations`) reference `field_agents(id)`
+as their own PK, and bridge to Module 4's data via
+`field_agents.user_id = <that column>` — exactly the
+"susu_collections -> users <- field_agents" join the Module 4 comment
+describes.
+
+```js
+// agentService.js
+createFieldAgent(pool, { userId, homeBranchId, territory, createdBy }) -> field_agent  // opens its first agent_assignments row in the same transaction
+updateFieldAgent(pool, { agentId, updatedBy, fields }) -> field_agent  // territory/status only; homeBranchId must go through reassignAgent
+reassignAgent(pool, { agentId, newBranchId, territory, effectiveDate, reason, assignedBy }) -> field_agent  // closes the current open assignment, opens a new one, syncs the denormalized current branch/territory
+listAssignmentHistory(pool, { agentId }) -> agent_assignments[]
+recordLocationPing(pool, { agentId, gpsLat, gpsLng, recordedAt }) -> agent_location  // rejects (429) a ping submitted under MIN_PING_INTERVAL_SECONDS since the agent's last accepted ping
+getCurrentLocation(pool, { agentId }) / getLocationHistory(pool, { agentId, fromDate, toDate })
+purgeOldLocations(pool, { olderThanDays }) -> { deletedCount }  // callable now; scheduling it is a Module 12 concern, see below
+runDailyReconciliation(pool, { agentId, date, createdBy }) -> agent_reconciliation  // upserts; never reverts an already-'resolved' row
+runBranchDailyReconciliation(pool, { branchId, date, createdBy }) -> agent_reconciliation[]  // every active agent at the branch
+listReconciliations(pool, { branchId, agentId, status, fromDate, toDate })
+resolveReconciliation(pool, { reconciliationId, resolvedBy, resolutionNotes }) -> agent_reconciliation  // the ONLY path to status 'resolved'
+```
+
+- **`reassignAgent` mirrors `branchService.assignStaff`'s exact shape**:
+  close the current open (`end_date IS NULL`) `agent_assignments` row,
+  insert a new one, then sync the denormalized "current" fields
+  (`field_agents.home_branch_id`/`territory`) onto the parent record —
+  same pattern `branchService.assignStaff` already established for
+  `users.home_branch_id`/`branch_staff_assignments`. At most one open
+  assignment per agent at a time, enforced by a partial unique index
+  (`agent_assignments_one_open_per_agent`), same mechanism as
+  `branch_staff_assignments_one_open_per_user`.
+- **A user can be tracked as a field agent regardless of their RBAC
+  role.** The module prompt's own "susu collectors, loan officers doing
+  field visits" framing needs both a `field_agent`-role user AND a
+  `loan_officer`-role user to be trackable here, so `createFieldAgent`
+  doesn't check/require any particular role — it's an operational
+  tracking construct orthogonal to RBAC role assignment.
+- **Minimum location-ping interval (`MIN_PING_INTERVAL_SECONDS = 120`) is
+  an engineering/cost-control choice, not a regulatory figure** — the
+  module prompt asks for "a reasonable ping interval... to control mobile
+  data costs," not a specific number. A ping submitted too soon gets a
+  distinct 429 (`AgentPingTooFrequentError`), not a 409 or a silent
+  no-op, so a mobile client on flaky connectivity knows definitively not
+  to bother retrying yet.
+- **No scheduled purge job for `agent_locations`.** The module prompt
+  itself asks for "a rolling retention window rather than infinite
+  history" — `purgeOldLocations()` is a real, callable primitive
+  (default 90-day window), but actually SCHEDULING it to run periodically
+  is a Module 12 (System Administration) concern, same "the job exists,
+  the cron doesn't yet" deferral already used for Module 9's
+  `daily_metrics_snapshot`.
+- **End-of-day reconciliation only covers susu field collections, NOT
+  "any field loan repayments" the module prompt also asks for.**
+  `loanService.js` (Module 3) has no field-collection/agent concept at
+  all — `postRepayment` always posts against the branch's own cash-in-hand
+  account with no notion of "collected in the field, not yet banked" the
+  way susu's `cash_with_agents` control account + `agent_remittances`
+  bridge provides. Adding that would be real Module 3 schema/posting
+  surgery (a new collection channel, likely its own GL control account),
+  judged out of scope for a module described as reading other modules'
+  data, not redesigning one. See Open Questions.
+- **The expected/received comparison is genuinely non-tautological**,
+  unlike the bug this session already found and fixed in Module 7's bank
+  reconciliation (see that section above): `expected_amount_pesewas` sums
+  `susu_collections` by `collection_date`; `received_amount_pesewas` sums
+  `agent_remittances` by the INDEPENDENT `remitted_on` date — since an
+  agent doesn't necessarily remit the same day they collect, these two
+  sums can genuinely differ (an agent still holding cash overnight is
+  exactly the case worth flagging), not just re-derive the same number a
+  different way.
+- **A variance never auto-resolves** (module prompt's own explicit rule):
+  `status` is set to `'matched'` only when variance is exactly zero, else
+  `'pending_review'`, and only `resolveReconciliation()` — a distinct,
+  always-`resolutionNotes`-required human action — can move a row to
+  `'resolved'`. Re-running `runDailyReconciliation` for an already-
+  `'resolved'` day recomputes the expected/received FIGURES but leaves
+  `status` at `'resolved'` rather than silently reverting it back to
+  `'pending_review'`/`'matched'`.
+- **Per-agent branch scoping is enforced at the route layer for every
+  `:id`-scoped endpoint** (`GET/PATCH /agents/:id`, `/reassign`,
+  `/assignments`, `/location(s)`, `/:id/reconciliations`): the route
+  fetches the agent first, then checks
+  `canAccessBranch(req, agent.home_branch_id)`, 403ing rather than
+  leaking whether some other branch's numeric agent id even exists — same
+  "server-side, never trust the path param" rule as
+  `GET /branches/:id/performance`.
+
 ---
 
 ## Branch Scoping Convention
@@ -1616,6 +1716,26 @@ knowledge — plus any module prompt conflicts that need a human call._
       if/when dashboard load times at real data volume make live
       computation impractical; build the scheduled snapshot job in Module
       12 then, not as an unpopulated table now.
+- [ ] **Module 10's end-of-day reconciliation does not cover "any field
+      loan repayments"**, only susu field collections — `loanService.js`
+      has no field-collection/agent concept (no "collected in the field,
+      not yet banked" channel the way susu's `cash_with_agents`/
+      `agent_remittances` bridge provides). If loan officers start doing
+      field collection for real, this needs actual Module 3 schema/
+      posting work (a new collection channel, likely its own GL control
+      account) — not something to bolt onto Module 10's reconciliation
+      without that primitive existing first. See the Agent service
+      section.
+- [ ] **`agent_locations` has no scheduled purge** — `agentService.
+      purgeOldLocations()` is a real, callable function (default 90-day
+      retention), but nothing calls it periodically yet. Wire it into
+      Module 12's scheduler when that exists, same deferral as Module 9's
+      `daily_metrics_snapshot`.
+- [ ] **`MIN_PING_INTERVAL_SECONDS` (120s) is a starting engineering
+      guess**, not a number derived from actual mobile-data-cost analysis
+      or field-agent workflow research — revisit if real agent usage shows
+      it's too strict (missed genuine movement) or too loose (excessive
+      data usage).
 
 ---
 

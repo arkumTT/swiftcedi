@@ -49,6 +49,10 @@ describeIfDb('Module 9: analytics & owner dashboard', () => {
     await pool.query('DELETE FROM bank_statement_lines');
     await pool.query('DELETE FROM bank_accounts');
     await pool.query('DELETE FROM gl_manual_entries');
+    await pool.query('DELETE FROM agent_reconciliations');
+    await pool.query('DELETE FROM agent_locations');
+    await pool.query('DELETE FROM agent_assignments');
+    await pool.query('DELETE FROM field_agents');
     await pool.query('TRUNCATE gl_journal_lines, gl_journal_entries RESTART IDENTITY CASCADE');
     await pool.query('TRUNCATE audit_log RESTART IDENTITY CASCADE');
     await pool.query('TRUNCATE loan_repayments RESTART IDENTITY CASCADE');

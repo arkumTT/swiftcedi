@@ -48,6 +48,10 @@ describeIfDb('Module 2: customer & CRM', () => {
     await pool.query('TRUNCATE overdraft_interest_accruals RESTART IDENTITY CASCADE');
     await pool.query('TRUNCATE investment_accruals RESTART IDENTITY CASCADE');
     for (const table of [
+      'agent_reconciliations',
+      'agent_locations',
+      'agent_assignments',
+      'field_agents',
       'dashboard_widget_configs',
       'bank_accounts',
       'gl_prior_period_adjustments',
