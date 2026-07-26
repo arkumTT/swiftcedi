@@ -1770,6 +1770,111 @@ listReminderNotifications(pool, { status, notificationType, customerId }) / mark
 
 ---
 
+## Frontend Architecture
+
+_The React SPA in `frontend/`, built against the `SwiftCedi_UIUX_Design_Specification`
+docx the user supplied as a design-system guide. In progress — this section
+covers what's built so far; extend it as more of the Main Banking Application
+is completed._
+
+- **One SPA, two route trees, not two separate apps.** `/admin/*` (Admin
+  Back Office) and `/app/*` (Main Banking Application) share the same
+  design system, component library, `AuthContext`, and `ThemeContext` —
+  the spec's own framing ("two distinct platforms... share one design
+  system") is satisfied by one React Router tree with two layouts
+  (`AdminLayout`/`MainAppLayout`), not a monorepo with two build outputs.
+- **Stack**: Vite + React 19 + TypeScript, Tailwind v4 (CSS-first `@theme`
+  config mapped onto the token custom properties below — never Tailwind's
+  own default palette), TanStack Query for all server state, React Router
+  for routing, Recharts for charts (once dashboard charts are built),
+  lucide-react for icons. No component library (Radix/MUI/etc.) — the
+  design spec's component list (KPI cards, status badges, data tables,
+  filter toolbar, modal) is small enough to hand-build in
+  `src/components/` against the token system directly.
+- **Design tokens (`src/styles/tokens.css`)** — every color from Section
+  3.1's table as a CSS custom property, light and dark values in three
+  places (`:root` default, `@media (prefers-color-scheme: dark)`, and
+  `:root[data-theme]` override) so an explicit user choice always wins
+  over the OS preference. `--color-warning-text-strong` is an addition
+  beyond the spec's literal token table: the spec itself flags gold as
+  "the token most likely to fail WCAG AA against light backgrounds" and
+  the dataviz skill's palette validator confirmed it (2.87:1, below the
+  4.5:1 body-text minimum) — status badges/text use this darker
+  companion for text while the base `--color-warning` still does its
+  job as an icon/border/tint color.
+- **`--color-sidebar-bg` is also a deliberate addition, not a literal spec
+  row.** The spec's token table lists "Primary (brand navy)" as used for
+  both "primary buttons" AND "sidebar," but its dark-mode value
+  (`#4C7DC0`, a notably lighter blue) is clearly meant for buttons/active-
+  nav accents that need contrast against a dark card — a sidebar that
+  turned bright blue in dark mode would contradict Section 2's own "deep
+  navy... avoid bright, saturated palettes" trust-first principle (this
+  was caught visually in a browser screenshot during dark-mode testing,
+  not from reading the spec alone). The sidebar is a constant brand rail:
+  it keeps the light-mode navy value in both themes; `--color-primary`
+  stays theme-reactive for buttons/links that do need dark-mode contrast.
+- **Density (`data-density`), reduced motion, high contrast, and font
+  scale are real, working preferences** (Section 8), persisted to
+  `localStorage` and applied via `data-*` attributes on `<html>` — not
+  wired to a server-side per-user preferences table (no such table
+  exists; adding one was judged out of scope for a first pass — see Open
+  Questions). They therefore don't yet follow a user across devices.
+- **Permission-gated navigation, not role-name-gated.** `Sidebar`/
+  `CommandPalette` filter nav items by `hasAnyPermission(anyOf)` against
+  the real permission set from `GET /auth/me`, the same permissions the
+  backend's own `requirePermission` middleware checks — so a role change
+  made in the Roles & Permissions matrix changes what a user sees on
+  next login without the frontend needing its own copy of "which role
+  sees what." `RequirePermission` (route-level) renders an explicit "you
+  don't have access" message rather than a silent redirect, so staff
+  understand why.
+- **`DataTable` is the one list-rendering component every feature screen
+  uses** — sticky header, border-separated (never zebra-striped) rows,
+  row actions revealed on hover/focus, and built-in empty/error/loading
+  states (Section 3.4) — so those four things never have to be
+  reimplemented per screen.
+- **`CommandPalette` (Cmd/Ctrl+K) is scoped honestly to navigation, not a
+  fake cross-entity search.** The design spec's Section 9 recommendation
+  #1 describes "universal search across customers, loans, transactions,
+  and settings" — but no backend list endpoint (customers, loans, etc.)
+  supports a name/id text search today, only structured filters
+  (branchId, status, customerType...). Rather than fabricate a search box
+  that silently returns nothing useful, the palette indexes registered
+  nav destinations only; each feature's own list screen has its own real
+  filter/search toolbar for that module's data.
+- **`NotificationCenter` aggregates four existing list endpoints**
+  (`/system-admin/reminders`, `/system-admin/job-run-history?status=failed`,
+  `/compliance/aml/flags?status=open`, `/approvals?status=pending`) into
+  one feed client-side (Section 9 recommendation #2) — no new backend
+  endpoint, and each source is only requested if the current user holds
+  the permission that already gates that source's own screen.
+- **Settings > Session & security is deliberately honest, not a fake
+  multi-device list** — this codebase's session store is a single
+  in-memory bearer token per login (see the RBAC/auth building-blocks
+  section above), with no 2FA enrollment anywhere. The screen says so and
+  offers only a real "sign out this session" action, rather than
+  inventing a device list the backend can't actually produce.
+- **Money/date formatting is centralized in `src/lib/format.ts`**
+  (`formatGhs`, `formatDate` → `DD-MMM-YYYY`, `formatDateTime`, `formatBps`)
+  — CLAUDE.md's pesewas-integer and date-format rules apply to the
+  frontend too; no component divides a pesewas amount by 100 inline.
+- **Backend additions this frontend needed** are recorded in their own
+  entries above (RBAC/auth building blocks section): `GET /auth/me`,
+  `GET /rbac/users`, `GET/DELETE /rbac/roles/:roleId/permissions`,
+  `PATCH /rbac/users/:userId/status`, `GET /approvals`, `approval_thresholds`
+  CRUD, `GET /branches/:id/cross-branch-grants`, and the hand-rolled CORS
+  middleware — all additive reads/writes over existing tables, discovered
+  by actually building each Admin Back Office screen against real data
+  rather than assumed up front.
+- **react-router-dom's GHSA-qwww-vcr4-c8h2 advisory (RSC-mode CSRF
+  bypass) does not apply here** — this is a plain client-side SPA with no
+  server actions/RSC integration, and every real authorization check
+  happens server-side (this codebase's own established discipline). Kept
+  on the current version rather than downgrading to a pre-7.12 release
+  for an inapplicable CVE.
+
+---
+
 ## Branch Scoping Convention
 
 _How `branch_id` is enforced across queries — e.g., middleware-level
@@ -2150,6 +2255,27 @@ knowledge — plus any module prompt conflicts that need a human call._
       direct `UPDATE ... SET archived_at = NULL`, not a service-layer call.
       Add one if this gap is ever hit for real, rather than reaching for
       raw SQL each time.
+- [ ] **Frontend preferences (theme, density, accessibility settings) are
+      `localStorage`-only, not synced to the server.** A user's choice
+      doesn't follow them to a different device/browser. Add a
+      `user_preferences` table + `GET/PUT /me/preferences` endpoints if
+      cross-device sync is ever actually needed — deliberately deferred
+      rather than adding a table for a need not yet confirmed.
+- [ ] **No backend text search exists for customers/loans/transactions by
+      name or id** — every list endpoint supports structured filters only
+      (branchId, status, customerType, etc.), which is why the frontend's
+      command palette (Cmd/Ctrl+K) is scoped to navigation only rather
+      than the "universal search across customers, loans, transactions"
+      the design spec's Section 9 describes. Adding real search (likely
+      Postgres `ILIKE`/trigram or a proper search index) is a genuine
+      follow-up if this is wanted, not something to fake client-side.
+- [ ] **No 2FA and no multi-device session tracking exist anywhere in this
+      codebase** — auth is still the single in-memory bearer-token-per-
+      login session store flagged as a placeholder since Module 11. The
+      frontend's Settings > Session & security screen says this openly
+      rather than presenting a fake device list; building real 2FA
+      enrollment and a persisted multi-session table is a significant
+      follow-up, not a frontend-only task.
 
 ---
 

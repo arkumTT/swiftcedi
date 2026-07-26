@@ -6,8 +6,9 @@ the project's non-negotiable rules, `SwiftCedi_Module_Build_Prompts.md` for
 the full module specs, and `Decisions_Log.md` for conventions actually
 adopted during the build.
 
-- `backend/` — Node.js/Express + PostgreSQL API. See `backend/README.md`
-  for local setup. Module 11 (RBAC/Audit) and Module 7 (GL) are built as
-  shared infrastructure first.
-- `frontend/` — React app; not started yet (see `frontend/README.md`).
+- `backend/` — Node.js/Express + PostgreSQL API covering all 12 modules.
+  See `backend/README.md` for local setup.
+- `frontend/` — React SPA covering the Admin Back Office and Main Banking
+  Application platforms described in the UI/UX design specification. See
+  `frontend/README.md` for local setup.
 
