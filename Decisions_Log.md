@@ -2058,6 +2058,30 @@ is completed._
     query behind it, and guessing a total would be fabricating a number
     the backend doesn't have. "Next" just disables once a page comes back
     shorter than the limit.
+- **Branches performance view (`src/features/main/branches/`) needed zero
+  backend additions.** `BranchesPage` (filterable list + up-to-6-branch
+  net-income compare chart) and `BranchDetailPage` (cash position,
+  income/expense, cost-to-income, headcount, staff list) consume
+  `GET /branches/:id/performance` as-is — including its own honest
+  `pendingMetrics` field (`portfolioSize`, `parBuckets`, `totalDeposits`,
+  `profitability`, which it says need Module 9 data it doesn't compute
+  itself). Rather than leave those metrics blank, the detail page fills
+  the actual gap with the Module 9 endpoints Dashboard already
+  established the pattern for: `analytics.portfolio-quality` (loan count,
+  outstanding principal, PAR30, largest exposures) and
+  `analytics.growth-trends` (the same `TrendChart` component, reused
+  as-is) — both scoped to this one branch via `?branchId=`. No new
+  backend surface, just composing two already-real data sources instead
+  of shipping the branch's own honest "not computed here" fields blank.
+  - The compare chart colors bars green/red by net-income sign (the same
+    status-color convention `BranchParChart` established for PAR30), not
+    one hue per branch — color encodes profit/loss, not branch identity.
+  - Cash-in-transit transfers (`POST /branches/transfers`) and
+    cross-branch access grants are deliberately NOT on this screen —
+    transfers aren't a performance metric, and the grants are already
+    covered by the Admin Back Office's Access & Approval Rules page;
+    duplicating either here would be scope creep past what
+    `branch.view_performance` (a view-only permission) implies.
 
 ---
 

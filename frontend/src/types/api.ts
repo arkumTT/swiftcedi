@@ -50,6 +50,39 @@ export interface Branch {
   created_at?: string;
 }
 
+export interface Region {
+  id: string;
+  name: string;
+}
+
+export interface Cluster {
+  id: string;
+  name: string;
+  region_id: string;
+}
+
+export interface BranchStaffAssignment {
+  id: string;
+  user_id: string;
+  branch_id: string;
+  start_date: string;
+  end_date: string | null;
+}
+
+export interface BranchPerformance {
+  branchId: number;
+  asOfDate: string | null;
+  cashInHandPesewas: number;
+  vaultPesewas: number;
+  cashPositionPesewas: number;
+  incomePesewas: number;
+  expensePesewas: number;
+  netIncomePesewas: number;
+  costToIncomeRatio: number | null;
+  headcount: number;
+  pendingMetrics: string[];
+}
+
 export interface Customer {
   id: string;
   customer_type: 'individual' | 'sme' | 'group';
