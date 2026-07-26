@@ -1970,6 +1970,31 @@ is completed._
     inverse of `formatGhs`/`formatBps`, so a GHS or percent text field
     becomes the integer pesewas/bps value the API expects in exactly one
     place, never inline `* 100` arithmetic in a component.
+- **Savings & Susu (`src/features/main/savings/`) needed zero backend
+  additions** — every read/write the screens use already existed:
+  accounts, statement, reconciliation, deposits, withdrawal requests,
+  charges, close; susu accounts, collections, complete-cycle, payout;
+  standing orders and their run history; both product catalogs.
+  - `SavingsSusuPage` is one page with a `FilterToolbar` chip toggle
+    between "Savings accounts" and "Susu accounts" (reusing the chips
+    prop that already existed for this exact purpose) rather than two
+    separate routes for what the nav treats as one destination — Standing
+    Orders and Savings Products sections sit below both views since
+    they're not specific to either account type.
+  - `SusuAccount.status` is `active | completed | uncompleted | paid_out`
+    per the `susu_accounts_status_chk` constraint (migration 029) — NOT
+    `cancelled`, which only applies to `standing_orders.status`. Payout is
+    only offered once a cycle has left `active` (`completed` or
+    `uncompleted`, matching `payOutCycle`'s own precondition).
+  - Susu collection recording generates its idempotency key client-side
+    via `crypto.randomUUID()` — mirroring the backend's own documented
+    idempotency contract for agent field collections (a retry after a
+    dropped connection returns the original collection rather than
+    double-posting), rather than the UI needing its own retry logic.
+  - The withdrawal-request modal shows the real `paidOut` vs. pending-
+    approval outcome the backend actually returned (200 vs. 202), instead
+    of a generic "submitted" message — same honesty-about-outcome pattern
+    as the Customer 360 closure-request modal.
 
 ---
 

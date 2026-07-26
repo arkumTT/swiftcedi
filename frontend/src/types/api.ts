@@ -135,6 +135,80 @@ export interface SavingsAccount {
   opened_at: string;
 }
 
+export interface SavingsProduct {
+  id: string;
+  name: string;
+  code: string;
+  min_balance_pesewas: number;
+  maintenance_fee_pesewas: number;
+  withdrawal_fee_pesewas: number;
+  min_balance_charge_pesewas: number;
+  withdrawal_approval_threshold_pesewas: number;
+  allows_overdraft: boolean;
+  status: 'active' | 'inactive';
+}
+
+export interface SavingsTransaction {
+  id: string;
+  account_id: string;
+  txn_type: 'deposit' | 'withdrawal' | 'maintenance_fee' | 'withdrawal_fee' | 'min_balance_charge' | 'standing_order_out' | 'standing_order_in' | 'susu_payout';
+  amount_pesewas: number;
+  balance_after_pesewas: number;
+  description: string | null;
+  created_at: string;
+}
+
+export interface SavingsStatement {
+  account: SavingsAccount;
+  transactions: SavingsTransaction[];
+}
+
+export interface AccountReconciliation {
+  accountId: number;
+  storedBalancePesewas: number;
+  ledgerSumPesewas: number;
+  reconciled: boolean;
+}
+
+export interface SusuAccount {
+  id: string;
+  account_no: string;
+  customer_id: string;
+  branch_id: string;
+  payout_savings_account_id: string | null;
+  cycle_length_days: number;
+  expected_collection_pesewas: number;
+  target_amount_pesewas: number;
+  collected_pesewas: number;
+  commission_rate_bps: number;
+  assigned_agent_id: string | null;
+  cycle_start_date: string;
+  cycle_end_date: string;
+  status: 'active' | 'completed' | 'uncompleted' | 'paid_out';
+}
+
+export interface SusuCollection {
+  id: string;
+  susu_account_id: string;
+  agent_id: string;
+  amount_pesewas: number;
+  collection_date: string;
+  remittance_id: string | null;
+}
+
+export interface StandingOrder {
+  id: string;
+  source_account_id: string;
+  destination_account_id: string;
+  amount_pesewas: number;
+  frequency: 'daily' | 'weekly' | 'monthly';
+  next_run_date: string;
+  end_date: string | null;
+  status: 'active' | 'paused' | 'suspended' | 'completed' | 'cancelled';
+  consecutive_failures: number;
+  last_error: string | null;
+}
+
 export interface LoanProduct {
   id: string;
   name: string;
