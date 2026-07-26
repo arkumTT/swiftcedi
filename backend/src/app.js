@@ -29,8 +29,24 @@ const { registerGlModuleExecutionHandlers } = require('./modules/gl/glService');
 const { requireAuth } = require('./middleware/auth');
 const { asyncHandler } = require('./utils/asyncHandler');
 
+// Minimal hand-rolled CORS — the frontend is a separately-hosted SPA (Vite
+// dev server / static build), never the same origin as this API in any
+// real deployment. CORS_ORIGIN defaults to '*' for local dev; set it to the
+// frontend's real origin in any environment that sends credentials or needs
+// tighter restriction. No new dependency: this is the entire CORS surface
+// the app needs (simple GET/POST/PATCH/PUT/DELETE + a Bearer header, no
+// cookies), not worth pulling in the `cors` package for.
+function corsMiddleware(req, res, next) {
+  res.header('Access-Control-Allow-Origin', process.env.CORS_ORIGIN || '*');
+  res.header('Access-Control-Allow-Methods', 'GET,POST,PATCH,PUT,DELETE,OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type,Authorization');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  return next();
+}
+
 function createApp(pool) {
   const app = express();
+  app.use(corsMiddleware);
   app.use(express.json());
 
   // Lets approvalWorkflow.decide() dispatch approval-gated actions (branch

@@ -265,6 +265,11 @@ describeIfDb('Module 6: cashier, till & vault operations', () => {
     expect(settled.cashBackRequest.status).toBe('paid');
 
     await cashierService.closeTill(pool, { tillId: till.id, closingBalancePesewas: 120000, closedBy: maker });
+
+    const requestsForTill = await cashierService.listCashBackRequests(pool, { tillId: till.id });
+    expect(requestsForTill).toHaveLength(1);
+    expect(requestsForTill[0].status).toBe('paid');
+    expect(await cashierService.listCashBackRequests(pool, { tillId: till.id, status: 'pending' })).toHaveLength(0);
   });
 
   test('closing a till computes the expected balance from opening float + paid cash-back, and records any variance without blocking', async () => {
@@ -345,6 +350,10 @@ describeIfDb('Module 6: cashier, till & vault operations', () => {
     // level; close the till at 0 so later close-out tests (which require
     // no open tills anywhere in the branch) aren't blocked by it.
     await cashierService.closeTill(pool, { tillId: till.id, closingBalancePesewas: 0, closedBy: maker });
+
+    const reversalsForBranch = await cashierService.listReversals(pool, { branchId });
+    expect(reversalsForBranch.some((r) => r.id === reversal.id && r.status === 'reversed')).toBe(true);
+    expect(await cashierService.listReversals(pool, { branchId, status: 'pending' })).toHaveLength(0);
   });
 
   test('day close-out is blocked while any till in the branch is open, and lists which ones', async () => {

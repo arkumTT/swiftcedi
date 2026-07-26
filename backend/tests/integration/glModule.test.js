@@ -580,4 +580,76 @@ describeIfDb('Module 7: GL, accounting & financial reporting', () => {
       ).rejects.toThrow(glService.GlConflictError);
     });
   });
+
+  describe('unified transaction ledger (listJournalEntries)', () => {
+    test('lists posted entries filtered by sourceModule and date range, newest first, with each entry\'s net amount', async () => {
+      const ref = `LEDGER-TEST-${Date.now()}`;
+      await glPosting.postJournalEntry(pool, {
+        branchId,
+        reference: `${ref}-A`,
+        entryDate: '2024-03-01',
+        sourceModule: 'susu',
+        createdBy: maker,
+        lines: [
+          { accountId: glAccounts.cashInHand.id, debitPesewas: 12345, branchId },
+          { accountId: glAccounts.income.id, creditPesewas: 12345, branchId },
+        ],
+      });
+      await glPosting.postJournalEntry(pool, {
+        branchId,
+        reference: `${ref}-B`,
+        entryDate: '2024-03-02',
+        sourceModule: 'susu',
+        createdBy: maker,
+        lines: [
+          { accountId: glAccounts.cashInHand.id, debitPesewas: 55555, branchId },
+          { accountId: glAccounts.income.id, creditPesewas: 55555, branchId },
+        ],
+      });
+
+      const rows = await glService.listJournalEntries(pool, {
+        branchId,
+        sourceModule: 'susu',
+        fromDate: '2024-03-01',
+        toDate: '2024-03-02',
+      });
+      const testRows = rows.filter((r) => r.reference.startsWith(ref));
+      expect(testRows.length).toBe(2);
+      expect(testRows[0].reference).toBe(`${ref}-B`); // newest entry_date first
+      expect(Number(testRows[0].amount_pesewas)).toBe(55555);
+      expect(Number(testRows[1].amount_pesewas)).toBe(12345);
+    });
+
+    test('respects limit/offset pagination', async () => {
+      const page1 = await glService.listJournalEntries(pool, { branchId, limit: 2, offset: 0 });
+      const page2 = await glService.listJournalEntries(pool, { branchId, limit: 2, offset: 2 });
+      expect(page1.length).toBe(2);
+      expect(page1.map((r) => r.id)).not.toEqual(page2.map((r) => r.id));
+    });
+
+    test('getJournalEntryDetail returns the entry plus its debit/credit lines with account code/name joined', async () => {
+      const ref = `LEDGER-DETAIL-${Date.now()}`;
+      const journalEntry = await glPosting.postJournalEntry(pool, {
+        branchId,
+        reference: ref,
+        entryDate: '2024-03-03',
+        sourceModule: 'susu',
+        createdBy: maker,
+        lines: [
+          { accountId: glAccounts.cashInHand.id, debitPesewas: 7777, branchId },
+          { accountId: glAccounts.income.id, creditPesewas: 7777, branchId },
+        ],
+      });
+
+      const detail = await glService.getJournalEntryDetail(pool, { journalEntryId: journalEntry.id });
+      expect(detail.entry.reference).toBe(ref);
+      expect(detail.lines).toHaveLength(2);
+      const debitLine = detail.lines.find((l) => Number(l.debit_pesewas) === 7777);
+      const creditLine = detail.lines.find((l) => Number(l.credit_pesewas) === 7777);
+      expect(debitLine.account_code).toBe(glAccounts.cashInHand.code);
+      expect(creditLine.account_code).toBe(glAccounts.income.code);
+
+      await expect(glService.getJournalEntryDetail(pool, { journalEntryId: 9999999 })).rejects.toThrow(glService.GlNotFoundError);
+    });
+  });
 });

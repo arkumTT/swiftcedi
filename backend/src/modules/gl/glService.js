@@ -439,6 +439,80 @@ async function getAnnualTransactionReport(pool, { year, branchId = null }) {
   };
 }
 
+/**
+ * A paginated, filterable list of posted journal entries — the closest
+ * thing this codebase has to a single "unified transaction ledger," since
+ * every module's financial action (loan disbursement/repayment, savings
+ * deposit/withdrawal, susu collection/commission, investment activation/
+ * payout, cashier reversals) posts through the shared `glPosting.js`
+ * interface and therefore always has a row here. Added specifically to
+ * back the frontend's Transactions screen and dashboard recent-activity
+ * widget — see Decisions_Log.md. `amountPesewas` is each entry's total
+ * debit-side value (== credit-side, since every entry balances), which is
+ * the one meaningful "how much moved" figure for a list view; the
+ * `reference` string's suffix (e.g. -RPY, -DISB, -DEP, -WDL, -COL, -COMM)
+ * is what the frontend groups into Collections/Payouts/Commissions
+ * filter chips, following the naming convention every module's own
+ * posting code already uses — no new column needed.
+ */
+async function listJournalEntries(pool, { branchId, sourceModule, fromDate, toDate, limit = 50, offset = 0 } = {}) {
+  const clauses = [];
+  const params = [];
+  const add = (col, val) => {
+    if (val === undefined || val === null || val === '') return;
+    params.push(val);
+    clauses.push(`${col} = $${params.length}`);
+  };
+  add('e.branch_id', branchId);
+  add('e.source_module', sourceModule);
+  if (fromDate) {
+    params.push(fromDate);
+    clauses.push(`e.entry_date >= $${params.length}`);
+  }
+  if (toDate) {
+    params.push(toDate);
+    clauses.push(`e.entry_date <= $${params.length}`);
+  }
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+
+  params.push(Math.min(Number(limit) || 50, 200));
+  const limitIdx = params.length;
+  params.push(Number(offset) || 0);
+  const offsetIdx = params.length;
+
+  const { rows } = await pool.query(
+    `SELECT e.*, COALESCE((SELECT SUM(l.debit_pesewas) FROM gl_journal_lines l WHERE l.journal_entry_id = e.id), 0)::bigint AS amount_pesewas
+       FROM gl_journal_entries e
+       ${where}
+      ORDER BY e.entry_date DESC, e.id DESC
+      LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
+    params
+  );
+  return rows;
+}
+
+/**
+ * The transaction-drill-down counterpart to listJournalEntries — the
+ * ledger list shows one net amount per entry; this returns the entry's
+ * actual debit/credit lines (account code/name joined for readability) so
+ * a "detailed transaction record" screen can show what actually moved.
+ */
+async function getJournalEntryDetail(pool, { journalEntryId }) {
+  const { rows: entryRows } = await pool.query('SELECT * FROM gl_journal_entries WHERE id = $1', [journalEntryId]);
+  const entry = entryRows[0];
+  if (!entry) throw new GlNotFoundError(`gl_journal_entries ${journalEntryId} not found`);
+
+  const { rows: lines } = await pool.query(
+    `SELECT l.*, a.code AS account_code, a.name AS account_name
+       FROM gl_journal_lines l
+       JOIN gl_accounts a ON a.id = l.account_id
+      WHERE l.journal_entry_id = $1
+      ORDER BY l.id`,
+    [journalEntryId]
+  );
+  return { entry, lines };
+}
+
 // --- Manual JV (always maker-checker) -----------------------------------------
 
 /**
@@ -802,6 +876,8 @@ module.exports = {
   getIncomeStatement,
   getDailyBalanceSummary,
   getAnnualTransactionReport,
+  listJournalEntries,
+  getJournalEntryDetail,
   requestManualJournalEntry,
   applyManualJournalEntryApprovalDecision,
   postApprovedManualJournalEntry,

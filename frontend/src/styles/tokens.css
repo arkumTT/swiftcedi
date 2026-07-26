@@ -1,0 +1,166 @@
+/*
+ * SwiftCedi design tokens — SwiftCedi_UIUX_Design_Specification.md Section 3.
+ * Every color used anywhere in the app is one of these custom properties,
+ * never a hardcoded hex in a component — that's what makes the light/dark
+ * toggle a single attribute flip (`data-theme` on <html>) instead of a
+ * per-screen rebuild. `@media (prefers-color-scheme)` supplies the
+ * no-preference-set default; an explicit `data-theme` always wins in either
+ * direction (see theme/ThemeContext.tsx).
+ *
+ * --warning-text-strong is not in the spec's token table — the spec itself
+ * flags gold/warning as "the token most likely to fail WCAG AA against
+ * light backgrounds at small sizes" (Section 4) and the dataviz skill's
+ * validator confirms it (2.87:1 vs the surface, below the 4.5:1 body-text
+ * minimum). Status badges/text use this darker companion for TEXT while the
+ * base --warning token still does its job as an icon/border/tint color.
+ *
+ * --color-sidebar-bg is also not a literal spec row — the spec's own table
+ * lists "Primary (brand navy)" as used for both "primary buttons" AND
+ * "sidebar," but its dark-mode value (#4C7DC0, a lighter blue) is clearly
+ * meant for primary BUTTONS/active-nav accents needing contrast against a
+ * dark card, not a large sidebar fill — a sidebar that turned bright blue
+ * in dark mode would contradict Section 2's "deep navy... avoid bright,
+ * saturated palettes" principle. The sidebar is a constant brand rail: it
+ * keeps the light-mode navy value in both themes, while --color-primary
+ * stays reactive for buttons/links that actually need dark-mode contrast.
+ */
+
+:root {
+  color-scheme: light;
+
+  --color-page-bg: #f5f7fa;
+  --color-surface: #ffffff;
+  --color-surface-alt: #eef1f6;
+  --color-border: #e1e5ec;
+
+  --color-text-primary: #122043;
+  --color-text-secondary: #5b6577;
+  --color-text-muted: #8d96a6;
+
+  --color-primary: #0f2a52;
+  --color-accent: #b6862c;
+  --color-sidebar-bg: #0f2a52; /* fixed brand rail — see header comment */
+
+  --color-success: #1e8e5a;
+  --color-warning: #c98a1c;
+  --color-warning-text-strong: #8a5f13; /* AA-safe warning text on light surfaces */
+  --color-danger: #d64545;
+  --color-info: #2563ac;
+
+  --shadow-elevation: 0 1px 2px rgba(18, 32, 67, 0.06), 0 2px 8px rgba(18, 32, 67, 0.06);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    color-scheme: dark;
+
+    --color-page-bg: #0b1220;
+    --color-surface: #121a2c;
+    --color-surface-alt: #182338;
+    --color-border: #28324a;
+
+    --color-text-primary: #e9ecf4;
+    --color-text-secondary: #a6afc2;
+    --color-text-muted: #6d778c;
+
+    --color-primary: #4c7dc0;
+    --color-accent: #d9ae55;
+    --color-sidebar-bg: #0f2a52;
+
+    --color-success: #39c08a;
+    --color-warning: #e0a83e;
+    --color-warning-text-strong: #e0a83e;
+    --color-danger: #e7726f;
+    --color-info: #5b9ae0;
+
+    --shadow-elevation: 0 1px 2px rgba(0, 0, 0, 0.3), 0 2px 8px rgba(0, 0, 0, 0.35);
+  }
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+
+  --color-page-bg: #0b1220;
+  --color-surface: #121a2c;
+  --color-surface-alt: #182338;
+  --color-border: #28324a;
+
+  --color-text-primary: #e9ecf4;
+  --color-text-secondary: #a6afc2;
+  --color-text-muted: #6d778c;
+
+  --color-primary: #4c7dc0;
+  --color-accent: #d9ae55;
+
+  --color-success: #39c08a;
+  --color-warning: #e0a83e;
+  --color-warning-text-strong: #e0a83e;
+  --color-danger: #e7726f;
+  --color-info: #5b9ae0;
+
+  --shadow-elevation: 0 1px 2px rgba(0, 0, 0, 0.3), 0 2px 8px rgba(0, 0, 0, 0.35);
+}
+
+/* Spacing grid: base unit 4px (Section 3.3) */
+:root {
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --space-8: 32px;
+
+  --radius-card: 10px;
+  --radius-pill: 20px;
+
+  --sidebar-width: 248px;
+  --sidebar-width-rail: 68px;
+  --content-max-width: 1400px;
+}
+
+/* Density setting (Section 8) — comfortable is the default; compact tightens
+   table row height and card padding for high-volume cashier/back-office use.
+   Applied via [data-density] on <html>, read by component CSS below. */
+:root[data-density='compact'] {
+  --table-row-height: 36px;
+  --card-padding: var(--space-3);
+}
+:root:not([data-density='compact']) {
+  --table-row-height: 44px;
+  --card-padding: var(--space-4);
+}
+
+/* Accessibility preferences (Section 8) */
+:root[data-font-scale='large'] {
+  font-size: 112.5%; /* ~18px base */
+}
+:root[data-contrast='high']:not([data-theme='dark']) {
+  --color-border: #8a93a6;
+  --color-text-secondary: #40485a;
+}
+:root[data-contrast='high'][data-theme='dark'] {
+  --color-border: #4a5570;
+  --color-text-secondary: #c7cedb;
+}
+@media (prefers-color-scheme: dark) {
+  :root[data-contrast='high']:not([data-theme='light']) {
+    --color-border: #4a5570;
+    --color-text-secondary: #c7cedb;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+:root[data-reduced-motion='true'] *,
+:root[data-reduced-motion='true'] *::before,
+:root[data-reduced-motion='true'] *::after {
+  animation-duration: 0.001ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.001ms !important;
+  scroll-behavior: auto !important;
+}

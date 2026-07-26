@@ -82,6 +82,14 @@ function cashierRouter(pool) {
     })
   );
 
+  router.get(
+    '/tills/:id/cashback-requests',
+    auth,
+    asyncHandler(async (req, res) => {
+      res.json(await cashierService.listCashBackRequests(pool, { tillId: req.params.id, status: req.query.status }));
+    })
+  );
+
   // --- Cash-back settlement ---------------------------------------------------
 
   router.post(
@@ -98,6 +106,16 @@ function cashierRouter(pool) {
   );
 
   // --- Reversals ---------------------------------------------------------------
+
+  router.get(
+    '/reversals',
+    auth,
+    requirePermission('cashier.view'),
+    asyncHandler(async (req, res) => {
+      const { branchId, status } = req.query;
+      res.json(await cashierService.listReversals(pool, { branchId: branchId ? Number(branchId) : undefined, status }));
+    })
+  );
 
   router.post(
     '/reversals',

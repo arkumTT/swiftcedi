@@ -40,6 +40,23 @@ function authRouter(pool) {
     res.status(204).end();
   });
 
+  // Lets the frontend resolve who's logged in, their role, and their
+  // permission set (for nav gating) without decoding anything client-side
+  // — req.user is already populated by requireAuth from the same query
+  // every other RBAC-gated route relies on.
+  router.get('/me', requireAuth(pool), (req, res) => {
+    res.json({
+      id: req.user.id,
+      fullName: req.user.fullName,
+      email: req.user.email,
+      homeBranchId: req.user.homeBranchId,
+      roleId: req.user.roleId,
+      roleName: req.user.roleName,
+      permissions: Array.from(req.user.permissions),
+      crossBranchAccessibleBranchIds: Array.from(req.user.crossBranchAccessibleBranchIds),
+    });
+  });
+
   return router;
 }
 

@@ -209,11 +209,38 @@ async function decide(db, { approvalId, decidedBy, decision, reason = null, exec
   return updated;
 }
 
+/**
+ * Powers every "approval queue" / "approval trail" screen (Admin's Access &
+ * Approval Rules, the notification center, a loan/customer/branch closure's
+ * own approval-trail view) — there was previously no way to list
+ * `approval_requests` at all, only request/decide single rows by id.
+ */
+async function listApprovals(db, { status, actionType, entityType, branchId } = {}) {
+  const clauses = [];
+  const params = [];
+  const add = (col, val) => {
+    if (val === undefined || val === null) return;
+    params.push(val);
+    clauses.push(`${col} = $${params.length}`);
+  };
+  add('status', status);
+  add('action_type', actionType);
+  add('entity_type', entityType);
+  add('branch_id', branchId);
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  const { rows } = await db.query(
+    `SELECT * FROM approval_requests ${where} ORDER BY created_at DESC`,
+    params
+  );
+  return rows;
+}
+
 module.exports = {
   requestApproval,
   decide,
   getApplicableThreshold,
   isApprovalRequired,
+  listApprovals,
   registerExecutionHandler,
   ApprovalValidationError,
   ApprovalNotFoundError,

@@ -2,7 +2,7 @@
 
 const express = require('express');
 const { requireAuth } = require('../middleware/auth');
-const { requirePermission, resolveBranchScope, canAccessBranch } = require('../middleware/requirePermission');
+const { requirePermission, resolveConsolidatedBranchScope, canAccessBranch } = require('../middleware/requirePermission');
 const { asyncHandler } = require('../utils/asyncHandler');
 const agentService = require('../modules/agent/agentService');
 
@@ -46,7 +46,7 @@ function agentsRouter(pool) {
     auth,
     requirePermission('agent.reconcile'),
     asyncHandler(async (req, res) => {
-      const branchId = resolveBranchScope(req);
+      const branchId = resolveConsolidatedBranchScope(req);
       const { agentId, status, fromDate, toDate } = req.query;
       res.json(
         await agentService.listReconciliations(pool, {
@@ -65,7 +65,7 @@ function agentsRouter(pool) {
     auth,
     requirePermission('agent.reconcile'),
     asyncHandler(async (req, res) => {
-      const branchId = resolveBranchScope(req);
+      const branchId = resolveConsolidatedBranchScope(req);
       if (req.body && req.body.branchId && !canAccessBranch(req, req.body.branchId)) {
         return res.status(403).json({ error: `not permitted to run reconciliation for branch ${req.body.branchId}` });
       }
@@ -102,7 +102,7 @@ function agentsRouter(pool) {
     auth,
     requirePermission('agent.manage'),
     asyncHandler(async (req, res) => {
-      const branchId = resolveBranchScope(req);
+      const branchId = resolveConsolidatedBranchScope(req);
       res.json(await agentService.listFieldAgents(pool, { branchId, status: req.query.status }));
     })
   );

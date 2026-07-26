@@ -169,7 +169,11 @@ authentication header, versioning approach._
 
 - Resource paths are plural, kebab/lower-case, mounted at the app root
   (no `/api/v1` prefix yet — add versioning when a breaking change is
-  actually needed, not preemptively): `/rbac/roles`, `/rbac/users`,
+  actually needed, not preemptively): `/auth/me`, `/rbac/roles`,
+  `/rbac/roles/:roleId/permissions`, `/rbac/users`,
+  `/rbac/users/:userId/status`, `/approvals` (GET, the review queue),
+  `/approvals/thresholds`, `/approvals/thresholds/:id`,
+  `/branches/:id/cross-branch-grants` (GET, list),
   `/audit-log`, `/approvals`, `/gl/accounts`, `/gl/journal-entries`,
   `/branches`, `/branches/regions`, `/branches/clusters`,
   `/branches/transfers`, `/branches/:id/status`,
@@ -551,6 +555,52 @@ validateBalancedLines(lines) -> void  // pure, throws UnbalancedEntryError; no d
   Add new codes via
   `POST /rbac/roles/:roleId/permissions`, not a new migration, unless you
   also need to seed a default grant.
+- **Frontend-enabling additions** (`backend/src/routes/auth.js`,
+  `backend/src/routes/rbac.js`, no new migrations — all read/write existing
+  `users`/`roles`/`permissions`/`role_permissions` tables): `GET /auth/me`
+  (current user + role + full permission set, so the SPA can gate nav
+  without decoding anything client-side), `GET /rbac/users` (filterable by
+  `roleId`/`branchId`/`status`/`search`, `rbac.manage_users`-gated — powers
+  the Admin Back Office's Users & Roles table), `GET
+  /rbac/roles/:roleId/permissions` (granted codes for one role) and `DELETE
+  /rbac/roles/:roleId/permissions/:permissionCode` (the missing revoke
+  counterpart to the existing grant endpoint — together these power the
+  Roles & Permissions checkbox matrix), and `PATCH /rbac/users/:userId/status`
+  (suspend/unlock/disable, mirroring the existing `PATCH .../role` shape).
+  Covered by `backend/tests/integration/rbacAuthModule.test.js` — the first
+  supertest-based (real Express app, not direct service calls) integration
+  test in this codebase, since these are route-layer additions with no
+  dedicated service module of their own.
+- **CORS middleware added to `app.js`** — a small hand-rolled middleware
+  (`Access-Control-Allow-Origin` from a `CORS_ORIGIN` env var, default `*`),
+  not the `cors` npm package, since the app's actual CORS surface (plain
+  methods + a Bearer header, no cookies) doesn't need it. Required once a
+  frontend SPA (necessarily a different origin from this API in any real
+  deployment) exists to call it from a browser.
+- **`approvalWorkflow.listApprovals(db, { status, actionType, entityType,
+  branchId })` added** — `approval_requests` had a request/decide path since
+  Module 11 but no way to LIST them at all; every "approval queue" screen
+  the frontend needs (Admin's Access & Approval Rules, a notification
+  center, any module's own "approval trail" view) needs this. Exposed as
+  `GET /approvals`, gated by `approval.decide` (the reviewer-queue
+  permission) since it's a queue of things to decide, not a personal
+  request history.
+- **`approval_thresholds` CRUD added** (`GET/POST /approvals/thresholds`,
+  `PATCH /approvals/thresholds/:id`) — the table has existed since
+  migration 003 but was config-by-migration-only; a new
+  `approval.manage_thresholds` permission (owner + system_admin, migration
+  052) gates it. `POST` upserts on the `(action_type, branch_id)` unique
+  index rather than erroring on a duplicate — "set the threshold for X" is
+  the natural admin mental model, not "create a new threshold row and
+  reject if one exists."
+- **`branchService.listCrossBranchGrantsForBranch(pool, { branchId })` +
+  `GET /branches/:id/cross-branch-grants` added** — the existing
+  `listActiveCrossBranchGrants` is scoped to one user's currently-active
+  grants (used by `requireAuth`'s own branch-scope resolution); the admin
+  "Access & Approval Rules" screen needs the inverse view — every grant
+  (active, expired, revoked) for one branch, with the grantee's name — so
+  this is a new function alongside it, not a modification of the
+  permission-check path.
 
 ### Branch service — `backend/src/modules/branch/branchService.js` (Module 1)
 
@@ -1198,6 +1248,7 @@ listGlAccounts(pool, { branchId, accountType, status }) -> gl_accounts[]
 createGlAccount(pool, { code, name, accountType, branchId, parentAccountId, createdBy, actorBranchId }) -> gl_account
 updateGlAccount(pool, { accountId, updatedBy, actorBranchId, fields }) -> gl_account  // name/status always editable; code/accountType only pre-activity; branchId/parentAccountId never editable
 getTrialBalance(pool, { asOfDate, branchId }) / getBalanceSheet(pool, { asOfDate, branchId }) / getIncomeStatement(pool, { fromDate, toDate, branchId }) / getDailyBalanceSummary(pool, { date, branchId }) / getAnnualTransactionReport(pool, { year, branchId })
+listJournalEntries(pool, { branchId, sourceModule, fromDate, toDate, limit, offset }) -> gl_journal_entries[] with amountPesewas  // GET /gl/journal-entries, paginated, newest first
 requestManualJournalEntry(pool, { branchId, entryDate, description, lines, requestedBy }) -> { entry, approvalRequest }  // ALWAYS maker-checker
 postApprovedManualJournalEntry(pool, { entryId, postedBy }) -> { entry, journalEntry }
 createBankAccount(pool, { glAccountId, branchId, bankName, accountNumber, createdBy, actorBranchId }) -> bank_account  // glAccountId must already exist and be account_type='asset'
@@ -1224,6 +1275,17 @@ registerGlModuleExecutionHandlers()  // 'gl.manual_jv'
   `Assets = Liabilities + Equity` hold by construction (the fundamental
   accounting identity, guaranteed as long as every posted entry balanced,
   which `glPosting.js` already enforces) rather than an approximation.
+- **`listJournalEntries` added while building the frontend's Transactions
+  screen and dashboard** — before this, `gl_journal_entries` had a POST
+  (via `glPosting.postJournalEntry`) and year-scoped/unpaginated report
+  reads (`getAnnualTransactionReport`), but no general paginated list.
+  Since every module's financial action posts through the same shared
+  interface, this is the closest thing to a real "unified transaction
+  ledger" without inventing a parallel table — the frontend derives
+  Collections/Payouts/Commissions filter categories from each entry's
+  `reference` suffix (`-RPY`/`-DEP`/`-COL` vs. `-DISB`/`-WDL`/`-PYT` vs.
+  `-COMM`), a convention every module's own posting code already follows,
+  rather than adding a new `transaction_category` column.
 - **Manual JV (`gl_manual_entries`, migration 041) is ALWAYS maker-checker,
   no threshold** — same reasoning as `loan.approve`/`investment.book`/
   `investment.redeem`/`gl.reversal`/`gl.prior_period_adjustment`: a
@@ -1720,6 +1782,473 @@ listReminderNotifications(pool, { status, notificationType, customerId }) / mark
 
 ---
 
+## Frontend Architecture
+
+_The React SPA in `frontend/`, built against the `SwiftCedi_UIUX_Design_Specification`
+docx the user supplied as a design-system guide. In progress — this section
+covers what's built so far; extend it as more of the Main Banking Application
+is completed._
+
+- **One SPA, two route trees, not two separate apps.** `/admin/*` (Admin
+  Back Office) and `/app/*` (Main Banking Application) share the same
+  design system, component library, `AuthContext`, and `ThemeContext` —
+  the spec's own framing ("two distinct platforms... share one design
+  system") is satisfied by one React Router tree with two layouts
+  (`AdminLayout`/`MainAppLayout`), not a monorepo with two build outputs.
+- **Stack**: Vite + React 19 + TypeScript, Tailwind v4 (CSS-first `@theme`
+  config mapped onto the token custom properties below — never Tailwind's
+  own default palette), TanStack Query for all server state, React Router
+  for routing, Recharts for charts (once dashboard charts are built),
+  lucide-react for icons. No component library (Radix/MUI/etc.) — the
+  design spec's component list (KPI cards, status badges, data tables,
+  filter toolbar, modal) is small enough to hand-build in
+  `src/components/` against the token system directly.
+- **Design tokens (`src/styles/tokens.css`)** — every color from Section
+  3.1's table as a CSS custom property, light and dark values in three
+  places (`:root` default, `@media (prefers-color-scheme: dark)`, and
+  `:root[data-theme]` override) so an explicit user choice always wins
+  over the OS preference. `--color-warning-text-strong` is an addition
+  beyond the spec's literal token table: the spec itself flags gold as
+  "the token most likely to fail WCAG AA against light backgrounds" and
+  the dataviz skill's palette validator confirmed it (2.87:1, below the
+  4.5:1 body-text minimum) — status badges/text use this darker
+  companion for text while the base `--color-warning` still does its
+  job as an icon/border/tint color.
+- **`--color-sidebar-bg` is also a deliberate addition, not a literal spec
+  row.** The spec's token table lists "Primary (brand navy)" as used for
+  both "primary buttons" AND "sidebar," but its dark-mode value
+  (`#4C7DC0`, a notably lighter blue) is clearly meant for buttons/active-
+  nav accents that need contrast against a dark card — a sidebar that
+  turned bright blue in dark mode would contradict Section 2's own "deep
+  navy... avoid bright, saturated palettes" trust-first principle (this
+  was caught visually in a browser screenshot during dark-mode testing,
+  not from reading the spec alone). The sidebar is a constant brand rail:
+  it keeps the light-mode navy value in both themes; `--color-primary`
+  stays theme-reactive for buttons/links that do need dark-mode contrast.
+- **Density (`data-density`), reduced motion, high contrast, and font
+  scale are real, working preferences** (Section 8), persisted to
+  `localStorage` and applied via `data-*` attributes on `<html>` — not
+  wired to a server-side per-user preferences table (no such table
+  exists; adding one was judged out of scope for a first pass — see Open
+  Questions). They therefore don't yet follow a user across devices.
+- **Permission-gated navigation, not role-name-gated.** `Sidebar`/
+  `CommandPalette` filter nav items by `hasAnyPermission(anyOf)` against
+  the real permission set from `GET /auth/me`, the same permissions the
+  backend's own `requirePermission` middleware checks — so a role change
+  made in the Roles & Permissions matrix changes what a user sees on
+  next login without the frontend needing its own copy of "which role
+  sees what." `RequirePermission` (route-level) renders an explicit "you
+  don't have access" message rather than a silent redirect, so staff
+  understand why.
+- **`DataTable` is the one list-rendering component every feature screen
+  uses** — sticky header, border-separated (never zebra-striped) rows,
+  row actions revealed on hover/focus, and built-in empty/error/loading
+  states (Section 3.4) — so those four things never have to be
+  reimplemented per screen.
+- **`CommandPalette` (Cmd/Ctrl+K) is scoped honestly to navigation, not a
+  fake cross-entity search.** The design spec's Section 9 recommendation
+  #1 describes "universal search across customers, loans, transactions,
+  and settings" — but no backend list endpoint (customers, loans, etc.)
+  supports a name/id text search today, only structured filters
+  (branchId, status, customerType...). Rather than fabricate a search box
+  that silently returns nothing useful, the palette indexes registered
+  nav destinations only; each feature's own list screen has its own real
+  filter/search toolbar for that module's data.
+- **`NotificationCenter` aggregates four existing list endpoints**
+  (`/system-admin/reminders`, `/system-admin/job-run-history?status=failed`,
+  `/compliance/aml/flags?status=open`, `/approvals?status=pending`) into
+  one feed client-side (Section 9 recommendation #2) — no new backend
+  endpoint, and each source is only requested if the current user holds
+  the permission that already gates that source's own screen.
+- **Settings > Session & security is deliberately honest, not a fake
+  multi-device list** — this codebase's session store is a single
+  in-memory bearer token per login (see the RBAC/auth building-blocks
+  section above), with no 2FA enrollment anywhere. The screen says so and
+  offers only a real "sign out this session" action, rather than
+  inventing a device list the backend can't actually produce.
+- **Money/date formatting is centralized in `src/lib/format.ts`**
+  (`formatGhs`, `formatDate` → `DD-MMM-YYYY`, `formatDateTime`, `formatBps`)
+  — CLAUDE.md's pesewas-integer and date-format rules apply to the
+  frontend too; no component divides a pesewas amount by 100 inline.
+- **Backend additions this frontend needed** are recorded in their own
+  entries above (RBAC/auth building blocks section): `GET /auth/me`,
+  `GET /rbac/users`, `GET/DELETE /rbac/roles/:roleId/permissions`,
+  `PATCH /rbac/users/:userId/status`, `GET /approvals`, `approval_thresholds`
+  CRUD, `GET /branches/:id/cross-branch-grants`, and the hand-rolled CORS
+  middleware — all additive reads/writes over existing tables, discovered
+  by actually building each Admin Back Office screen against real data
+  rather than assumed up front.
+- **react-router-dom's GHSA-qwww-vcr4-c8h2 advisory (RSC-mode CSRF
+  bypass) does not apply here** — this is a plain client-side SPA with no
+  server actions/RSC integration, and every real authorization check
+  happens server-side (this codebase's own established discipline). Kept
+  on the current version rather than downgrading to a pre-7.12 release
+  for an inapplicable CVE.
+- **The Main App Dashboard branches its content by role, not by a
+  hardcoded role-name switch** — it checks `isCrossBranchRole` (owner/
+  system_admin get a consolidated view + branch PAR30 comparison bar
+  chart) and whether the caller is specifically `loan_officer` (their
+  portfolio-quality call passes `loanOfficerId`, giving "My loan book"
+  scoped to their own assigned loans, per Section 7.2's role-scope table)
+  — everything else (branch_manager, cashier, field_agent) gets the
+  single-branch dashboard variant with a permission-gated Quick Actions
+  row instead of the cross-branch chart, since building each of those
+  roles' full dedicated landing experience (till view, collection round)
+  is those modules' own screens (Cashier & Vault, Field Agents), not a
+  dashboard concern to duplicate. No `investor` role exists anywhere in
+  this codebase's seeded role set (owner, branch_manager, loan_officer,
+  cashier, field_agent, system_admin) — Module 11 never created one — so
+  the spec's investor-only read-only statement view has no role to gate
+  behind yet; flagged in Open Questions rather than inventing role logic
+  the backend doesn't support.
+- **`glService.listJournalEntries` (added above) is what both the
+  dashboard's recent-transactions widget and the Reports Transactions
+  screen read from** — one query, one component
+  (`RecentTransactionsWidget`), reused in both places rather than two
+  separate implementations.
+- **Customers & CRM (`src/features/main/customers/`) needed zero backend
+  additions** — `GET /customers`, `GET /loans`, `GET /savings`, and
+  `GET /investments` already all accept a `customerId`/filter set, and
+  `GET /customers/:id/360` already aggregates documents, next-of-kin,
+  credit bureau lookups, and group info in one call. `Customer360Page`
+  fetches that 360 payload plus the three list endpoints (each filtered
+  by `customerId`) in parallel, since `getCustomer360` itself
+  deliberately excludes loans/savings/investments (its own
+  `pendingModules` field says so) — those three modules' real list
+  endpoints already covered the gap.
+  - `CustomersListPage` follows the same no-text-search honesty already
+    established for `CommandPalette`: filters are branch/type/status/
+    classification dropdowns (plus a free-text exact-match input for the
+    free-form `classification` column), not a fake name search box.
+  - The create-customer modal only covers `individual`/`sme` — `group` is
+    a deliberately separate backend flow (`createGroup`/`groups.js`, not
+    `createCustomer`), so groups are formed from an existing customer's
+    360 page once members are onboarded individually, matching
+    `validateCustomerFields`'s own rejection of `customerType: 'group'`.
+  - Document upload has no file-storage backend — `AddDocumentModal`
+    takes a `fileUrl` text field (an already-hosted link) rather than a
+    fake file picker, consistent with the `customer_documents` table
+    schema itself (`file_url TEXT`, no blob storage).
+  - `customer.close` (closure request) posts to `/customers/:id/closure-
+    requests`, which returns 202/pending — the modal explicitly tells the
+    user this is a maker-checker request, not an immediate closure, so
+    the UI doesn't imply an action completed when it's actually now
+    sitting in the Approvals queue.
+- **Loans & Credit (`src/features/main/loans/`) needed one small backend
+  addition: `GET /loans/:id/appraisals` + `loanService.listAppraisals`.**
+  Every other read the screen needs already existed (products, schedule,
+  repayments, collateral, guarantors, the arrears report, the calculator)
+  — but there was no way to see a loan's appraisal history, only submit a
+  new one (`POST /:id/appraisals`), which meant a loan that had been
+  appraised more than once (e.g. re-appraised after more documentation)
+  had no visible trail. Added the read-only list alongside the existing
+  collateral/guarantors GETs (no permission gate, matching that pattern),
+  with a service-level test in `loanModule.test.js` following the same
+  convention the rest of that file already uses (direct `loanService`
+  calls, not supertest — supertest was only introduced for the RBAC/auth
+  additions above).
+  - `LoansListPage` is one continuous page (same "single page, permission-
+    gated sections" pattern as `Customer360Page`): the filtered loan list
+    + create-application modal, a loan calculator (`POST /loans/calculator`
+    — no permission gate, previews a schedule without creating anything),
+    an arrears/PAR report (`loan.view_reports`), and loan product
+    management (`loan.manage_products` for create; the list itself is
+    open to any authenticated user, same as the backend route).
+  - `LoanDetailPage` renders every lifecycle action gated both by
+    permission AND by the loan's current `status` (e.g. "Disburse" only
+    shows once `status === 'approved'`, "Restructure"/"Write off" only
+    once `status === 'disbursed'`), so the button row can never invite an
+    action the backend will reject. Restructure and closure-style actions
+    that return `202` (maker-checker) say so explicitly in the modal,
+    matching the Customer 360 closure-request pattern.
+  - Overdraft loans get their own facility card (limit/drawn/available/
+    balance from `GET /:id/overdraft-status`) instead of the amortizing
+    schedule section, since overdrafts have no `loan_schedules` rows —
+    the schedule card is only rendered for non-overdraft loans.
+  - Money/percentage form inputs use two new small helpers in
+    `src/lib/format.ts`, `parseGhsInput` and `parsePercentToBps` — the
+    inverse of `formatGhs`/`formatBps`, so a GHS or percent text field
+    becomes the integer pesewas/bps value the API expects in exactly one
+    place, never inline `* 100` arithmetic in a component.
+- **Savings & Susu (`src/features/main/savings/`) needed zero backend
+  additions** — every read/write the screens use already existed:
+  accounts, statement, reconciliation, deposits, withdrawal requests,
+  charges, close; susu accounts, collections, complete-cycle, payout;
+  standing orders and their run history; both product catalogs.
+  - `SavingsSusuPage` is one page with a `FilterToolbar` chip toggle
+    between "Savings accounts" and "Susu accounts" (reusing the chips
+    prop that already existed for this exact purpose) rather than two
+    separate routes for what the nav treats as one destination — Standing
+    Orders and Savings Products sections sit below both views since
+    they're not specific to either account type.
+  - `SusuAccount.status` is `active | completed | uncompleted | paid_out`
+    per the `susu_accounts_status_chk` constraint (migration 029) — NOT
+    `cancelled`, which only applies to `standing_orders.status`. Payout is
+    only offered once a cycle has left `active` (`completed` or
+    `uncompleted`, matching `payOutCycle`'s own precondition).
+  - Susu collection recording generates its idempotency key client-side
+    via `crypto.randomUUID()` — mirroring the backend's own documented
+    idempotency contract for agent field collections (a retry after a
+    dropped connection returns the original collection rather than
+    double-posting), rather than the UI needing its own retry logic.
+  - The withdrawal-request modal shows the real `paidOut` vs. pending-
+    approval outcome the backend actually returned (200 vs. 202), instead
+    of a generic "submitted" message — same honesty-about-outcome pattern
+    as the Customer 360 closure-request modal.
+- **Investments (`src/features/main/investments/`) needed zero backend
+  additions.** `InvestmentsListPage` (list + booking modal + product
+  catalog) and `InvestmentDetailPage` (activate, accrue interest, request
+  payout, request redemption, settle a pending payout, confirm a
+  redemption payout) map directly onto the existing route set.
+  - "Request payout" is only offered when the product's
+    `payout_frequency === 'monthly'` — an `at_maturity` product's interest
+    only ever surfaces through redemption, matching `investmentService`'s
+    own model (no periodic payout path exists for it).
+  - A pending payout can only be settled from this screen once
+    `threshold_flag` is false; a payout above the product's approval
+    threshold must clear maker-checker first, and the screen says so
+    rather than offering a Settle button that would just 409.
+  - Early-redemption penalties are shown as a distinct KPI
+    (`penalty_pesewas`) next to `interest_payable_pesewas`, making
+    visible on-screen the rule already enforced server-side and
+    documented elsewhere in this log: the penalty only ever reduces
+    payable interest, never principal.
+- **Cashier & Vault (`src/features/main/cashier/`) needed two small backend
+  additions: `cashierService.listCashBackRequests` (`GET
+  /cashier/tills/:id/cashback-requests`) and `cashierService.listReversals`
+  (`GET /cashier/reversals`, `cashier.view`-gated).** Module 6 shipped
+  `POST` routes for both cash-back requests and reversals but no way to
+  read them back — a teller had no way to see a till's own cash-back
+  history, and nobody had a worklist of reversals waiting to be executed
+  once approved. Both are straightforward filtered `SELECT`s over their
+  existing tables (mirroring `listCollateral`/`listGuarantors`'s
+  no-permission-gate-on-nested-GET pattern for the till-scoped one), with
+  assertions added to the existing `cashierModule.test.js` cases that
+  already build the fixtures these functions read back, rather than new
+  test blocks duplicating that setup.
+  - `CashierVaultPage` is one page: cash position (consolidated across
+    branches for owner/system_admin via the existing
+    `getConsolidatedCashPosition`, single-branch otherwise), tills,
+    reversals, and period close-outs — the same "single page, permission-
+    gated sections" shape used throughout the Main Banking Application.
+  - `TillDetailPage` is where a till's cash-back requests actually live
+    and get settled, since `cash_back_requests` has no independent
+    identity outside its till.
+  - Prior-period adjustments (`POST /cashier/prior-period-adjustments`)
+    are deliberately NOT built into this screen — the endpoint takes
+    arbitrary balanced GL debit/credit lines, and a rushed line-item
+    editor here would be worse than none; it belongs with a proper GL
+    journal-entry UI (Reports & Compliance), not bolted onto Cashier &
+    Vault.
+- **Transactions ledger (`src/features/main/transactions/TransactionsPage.tsx`)
+  needed one small backend addition: `glService.getJournalEntryDetail`
+  (`GET /gl/journal-entries/:id/lines`, `gl.view_reports`-gated).**
+  `listJournalEntries` (added for the dashboard widget) only returns each
+  entry's one net amount — enough for a feed, not for a "detailed
+  transaction record." The new function returns the entry plus its actual
+  `gl_journal_lines` rows with `gl_accounts.code`/`name` joined in, so a
+  drill-down modal can show what actually debited/credited, tested by
+  extending the existing `unified transaction ledger` describe block.
+  - `RecentTransactionsWidget`'s category logic (`categoryOf`, the
+    `-RPY`/`-DISB`/`-COMM`-etc. suffix groups, and its row type) is now
+    exported and reused by `TransactionsPage` rather than re-implemented
+    — one classification rule, two consumers.
+  - Pagination is plain prev/next (not the admin `Pagination` component,
+    which requires a `total` count) — `listJournalEntries` has no COUNT
+    query behind it, and guessing a total would be fabricating a number
+    the backend doesn't have. "Next" just disables once a page comes back
+    shorter than the limit.
+- **Branches performance view (`src/features/main/branches/`) needed zero
+  backend additions.** `BranchesPage` (filterable list + up-to-6-branch
+  net-income compare chart) and `BranchDetailPage` (cash position,
+  income/expense, cost-to-income, headcount, staff list) consume
+  `GET /branches/:id/performance` as-is — including its own honest
+  `pendingMetrics` field (`portfolioSize`, `parBuckets`, `totalDeposits`,
+  `profitability`, which it says need Module 9 data it doesn't compute
+  itself). Rather than leave those metrics blank, the detail page fills
+  the actual gap with the Module 9 endpoints Dashboard already
+  established the pattern for: `analytics.portfolio-quality` (loan count,
+  outstanding principal, PAR30, largest exposures) and
+  `analytics.growth-trends` (the same `TrendChart` component, reused
+  as-is) — both scoped to this one branch via `?branchId=`. No new
+  backend surface, just composing two already-real data sources instead
+  of shipping the branch's own honest "not computed here" fields blank.
+  - The compare chart colors bars green/red by net-income sign (the same
+    status-color convention `BranchParChart` established for PAR30), not
+    one hue per branch — color encodes profit/loss, not branch identity.
+  - Cash-in-transit transfers (`POST /branches/transfers`) and
+    cross-branch access grants are deliberately NOT on this screen —
+    transfers aren't a performance metric, and the grants are already
+    covered by the Admin Back Office's Access & Approval Rules page;
+    duplicating either here would be scope creep past what
+    `branch.view_performance` (a view-only permission) implies.
+- **Field Agents (`src/features/main/agents/`) surfaced a real cross-
+  branch-supervisor gap identical to the one already fixed for
+  analytics: `GET /agents` and `GET /agents/reconciliations` used the
+  plain `resolveBranchScope`, which — same as before the analytics
+  fix — always falls back to the caller's OWN home branch when no
+  `?branchId=` is given, even for owner/system_admin. A cross-branch
+  supervisor's roster/reconciliation screens would have silently shown
+  only their own home branch's agents. Rather than re-invent the same
+  `?branchId=all` sentinel a second time, `resolveAnalyticsBranchScope`
+  was renamed to `resolveConsolidatedBranchScope` (its behavior was
+  never analytics-specific, just first needed there) and wired into
+  both agent routes; `FieldAgentsPage` sends `branchId: 'all'` for
+  cross-branch roles the same way `DashboardPage` already does. Caught
+  live by registering a test agent in a non-home branch and watching
+  the supervisor roster come back empty — exactly the bug the rename
+  fixes.
+  - The screen renders two entirely different things behind one nav
+    entry, gated on which of `agent.manage` / `agent.view_locations` /
+    `agent.reconcile` / `agent.ping_location` the caller actually holds
+    (mirroring `agent.ping_location`'s own migration comment that it's
+    "the ONE action an ordinary field_agent-role user needs for
+    themselves"): a supervisor gets the roster + reconciliation
+    console; a plain field_agent (who holds only `agent.ping_location`
+    per the Module 10 permission seed) gets a single "record my
+    location" action and nothing else — honestly, since that role has
+    no read permission to show its own location history back to itself.
+  - The ping button uses the browser's real `navigator.geolocation` API
+    (Playwright-verified with a mocked coordinate), not a manually-typed
+    lat/lng, matching how an actual field agent would use this in the
+    field.
+- **Reports & Analytics (`src/features/main/reports/ReportsPage.tsx`) and
+  Compliance & Regulatory (`src/features/main/compliance/CompliancePage.tsx`)
+  needed zero backend additions** — both consume the existing Module 7/8/9
+  read and write surface as-is. Also caught and fixed the same
+  `resolveConsolidatedBranchScope`-sentinel gap discovered for Field
+  Agents: `ReportsPage`'s executive-report-pack query now sends
+  `branchId: 'all'` for cross-branch roles (the GL financial-statement
+  routes don't need it — they never scoped by `resolveBranchScope` in the
+  first place, so omitting `branchId` there already means "all
+  branches").
+  - Regulatory report TEMPLATE management (create/version/retire) already
+    lives in the Admin Back Office (`RegulatoryTemplatesPage`, built
+    earlier); `CompliancePage` is deliberately the OPERATIONAL side only —
+    generating a report from an existing template, tracking submissions,
+    running AML screening and reviewing flags, and sanctions
+    list/screening — so the two screens don't duplicate the same CRUD.
+  - Regulatory ratio computation (CAR, liquidity) and the GRA
+    withholding/VAT summaries exist at the service layer
+    (`complianceService.computeRatio`/`getWithholdingTaxSummary`/
+    `getVatSummary`) but were left off this pass's UI — they need a ratio-
+    definition picker that doesn't exist anywhere in the admin UI yet
+    (`ratio-definitions` is `compliance.manage_config`-gated, config-only,
+    with no screen of its own), so surfacing them here first would mean
+    guessing definition names rather than reading them from a real list.
+    Flagged here rather than bolted on with a free-text ratio-name input.
+  - "Mark submitted" records only a `fileReference` string — there is no
+    live regulator submission integration, and the modal says so, the
+    same honesty pattern used for investment/redemption payment
+    references elsewhere in this log.
+- **Settings & Preferences got two additions this pass: per-category
+  notification toggles and a "What's new" changelog card** — both
+  client-only, no backend changes.
+  - `NotificationPreferencesProvider` (`src/lib/notificationPreferences.tsx`)
+    is a `localStorage`-backed React Context, the exact same shape as
+    `ThemeContext`: read on mount, persist on every change, throw if the
+    hook is used outside the Provider. There is no per-user preferences
+    table (same reasoning as the density/reduced-motion/high-contrast
+    settings above), so this is in-app-only and does not follow a user
+    across devices — the Settings copy says so explicitly ("In-app only
+    for now — email and SMS delivery aren't wired up yet"), rather than
+    implying a channel that doesn't exist.
+  - `useNotifications()` (`src/lib/notifications.ts`) filters its final
+    constructed `items` array by `notificationPrefs[item.kind]` rather
+    than gating each source query's `enabled` flag by the same
+    preference. Both were tried; gating `enabled` was reverted because
+    React Query does not clear a query's cached `.data` when `enabled`
+    transitions to `false`, so a category toggled off mid-session would
+    still show its last-fetched (stale) items until an unrelated refetch
+    cleared them — filtering the constructed array is correct regardless
+    of cache state and was verified live: toggling "Approvals awaiting
+    me" off in Settings immediately emptied that category from the bell
+    dropdown, which had been showing one real pending `savings.withdraw`
+    approval.
+  - Each toggle row is only shown if the caller holds the permission that
+    already gates that category's underlying source screen (mirrors the
+    per-source gating already documented for `NotificationCenter` above),
+    so a role without `compliance.manage_aml` never even sees an "AML
+    flags" toggle to turn on or off.
+  - The "What's new" card is a static, hand-written array of dated
+    entries describing what actually shipped this session (verified
+    against the task list, not invented feature claims) — there is no
+    backend release/changelog table, and building one for a single static
+    list was judged out of scope; flagged as a candidate for a real
+    changelog endpoint if this becomes a maintained product rather than a
+    single build session.
+- **Final verification pass: a scripted Playwright sweep (5 real seeded
+  users spanning every role — owner, system_admin, branch_manager,
+  loan_officer, field_agent — across light/dark theme × desktop/tablet/
+  narrow viewports, ~121 page loads total) caught four real bugs that
+  typechecking/linting alone had missed, all now fixed:**
+  - **No `/app/*` route was actually permission-gated** — the sidebar
+    hid links a role couldn't use, but typing the URL directly (or a
+    stale bookmark/back-button) still rendered the full page and fired
+    its data queries, which came back 403 and surfaced as raw console
+    errors with no explanation to the user. Fixed by wrapping every
+    `/app/*` route in `RequirePermission` in `App.tsx`, using the exact
+    same `anyOf` list already declared for that route's nav item in
+    `MainAppLayout.tsx` — same honest "you don't have access" pattern
+    `RequirePermission` already gave Admin routes, now applied
+    consistently to the Main App tree too.
+  - **`DashboardPage`'s KPI/trend-chart queries (`live-stats`,
+    `portfolio-quality`, `growth-trends`) had no permission gate at
+    all**, so cashier and field_agent — deliberately NOT analytics
+    audiences per migration 045's role_permissions seed — got 403s on
+    every dashboard load and a "Branch dashboard" showing four KPI tiles
+    reading GH₵0.00/"—", which reads as real data ("nothing happened
+    today") rather than "you can't see this." Fixed by gating those
+    three queries and the whole KPI/trend-chart section behind
+    `hasPermission('analytics.view')`; a role without it now gets the
+    welcome header plus a Quick Actions card only. Also added two Quick
+    Action buttons (Savings & Susu, Field Agents) gated on
+    `susu.view`/`susu.record_collection` and
+    `agent.manage`/`agent.view_locations`/`agent.ping_location`
+    respectively — field_agent previously had zero buttons it could see
+    in that card, which was itself a smaller instance of the same gap.
+  - **`SavingsSusuPage` defaulted its tab to `'savings'` unconditionally**,
+    so field_agent (who holds `susu.view`/`susu.record_collection` but
+    not `savings.view` — they never handle a till, per migration 031)
+    got a 403 on page load and an unreachable "Savings accounts" tab
+    they could still click into. Fixed by defaulting the tab to whichever
+    the caller can actually see (`savings.view` ? 'savings' : 'susu'),
+    additionally gating each tab's query on its own permission, and
+    hiding the tab-chip entirely for a permission the caller lacks.
+  - **The Transactions nav item and route both advertised
+    `cashier.view`/`loan.view_reports` as alternate ways in**, but the
+    page's sole data source (`GET /gl/journal-entries`) has only ever
+    required `gl.view_reports` (see the GL routes section above) — a
+    permission only owner/system_admin hold. branch_manager and
+    loan_officer could therefore see "Transactions" in the nav and reach
+    the page, but every load 403'd with an empty ledger. Rather than
+    extend the backend to honor a scoped view those roles were never
+    actually given, narrowed both the nav item's and the route's
+    `anyOf` to `['gl.view_reports']` alone, matching what the endpoint
+    genuinely allows — the GL ledger is a report-level screen, the same
+    tier as the Reports page's financial statements, which already gate
+    on `gl.view_reports` only.
+  - Also caught, while reviewing the same dashboard screenshots (not a
+    403/console-error, so the sweep's automated check didn't flag it,
+    but eyeballing the rendered charts per the dataviz skill's "render it
+    and look at it" step did): `TrendChart`'s Y-axis used a fixed
+    ÷1,000,000 divisor labeled "k", which reads as GH₵10,000 increments —
+    for any institution whose daily disbursement/collection volumes run
+    under that (a realistic range for a microfinance book, and this
+    session's own live seed data), every tick collapsed to "0k",
+    an uninformative axis. Replaced with `Intl.NumberFormat`'s
+    `notation: 'compact'`, which scales its own label ("GH₵3.1K",
+    "GH₵150K", "GH₵0") to whatever range the data actually falls in,
+    instead of a divisor tuned to one assumed scale.
+  - No visual/layout defects (overflow, broken responsive collapse,
+    dark-mode contrast failures) turned up at any of the three tested
+    viewport widths in either theme — the design system's dark-mode
+    token overrides, sidebar icon-rail collapse below desktop width, and
+    `DataTable`'s internal horizontal-scroll-on-overflow behavior all
+    held up under the sweep.
+
+---
+
 ## Branch Scoping Convention
 
 _How `branch_id` is enforced across queries — e.g., middleware-level
@@ -1748,6 +2277,21 @@ once and applied everywhere._
   can't escalate scope by editing the query string or path.
 - This mirrors the CLAUDE.md rule that permission/scope checks happen
   server-side, never trusting the frontend.
+- **`resolveAnalyticsBranchScope(req)` added (same file) while building the
+  frontend dashboard** — `resolveBranchScope`'s "no `?branchId=` means the
+  caller's own home branch" default is deliberate everywhere else, but it
+  left `CROSS_BRANCH_ROLES` with no way to ask Module 9's analytics
+  endpoints (`live-stats`, `portfolio-quality`, `profitability`,
+  `top-loan-customers`, `growth-trends`, `report-pack`) for the
+  consolidated, all-branches view those functions already support at the
+  service layer (`branchId: null`) — an owner's dashboard was silently
+  scoped to just their own home branch. Fixed narrowly: `?branchId=all`
+  resolves to `null` for a `CROSS_BRANCH_ROLES` member only; every other
+  input (a real id, no param at all, or `'all'` from a non-cross-branch
+  role) defers to the exact same `resolveBranchScope` behavior as before,
+  so nothing else changes. The frontend sends `branchId=all` explicitly
+  for owner/system_admin's dashboard queries — see
+  `frontend/src/lib/roleScope.ts`.
 
 ---
 
@@ -2100,6 +2644,37 @@ knowledge — plus any module prompt conflicts that need a human call._
       direct `UPDATE ... SET archived_at = NULL`, not a service-layer call.
       Add one if this gap is ever hit for real, rather than reaching for
       raw SQL each time.
+- [ ] **Frontend preferences (theme, density, accessibility settings) are
+      `localStorage`-only, not synced to the server.** A user's choice
+      doesn't follow them to a different device/browser. Add a
+      `user_preferences` table + `GET/PUT /me/preferences` endpoints if
+      cross-device sync is ever actually needed — deliberately deferred
+      rather than adding a table for a need not yet confirmed.
+- [ ] **No backend text search exists for customers/loans/transactions by
+      name or id** — every list endpoint supports structured filters only
+      (branchId, status, customerType, etc.), which is why the frontend's
+      command palette (Cmd/Ctrl+K) is scoped to navigation only rather
+      than the "universal search across customers, loans, transactions"
+      the design spec's Section 9 describes. Adding real search (likely
+      Postgres `ILIKE`/trigram or a proper search index) is a genuine
+      follow-up if this is wanted, not something to fake client-side.
+- [ ] **No 2FA and no multi-device session tracking exist anywhere in this
+      codebase** — auth is still the single in-memory bearer-token-per-
+      login session store flagged as a placeholder since Module 11. The
+      frontend's Settings > Session & security screen says this openly
+      rather than presenting a fake device list; building real 2FA
+      enrollment and a persisted multi-session table is a significant
+      follow-up, not a frontend-only task.
+- [ ] **No `investor` role exists in this codebase's RBAC role set**
+      (owner, branch_manager, loan_officer, cashier, field_agent,
+      system_admin — see migration 002) — the design spec's "Investor
+      (read-only): Investment statement" role-scope row has nothing to
+      gate behind today. If real external investors need platform
+      access, add a proper `investor` role (Module 11's RBAC CRUD) with a
+      narrow permission set (investment.view scoped to their own
+      holdings only — which itself needs a new "my investments" query
+      distinct from the branch-scoped one every other role uses), not a
+      frontend-only page with no real access control backing it.
 
 ---
 

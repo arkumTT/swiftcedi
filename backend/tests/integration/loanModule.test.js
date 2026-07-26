@@ -345,6 +345,26 @@ describeIfDb('Module 3: loan management', () => {
     expect(appraised.status).toBe('rejected');
   });
 
+  test('listAppraisals returns every appraisal recorded against a loan, oldest first', async () => {
+    const product = await createProduct();
+    const customer = await createVerifiedCustomer('Appraisal History Borrower');
+    const loan = await loanService.applyForLoan(pool, {
+      customerId: customer.id,
+      productId: product.id,
+      principalPesewas: 50000,
+      termMonths: 6,
+      appliedBy: maker,
+    });
+
+    expect(await loanService.listAppraisals(pool, { loanId: loan.id })).toEqual([]);
+
+    await loanService.submitAppraisal(pool, { loanId: loan.id, checklist: { a: 1 }, recommendation: 'recommend', appraiserId: maker });
+
+    const appraisals = await loanService.listAppraisals(pool, { loanId: loan.id });
+    expect(appraisals).toHaveLength(1);
+    expect(appraisals[0]).toMatchObject({ loan_id: String(loan.id), recommendation: 'recommend' });
+  });
+
   test('disbursement generates the schedule and posts the GL entry with fees netted from cash', async () => {
     const product = await createProduct({ feeSchedule: [{ type: 'percent_of_principal', rateBps: 200 }] });
     const customer = await createVerifiedCustomer('Disbursement Borrower');

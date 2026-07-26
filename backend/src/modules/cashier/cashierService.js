@@ -397,7 +397,37 @@ async function settleApprovedCashBack(pool, { cashBackRequestId, paidBy }) {
   return payOutCashBack(pool, { cashBackRequest, paidBy });
 }
 
+async function listCashBackRequests(pool, { tillId, status } = {}) {
+  const clauses = [];
+  const params = [];
+  const add = (col, val) => {
+    if (val === undefined || val === null) return;
+    params.push(val);
+    clauses.push(`${col} = $${params.length}`);
+  };
+  add('till_id', tillId);
+  add('status', status);
+  const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+  const { rows } = await pool.query(`SELECT * FROM cash_back_requests ${where} ORDER BY created_at DESC`, params);
+  return rows;
+}
+
 // --- Reversals (always maker-checker) -----------------------------------------
+
+async function listReversals(pool, { branchId, status } = {}) {
+  const clauses = [];
+  const params = [];
+  const add = (col, val) => {
+    if (val === undefined || val === null) return;
+    params.push(val);
+    clauses.push(`${col} = $${params.length}`);
+  };
+  add('branch_id', branchId);
+  add('status', status);
+  const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+  const { rows } = await pool.query(`SELECT * FROM transaction_reversals ${where} ORDER BY created_at DESC`, params);
+  return rows;
+}
 
 async function requestReversal(pool, { originalJournalEntryId, reasonCode, notes = null, requestedBy }) {
   if (!originalJournalEntryId || !reasonCode || !requestedBy) {
@@ -657,9 +687,11 @@ module.exports = {
   payOutCashBack,
   payOutCashBackOnApproval,
   settleApprovedCashBack,
+  listCashBackRequests,
   requestReversal,
   applyReversalApprovalDecision,
   executeApprovedReversal,
+  listReversals,
   closeOutPeriod,
   listCloseSnapshots,
   getBranchCashPosition,
