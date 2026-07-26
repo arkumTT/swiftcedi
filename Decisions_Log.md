@@ -1934,6 +1934,42 @@ is completed._
     user this is a maker-checker request, not an immediate closure, so
     the UI doesn't imply an action completed when it's actually now
     sitting in the Approvals queue.
+- **Loans & Credit (`src/features/main/loans/`) needed one small backend
+  addition: `GET /loans/:id/appraisals` + `loanService.listAppraisals`.**
+  Every other read the screen needs already existed (products, schedule,
+  repayments, collateral, guarantors, the arrears report, the calculator)
+  — but there was no way to see a loan's appraisal history, only submit a
+  new one (`POST /:id/appraisals`), which meant a loan that had been
+  appraised more than once (e.g. re-appraised after more documentation)
+  had no visible trail. Added the read-only list alongside the existing
+  collateral/guarantors GETs (no permission gate, matching that pattern),
+  with a service-level test in `loanModule.test.js` following the same
+  convention the rest of that file already uses (direct `loanService`
+  calls, not supertest — supertest was only introduced for the RBAC/auth
+  additions above).
+  - `LoansListPage` is one continuous page (same "single page, permission-
+    gated sections" pattern as `Customer360Page`): the filtered loan list
+    + create-application modal, a loan calculator (`POST /loans/calculator`
+    — no permission gate, previews a schedule without creating anything),
+    an arrears/PAR report (`loan.view_reports`), and loan product
+    management (`loan.manage_products` for create; the list itself is
+    open to any authenticated user, same as the backend route).
+  - `LoanDetailPage` renders every lifecycle action gated both by
+    permission AND by the loan's current `status` (e.g. "Disburse" only
+    shows once `status === 'approved'`, "Restructure"/"Write off" only
+    once `status === 'disbursed'`), so the button row can never invite an
+    action the backend will reject. Restructure and closure-style actions
+    that return `202` (maker-checker) say so explicitly in the modal,
+    matching the Customer 360 closure-request pattern.
+  - Overdraft loans get their own facility card (limit/drawn/available/
+    balance from `GET /:id/overdraft-status`) instead of the amortizing
+    schedule section, since overdrafts have no `loan_schedules` rows —
+    the schedule card is only rendered for non-overdraft loans.
+  - Money/percentage form inputs use two new small helpers in
+    `src/lib/format.ts`, `parseGhsInput` and `parsePercentToBps` — the
+    inverse of `formatGhs`/`formatBps`, so a GHS or percent text field
+    becomes the integer pesewas/bps value the API expects in exactly one
+    place, never inline `* 100` arithmetic in a component.
 
 ---
 

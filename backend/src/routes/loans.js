@@ -121,6 +121,14 @@ function loansRouter(pool) {
     })
   );
 
+  router.get(
+    '/:id/appraisals',
+    auth,
+    asyncHandler(async (req, res) => {
+      res.json(await loanService.listAppraisals(pool, { loanId: req.params.id }));
+    })
+  );
+
   router.post(
     '/:id/approval-requests',
     auth,

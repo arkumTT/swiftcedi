@@ -17,6 +17,8 @@ import { SystemHealthPage } from './features/admin/SystemHealthPage';
 import { DashboardPage } from './features/main/dashboard/DashboardPage';
 import { CustomersListPage } from './features/main/customers/CustomersListPage';
 import { Customer360Page } from './features/main/customers/Customer360Page';
+import { LoansListPage } from './features/main/loans/LoansListPage';
+import { LoanDetailPage } from './features/main/loans/LoanDetailPage';
 
 const ADMIN_ANY_OF = [
   'rbac.manage_users',
@@ -130,7 +132,8 @@ function App() {
         <Route index element={<DashboardPage />} />
         <Route path="customers" element={<CustomersListPage />} />
         <Route path="customers/:id" element={<Customer360Page />} />
-        <Route path="loans" element={<PlaceholderPage title="Loans & Credit" />} />
+        <Route path="loans" element={<LoansListPage />} />
+        <Route path="loans/:id" element={<LoanDetailPage />} />
         <Route path="savings" element={<PlaceholderPage title="Savings & Susu" />} />
         <Route path="investments" element={<PlaceholderPage title="Investments" />} />
         <Route path="cashier" element={<PlaceholderPage title="Cashier & Vault" />} />

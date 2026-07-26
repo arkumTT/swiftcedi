@@ -33,3 +33,15 @@ export function formatDateTime(value: string | Date | null | undefined): string 
 export function formatBps(bps: number | string | null | undefined): string {
   return `${(Number(bps ?? 0) / 100).toFixed(2)}%`;
 }
+
+/** Inverse of formatGhs's division — the one place a GHS text input becomes an integer pesewas value for the API. */
+export function parseGhsInput(value: string): number {
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.round(n * 100) : 0;
+}
+
+/** A percentage text input (e.g. "24.5" for 24.5% p.a.) to integer basis points. */
+export function parsePercentToBps(value: string): number {
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.round(n * 100) : 0;
+}

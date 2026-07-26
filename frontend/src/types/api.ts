@@ -135,6 +135,106 @@ export interface SavingsAccount {
   opened_at: string;
 }
 
+export interface LoanProduct {
+  id: string;
+  name: string;
+  code: string;
+  loan_type: 'individual' | 'group' | 'overdraft';
+  interest_method: 'flat' | 'reducing_balance';
+  annual_interest_rate_bps: number;
+  min_term_months: number;
+  max_term_months: number;
+  min_principal_pesewas: number;
+  max_principal_pesewas: number;
+  fee_schedule: { code?: string; type: 'flat' | 'percent_of_principal'; amountPesewas?: number; rateBps?: number }[];
+  par_bucket_days: number[];
+  reason_codes: string[];
+  status: 'active' | 'inactive';
+}
+
+export interface LoanAppraisal {
+  id: string;
+  loan_id: string;
+  appraiser_id: string;
+  checklist: Record<string, unknown>;
+  recommendation: 'recommend' | 'decline';
+  notes: string | null;
+  created_at: string;
+}
+
+export interface LoanScheduleRow {
+  id: string;
+  loan_id: string;
+  installment_number: number;
+  due_date: string;
+  principal_due_pesewas: number;
+  interest_due_pesewas: number;
+  fees_due_pesewas: number;
+  principal_paid_pesewas: number;
+  interest_paid_pesewas: number;
+  fees_paid_pesewas: number;
+  status: 'pending' | 'partially_paid' | 'paid';
+}
+
+export interface LoanRepayment {
+  id: string;
+  loan_id: string;
+  amount_pesewas: number;
+  principal_component_pesewas: number;
+  interest_component_pesewas: number;
+  fees_component_pesewas: number;
+  payment_date: string;
+  received_by: string;
+}
+
+export interface LoanCollateral {
+  id: string;
+  loan_id: string;
+  description: string;
+  estimated_value_pesewas: number | null;
+  verification_status: 'pending' | 'verified' | 'rejected';
+}
+
+export interface LoanGuarantor {
+  id: string;
+  loan_id: string;
+  customer_id: string | null;
+  guarantor_name: string | null;
+  guarantor_phone: string | null;
+  guaranteed_amount_pesewas: number | null;
+  verification_status: 'pending' | 'verified' | 'rejected';
+}
+
+export interface LoanCalculatorResult {
+  productId: string;
+  principalPesewas: number;
+  termMonths: number;
+  interestMethod: string;
+  annualInterestRateBps: number;
+  feesPesewas: number;
+  netDisbursedPesewas: number;
+  totalInterestPesewas: number;
+  totalRepayablePesewas: number;
+  schedule: { installmentNumber: number; dueDate: string; principalDuePesewas: number; interestDuePesewas: number }[];
+}
+
+export interface ArrearsReport {
+  asOfDate: string;
+  branchId: number | null;
+  loans: { loanId: number; customerId: number; branchId: number; outstandingPrincipalPesewas: number; daysOverdue: number; bucket: string | null }[];
+  totals: { totalOutstandingPesewas: number; totalAtRiskPesewas: number; buckets: Record<string, number>; parRatio: number };
+}
+
+export interface OverdraftStatus {
+  loanId: number;
+  status: string;
+  savingsAccountId: string;
+  limitPesewas: number;
+  balancePesewas: number;
+  drawnPesewas: number;
+  availablePesewas: number;
+}
+
 export interface Investment {
   id: string;
   customer_id: string;

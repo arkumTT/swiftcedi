@@ -392,6 +392,11 @@ async function submitAppraisal(pool, { loanId, checklist, recommendation, notes 
   }
 }
 
+async function listAppraisals(pool, { loanId }) {
+  const { rows } = await pool.query('SELECT * FROM loan_appraisals WHERE loan_id = $1 ORDER BY created_at', [loanId]);
+  return rows;
+}
+
 // --- Approval (maker-checker via the shared service) ------------------------
 
 /**
@@ -1432,6 +1437,7 @@ module.exports = {
   getLoan,
   listLoans,
   submitAppraisal,
+  listAppraisals,
   requestLoanApproval,
   applyLoanApprovalDecision,
   disburseLoan,
