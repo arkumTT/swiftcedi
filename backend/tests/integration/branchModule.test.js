@@ -59,6 +59,12 @@ describeIfDb('Module 1: branch management', () => {
     // loan_repayments needs TRUNCATE (DELETE is blocked by its immutability
     // trigger) and is handled above.
     for (const table of [
+      'gl_prior_period_adjustments',
+      'day_close_snapshots',
+      'gl_periods',
+      'transaction_reversals',
+      'cash_back_requests',
+      'cashier_tills',
       'investment_redemptions',
       'investment_payouts',
       'investments',
@@ -89,13 +95,26 @@ describeIfDb('Module 1: branch management', () => {
       'cross_branch_access_grants',
       'branch_staff_assignments',
       'branch_vault_configs',
-      'branch_gl_accounts',
       'approval_requests',
       'users',
     ]) {
       await pool.query(`DELETE FROM ${table}`);
     }
-    await pool.query('DELETE FROM gl_accounts WHERE branch_id IS NOT NULL');
+    // Scoped (not a blanket DELETE) so HQ's own branch_gl_accounts row
+    // survives — nothing in any suite ever recreates it for HQ (it's
+    // only ever created via branchService.createBranch(), which HQ
+    // bypassed at seed time), so an unscoped delete here would leave HQ
+    // permanently without one for the rest of this test run.
+    await pool.query(
+      "DELETE FROM branch_gl_accounts WHERE branch_id <> (SELECT id FROM branches WHERE code = 'HQ')"
+    );
+    // Scoped to exclude HQ for the same reason as the branch_gl_accounts
+    // delete above — HQ's own sub-accounts (1000.HQ, 1010.HQ, ...) are
+    // never recreated by any suite (only branchService.createBranch()
+    // does that, and HQ bypassed it at seed time).
+    await pool.query(
+      "DELETE FROM gl_accounts WHERE branch_id IS NOT NULL AND branch_id <> (SELECT id FROM branches WHERE code = 'HQ')"
+    );
     await pool.query("DELETE FROM branches WHERE code <> 'HQ'");
     await pool.query('DELETE FROM branch_clusters');
     await pool.query('DELETE FROM branch_regions');

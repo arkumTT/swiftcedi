@@ -25,8 +25,14 @@ Finalized in Module 1 (migration 009_gl_control_accounts.sql):
 | 4000-4999 | Income | `4000` Operating Income, `4010` Loan Interest Income (Module 3), `4020` Loan Fee Income (Module 3), `4030` Savings Fee Income (Module 4), `4040` Early Withdrawal Penalty Income (Module 5) |
 | 5000-5999 | Expense | `5000` Operating Expense, `5100` Loan Loss Expense (Module 3), `5200` Agent Commission Expense (Module 4), `5300` Investment Interest Expense (Module 5) |
 
+**Module 6 added NO new GL control accounts.** Till float, cash-back, and
+till-close all move cash between the branch's EXISTING Cash in Hand and
+Vault sub-accounts (both from Module 1) — see the Cashier service section
+below for why, and for why there's deliberately no separate
+`vault_balances` table either.
+
 Branch sub-account pattern: on branch creation, `branchService.createBranch()`
-auto-generates a sub-account per control account (14 as of Module 4 — the
+auto-generates a sub-account per control account (17 as of Module 5 — the
 full `branchService.CONTROL_ACCOUNT_CODES` map, minus `1020` Cash in
 Transit which is org-wide by design since it spans two branches) coded
 `<control_code>.<branch_code>` (e.g. `1000.NRA-01`), each with
@@ -114,6 +120,23 @@ _Naming patterns adopted for the schema so later modules stay consistent
   `gl_journal_lines`, `loan_repayments`, `savings_transactions`,
   `susu_collections`, `overdraft_interest_accruals`, `investment_accruals`)
   need `TRUNCATE`, since their triggers block plain `DELETE`.
+- **A second, latent cross-suite gap found and fixed in Module 6**: every
+  suite's cleanup did an UNSCOPED `DELETE FROM branch_gl_accounts` and
+  `DELETE FROM gl_accounts WHERE branch_id IS NOT NULL`, which wipes HQ's
+  own GL sub-accounts and `branch_gl_accounts` row too — and nothing ever
+  recreates them for HQ (only `branchService.createBranch()` does that,
+  which HQ bypassed at seed time; see below). This was silently harmless
+  for five modules because nothing ever queried HQ's GL setup specifically
+  — Module 6's `getConsolidatedCashPosition()` (which queries **every**
+  branch, HQ included) was the first code to do so, and broke in the test
+  database as soon as any earlier suite's cleanup had already run once.
+  Fixed by scoping both deletes to exclude HQ's `branch_id` in all six
+  integration test files — **not** by adding defensive code to the
+  service itself, since every branch always has a complete GL setup in
+  real operation (guaranteed by `createBranch()` and migration 021's
+  one-time HQ backfill); skipping a "branch with no GL accounts" in
+  production code would be handling a scenario that cannot happen, which
+  CLAUDE.md's code-style rules explicitly discourage.
 - **`branches`** started as a stub in Module 11/7's migrations (just `id,
   code, name, status, created_at, updated_at`) so every other table could
   carry a real `branch_id` FK immediately. Module 1 (migration
@@ -220,7 +243,7 @@ values, loan status values, account status values._
 | `gl_accounts.account_type` | `asset`, `liability`, `equity`, `income`, `expense` | 7 |
 | `gl_periods.period_type` | `month`, `year` | 7 |
 | `gl_journal_entries.entry_type` | `standard`, `prior_period_adjustment` | 7 — only `prior_period_adjustment` may post into a locked period |
-| `gl_journal_entries.status` | `posted`, `reversed` | 7 — a "reversed" entry keeps its original immutable lines; reversal is a separate new entry, never an edit |
+| `gl_journal_entries.status` | `posted`, `reversed` | 7 — a "reversed" entry keeps its original immutable lines; reversal is a separate new entry, never an edit. `reversed` existed in this CHECK constraint since Module 7 but had no producer until Module 6's `glPosting.reverseJournalEntry()` |
 | `approval_requests.status` | `pending`, `approved`, `rejected`, `cancelled` | 11 |
 | `branch_transfers.status` | `pending`, `in_transit`, `completed`, `cancelled` | 1 — `initiateTransfer()` moves straight from insert to `in_transit` (posts the outbound GL entry synchronously); `pending` exists in the enum for a future draft/pre-posting state but nothing produces it yet |
 | `customers.status` | `active`, `inactive`, `closed` | 2 — `active`/`inactive` toggle directly (`customerService.isValidDirectStatusTransition()`); `closed` is only reachable via the maker-checker closure flow, never a direct transition, and is terminal (no reactivation path — see Open Questions) |
@@ -247,6 +270,11 @@ values, loan status values, account status values._
 | `investments.status` | `applied`, `pending_approval`, `rejected`, `approved`, `active`, `matured`, `redeemed` | 5 — mirrors the loan lifecycle's applied/pending_approval/approved/disbursed shape; `matured` exists in the enum but nothing sets it yet (no Module 12 sweep — see Open Questions), same as savings' unused `dormant` |
 | `investment_payouts.status` | `pending`, `paid`, `rejected` | 5 |
 | `investment_redemptions.status` | `pending`, `approved`, `paid`, `rejected` | 5 — never jumps straight to `paid`; see the Investment service section |
+| `cashier_tills.status` | `open`, `closed` | 6 |
+| `cash_back_requests.status` | `pending`, `paid`, `rejected` | 6 |
+| `transaction_reversals.status` | `pending`, `approved`, `reversed`, `rejected` | 6 — same never-jumps-straight-to-executed shape as `investment_redemptions.status` |
+| `day_close_snapshots.period_type` | `day`, `month`, `year` | 6 — `month`/`year` also create+lock a `gl_periods` row; `day` has no `gl_periods` equivalent (that table only supports month/year), so a day-lock is enforced by `cashierService` itself, not `glPosting` |
+| `gl_prior_period_adjustments.status` | `pending`, `approved`, `posted`, `rejected` | 6/7 (shared `glPosting.js`, added while building Module 6 — see the Cashier service section) |
 
 **`branches.status` transition table** (`branchService.VALID_STATUS_TRANSITIONS`):
 
@@ -386,6 +414,10 @@ registerExecutionHandler(actionType, handler(approvalRequest, db) -> Promise<voi
 
 ```js
 postJournalEntry(pool, { branchId, reference, description, entryDate, sourceModule, createdBy, approvedBy, entryType, lines }) -> Promise<{ ...entry, lines }>
+reverseJournalEntry(pool, { originalEntryId, reason, reversedBy, entryDate, entryType }) -> Promise<{ reversalEntry, originalEntry }>  // added in Module 6
+requestPriorPeriodAdjustment(pool, { branchId, entryDate, description, lines, requestedBy }) -> Promise<{ adjustment, approvalRequest }>  // added in Module 6, ALWAYS maker-checker
+postApprovedPriorPeriodAdjustment(pool, { adjustmentId, postedBy }) -> Promise<{ adjustment, journalEntry }>  // added in Module 6
+registerGlExecutionHandlers()  // 'gl.prior_period_adjustment' — added in Module 6
 getAccountBalance(db, { accountId, asOfDate, branchId }) -> Promise<number>  // signed pesewas, reconstructed from gl_journal_lines
 validateBalancedLines(lines) -> void  // pure, throws UnbalancedEntryError; no db
 ```
@@ -408,6 +440,41 @@ validateBalancedLines(lines) -> void  // pure, throws UnbalancedEntryError; no d
 - `gl_journal_lines` rows are immutable at the DB layer once inserted
   (BEFORE UPDATE/DELETE trigger) — corrections are always a new reversing
   entry, never an edit.
+- **`reverseJournalEntry` (added in Module 6)** builds a NEW entry with
+  every line's debit/credit swapped from the original (via
+  `postJournalEntry`, so it gets the same balance/period-lock checks and
+  audit trail), links it back with `reverses_entry_id`
+  (`gl_journal_entries` migration 037, `UNIQUE` — at most one reversal per
+  original entry ever), and flips the ORIGINAL entry's `status` to
+  `'reversed'`. The original's *lines* are never touched — only its
+  status column, which (unlike `gl_journal_lines`) was never immutable at
+  the DB layer, just unused until now. This activates
+  `gl_journal_entries.status = 'reversed'`, which has existed in the
+  CHECK constraint since Module 7 with no producer until Module 6.
+- **`requestPriorPeriodAdjustment` / `postApprovedPriorPeriodAdjustment`
+  (added in Module 6)** are the module spec's "distinct back-dated
+  adjustment workflow with extra approval" for correcting a LOCKED
+  period. Deliberately placed here (shared, Module 7's domain) rather
+  than inside `cashierService.js` — any module could need a back-dated
+  correction, not just cashier operations. ALWAYS maker-checker, no
+  threshold. Same two-phase shape as every other approval-gated GL
+  posting in this codebase: the registered execution handler
+  (`applyPriorPeriodAdjustmentApprovalDecision`) only flips the request
+  to `approved` inside `decide()`'s transaction; the actual posting
+  (`entryType: 'prior_period_adjustment'`, the only value
+  `assertPeriodOpen()` lets through a locked period) happens afterward via
+  `postApprovedPriorPeriodAdjustment`, since `postJournalEntry` owns its
+  own transaction and can't run inside `decide()`'s. `lines` is
+  snapshotted on the `gl_prior_period_adjustments` row at request time so
+  what eventually posts can never silently drift from what a checker
+  reviewed — same reasoning as `loan_restructures` snapshotting proposed
+  new terms.
+- **`gl_periods` had no producer until Module 6.** The table and
+  `assertPeriodOpen()`'s lock check existed since Module 7, but nothing
+  ever inserted a row — `cashierService.closeOutPeriod()`'s month/year
+  level is the first code in this codebase to actually create (and lock)
+  one, which is what makes the period-lock mechanism real for every
+  module's postings, not just cashier's. See the Cashier service section.
 
 ### RBAC/auth building blocks used by all three
 
@@ -987,6 +1054,91 @@ not equity — see the Chart of Accounts section above for why.
   existing call sites happen to do this today, but nothing stops a future
   one from introducing it.
 
+### Cashier service — `backend/src/modules/cashier/` (Module 6)
+
+No dedicated pure-math file — the only arithmetic (expected-closing-
+balance, variance) is simple subtraction, not worth its own unit-tested
+module the way loan/savings/investment interest math is.
+
+```js
+// cashierService.js
+openTill(pool, { branchId, cashierId, openingBalancePesewas, businessDate, openedBy }) -> till + journalEntry
+closeTill(pool, { tillId, closingBalancePesewas, closedBy }) -> till + journalEntry  // records variance, never blocks on it
+requestCashBack(pool, { tillId, amountPesewas, requestedBy }) -> pays out OR queues for approval
+settleApprovedCashBack(pool, { cashBackRequestId, paidBy })
+requestReversal(pool, { originalJournalEntryId, reasonCode, notes, requestedBy }) -> { reversal, approvalRequest }  // ALWAYS maker-checker
+executeApprovedReversal(pool, { reversalId, executedBy }) -> { reversal, reversalEntry }
+closeOutPeriod(pool, { branchId, periodType, periodStart, periodEnd, closedBy }) -> day_close_snapshots row  // day/month/year
+getBranchCashPosition(pool, branchId) / getConsolidatedCashPosition(pool)
+registerCashierExecutionHandlers()  // 'cashback.request' + 'gl.reversal'
+```
+
+**GL mapping — no new control accounts** (see Chart of Accounts above):
+
+| Event | Debit | Credit |
+|---|---|---|
+| Till open (float issuance) | Cash in Hand | Vault |
+| Cash-back | Cash in Hand | Vault |
+| Till close (banking the count back) | Vault | Cash in Hand |
+| Reversal | `glPosting.reverseJournalEntry` — swaps the original entry's own lines | |
+
+- **No `vault_balances` table, despite the spec listing one.** "The vault
+  balance" for a branch already IS `branch_gl_accounts.vault_account_id`'s
+  reconstructed GL balance (`glPosting.getAccountBalance`) — a parallel
+  stored-balance table would just be a second, driftable copy of the same
+  number, the exact thing CLAUDE.md's "reconstruct from journal lines"
+  rule exists to prevent. Module 1's cash-in-transit transfers actually
+  move `Cash in Hand` (not `Vault`) between branches, so — in THIS
+  codebase specifically — only till-open/cash-back/till-close ever touch
+  a branch's vault balance.
+- **No `deleted_transactions_log` table either.** Nothing in this
+  codebase ever hard-deletes a financial record (every table is either
+  append-only with an immutability trigger, or uses a status/soft-delete
+  column), and every write already goes through the shared `audit_log`
+  service. A parallel deletion-log table would violate CLAUDE.md's "route
+  all audit writes through the shared audit-log service — do not write ad
+  hoc audit logic per module." Reversals (`transaction_reversals`) ARE
+  the "soft-delete" mechanism for GL transactions here.
+- **Cash-back is threshold-gated** (same convention as Module 4's
+  `savings.withdraw` / Module 5's `investment.payout`): a branch-specific
+  `approval_thresholds` row for `'cashback.request'` wins if present,
+  else 0 — every cash-back needs approval until someone configures a real
+  threshold, the same safe default established elsewhere. **Reversals
+  ALWAYS require maker-checker**, no threshold — matches the spec's own
+  "with a reason code and approver" framing, same treatment as
+  `loan.approve`/`investment.book`/`investment.redeem`.
+- **Till variance is real but approximate, not a true per-transaction
+  reconciliation.** `expected_closing_balance_pesewas` = opening float +
+  every `'paid'` cash-back for that till — it does NOT net out ordinary
+  teller transactions (deposits, withdrawals, loan disbursements/
+  repayments), because none of those carry a `till_id` anywhere in this
+  schema; they all post directly to the branch's POOLED Cash in Hand
+  account. Attributing every cash-moving transaction across Modules 3–5
+  to a specific till would be a real, much larger schema change (adding
+  `till_id` to `savings_transactions`, `loan_repayments`, etc.) — out of
+  scope here and flagged in Open Questions, not silently assumed away. A
+  variance is recorded, never blocks closing (a real-world shortage/
+  surplus must surface, not be hidden), same "report don't block"
+  philosophy as `savingsService.reconcileAccount()`.
+- **All GL postings tied to a specific till use that till's own
+  `business_date`, not "today."** A real bug caught in smoke-testing:
+  `closeTill`/cash-back originally used `todayIso()` for the entry date,
+  which misdates a till's activity to whenever the action happens to be
+  recorded rather than the shift it belongs to, and can even spuriously
+  collide with a period lock that covers today but not the till's actual
+  business date (closing a till dated last month, today, after this
+  month has already been locked). Fixed with the same
+  `toDateString()`-normalization pattern Module 5 already established for
+  DATE columns read back from Postgres.
+- **Close-out (`closeOutPeriod`) shares ONE precondition across all three
+  levels** — no till in the branch may still be open — per the spec's own
+  "close-out endpoints (each validating all tills for the branch are
+  closed first)". `'month'`/`'year'` additionally create+lock a
+  `gl_periods` row (see the GL posting interface section above);
+  `'day'` has no `gl_periods` equivalent, so its lock is enforced by
+  `assertDayNotLocked()` inside `cashierService` itself, checked before
+  every `openTill()`.
+
 ---
 
 ## Branch Scoping Convention
@@ -1190,13 +1342,17 @@ knowledge — plus any module prompt conflicts that need a human call._
       `investments.status`. **This is not new** — Module 3's
       `loan.approve` has the exact same gap (a rejected loan approval
       never flips `loans.status` to `rejected` either; only appraisal
-      decline does). Fixing it properly means changing
+      decline does), and **Module 6 has it a third and fourth time**:
+      `cash_back_requests.status` and `transaction_reversals.status` both
+      stay `pending` forever on rejection instead of moving to their own
+      `rejected` value. Fixing it properly means changing
       `approvalWorkflow.decide()` to invoke the handler on both outcomes
       and updating every existing handler (branch/customer closure, loan
-      approve/restructure, savings withdrawal, all three new investment
-      handlers) to branch on the outcome — a cross-cutting change touching
-      every module built so far, deliberately NOT done as a drive-by fix
-      here. Do it as its own explicit, tested change.
+      approve/restructure, savings withdrawal, investment book/payout/
+      redeem, cashier cashback/reversal) to branch on the outcome — a
+      cross-cutting change touching every module built so far,
+      deliberately NOT done as a drive-by fix here. Do it as its own
+      explicit, tested change.
 - [ ] **Nothing sweeps `investments.status` to `matured` when
       `maturity_date` passes.** Same shape as savings' unbuilt dormancy
       sweep — belongs to Module 12's scheduler. Until then, `matured` is a
@@ -1204,6 +1360,31 @@ knowledge — plus any module prompt conflicts that need a human call._
       correctly regardless (it derives "early or not" from comparing dates
       directly, not from this status), so this is a reporting gap, not a
       correctness one.
+- [ ] **Till variance is not a true per-transaction reconciliation** (see
+      the Cashier service section for the full reasoning) — it only nets
+      the till's own opening float and cash-back against the cashier's
+      physical count, because ordinary teller transactions (deposits,
+      withdrawals, disbursements, repayments) aren't attributed to a
+      specific `till_id` anywhere in this schema; they post to the
+      branch's pooled Cash in Hand. If the business needs a true
+      till-level audit trail (which specific transactions a given cashier
+      actually processed), that requires adding `till_id` to
+      `savings_transactions`, `loan_repayments`, and every other cash-
+      moving table across Modules 3–5 — a real, cross-module schema
+      change, not a Module 6 tweak.
+- [ ] **No `approval_thresholds` row exists for `cashback.request`
+      either**, so every cash-back currently needs approval regardless of
+      amount (the safe default). Same open question as `loan.approve` and
+      `savings.withdraw`/`investment.payout` before it — the real
+      threshold is a business/compliance number nobody has supplied yet.
+- [ ] **`gl_periods` locking is now real but coarse: month/year only, no
+      partial-branch exemptions.** Once a period is locked for a branch,
+      EVERY module's postings into it are blocked (loans, savings,
+      investments, cashier) — there's no way to lock "GL adjustments only"
+      while leaving, say, loan disbursement open, nor to lock a period for
+      some branches but not others in one call (each `closeOutPeriod`
+      call is single-branch). If the business needs finer-grained locking
+      than that, it's a new decision, not an extension of this mechanism.
 
 ---
 
@@ -1370,3 +1551,20 @@ deliberately changed._
   built in this repo; the actual payments-rail question is answered by
   the manual-confirmation stub described in Open Questions, not by a
   nonexistent "Module 7 payments layer."
+- **Module 6's data model expectations list `vault_balances` and a
+  `deleted_transactions_log` table; neither was built.** "The vault
+  balance" is already `branch_gl_accounts.vault_account_id`'s
+  reconstructed GL balance, and every write already goes through the
+  shared `audit_log` service with nothing ever hard-deleted — see the
+  Cashier service section for the full reasoning. Building either as a
+  literal, separate table would duplicate existing infrastructure this
+  codebase deliberately consolidated.
+- **`glPosting.js` (Module 7's shared interface) was extended twice
+  during Module 6's build** rather than adding this logic inside
+  `cashierService.js`: `reverseJournalEntry` and the prior-period-
+  adjustment workflow (`requestPriorPeriodAdjustment` /
+  `postApprovedPriorPeriodAdjustment`) both live at the shared-services
+  layer because any module could need to reverse a posting or correct a
+  locked period, not just cashier operations — same reasoning Module 1
+  used when it added `registerExecutionHandler` to `approvalWorkflow.js`
+  for branch closure rather than building a bespoke decide endpoint.

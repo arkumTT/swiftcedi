@@ -13,11 +13,14 @@ const { loansRouter } = require('./routes/loans');
 const { savingsRouter } = require('./routes/savings');
 const { susuRouter } = require('./routes/susu');
 const { investmentsRouter } = require('./routes/investments');
+const { cashierRouter } = require('./routes/cashier');
 const { registerBranchExecutionHandlers } = require('./modules/branch/branchService');
 const { registerCustomerExecutionHandlers, getAccountClosure } = require('./modules/customer/customerService');
 const { registerLoanExecutionHandlers } = require('./modules/loan/loanService');
 const { registerSavingsExecutionHandlers } = require('./modules/savings/savingsService');
 const { registerInvestmentExecutionHandlers } = require('./modules/investment/investmentService');
+const { registerCashierExecutionHandlers } = require('./modules/cashier/cashierService');
+const { registerGlExecutionHandlers } = require('./shared/glPosting');
 const { requireAuth } = require('./middleware/auth');
 const { asyncHandler } = require('./utils/asyncHandler');
 
@@ -34,6 +37,8 @@ function createApp(pool) {
   registerLoanExecutionHandlers();
   registerSavingsExecutionHandlers();
   registerInvestmentExecutionHandlers();
+  registerCashierExecutionHandlers();
+  registerGlExecutionHandlers();
 
   app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
@@ -49,6 +54,7 @@ function createApp(pool) {
   app.use('/savings', savingsRouter(pool));
   app.use('/susu', susuRouter(pool));
   app.use('/investments', investmentsRouter(pool));
+  app.use('/cashier', cashierRouter(pool));
 
   app.get(
     '/account-closures/:id',
