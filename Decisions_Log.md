@@ -2040,6 +2040,24 @@ is completed._
     editor here would be worse than none; it belongs with a proper GL
     journal-entry UI (Reports & Compliance), not bolted onto Cashier &
     Vault.
+- **Transactions ledger (`src/features/main/transactions/TransactionsPage.tsx`)
+  needed one small backend addition: `glService.getJournalEntryDetail`
+  (`GET /gl/journal-entries/:id/lines`, `gl.view_reports`-gated).**
+  `listJournalEntries` (added for the dashboard widget) only returns each
+  entry's one net amount — enough for a feed, not for a "detailed
+  transaction record." The new function returns the entry plus its actual
+  `gl_journal_lines` rows with `gl_accounts.code`/`name` joined in, so a
+  drill-down modal can show what actually debited/credited, tested by
+  extending the existing `unified transaction ledger` describe block.
+  - `RecentTransactionsWidget`'s category logic (`categoryOf`, the
+    `-RPY`/`-DISB`/`-COMM`-etc. suffix groups, and its row type) is now
+    exported and reused by `TransactionsPage` rather than re-implemented
+    — one classification rule, two consumers.
+  - Pagination is plain prev/next (not the admin `Pagination` component,
+    which requires a `total` count) — `listJournalEntries` has no COUNT
+    query behind it, and guessing a total would be fabricating a number
+    the backend doesn't have. "Next" just disables once a page comes back
+    shorter than the limit.
 
 ---
 

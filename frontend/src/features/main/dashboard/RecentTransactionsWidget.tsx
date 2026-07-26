@@ -6,7 +6,7 @@ import { FilterToolbar } from '../../../components/FilterToolbar';
 import { formatDate, formatGhs } from '../../../lib/format';
 import { api, ApiError } from '../../../lib/apiClient';
 
-interface JournalEntryRow {
+export interface JournalEntryRow {
   id: string;
   reference: string;
   description: string | null;
@@ -15,7 +15,7 @@ interface JournalEntryRow {
   amount_pesewas: string;
 }
 
-type Category = 'all' | 'collections' | 'payouts' | 'commissions';
+export type TransactionCategory = 'all' | 'collections' | 'payouts' | 'commissions';
 
 // Every module's own posting code already suffixes its reference this way
 // (see Decisions_Log.md's glService.listJournalEntries entry) — grouping
@@ -24,7 +24,7 @@ const COLLECTION_SUFFIXES = ['-RPY', '-DEP', '-COL'];
 const PAYOUT_SUFFIXES = ['-DISB', '-WDL', '-PYT', '-WOFF', '-RDM'];
 const COMMISSION_SUFFIXES = ['-COMM'];
 
-function categoryOf(reference: string): Exclude<Category, 'all'> | 'other' {
+export function categoryOf(reference: string): Exclude<TransactionCategory, 'all'> | 'other' {
   if (COLLECTION_SUFFIXES.some((s) => reference.includes(s))) return 'collections';
   if (PAYOUT_SUFFIXES.some((s) => reference.includes(s))) return 'payouts';
   if (COMMISSION_SUFFIXES.some((s) => reference.includes(s))) return 'commissions';
@@ -32,7 +32,7 @@ function categoryOf(reference: string): Exclude<Category, 'all'> | 'other' {
 }
 
 export function RecentTransactionsWidget({ branchId }: { branchId?: string }) {
-  const [category, setCategory] = useState<Category>('all');
+  const [category, setCategory] = useState<TransactionCategory>('all');
 
   const query = useQuery({
     queryKey: ['recent-transactions', branchId],

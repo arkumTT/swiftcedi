@@ -135,6 +135,34 @@ export interface SavingsAccount {
   opened_at: string;
 }
 
+export interface JournalEntry {
+  id: string;
+  branch_id: string;
+  reference: string;
+  entry_type: 'standard' | 'prior_period_adjustment';
+  description: string | null;
+  entry_date: string;
+  source_module: string;
+  status: 'posted' | 'reversed';
+  created_at: string;
+}
+
+export interface JournalEntryLine {
+  id: string;
+  journal_entry_id: string;
+  account_id: string;
+  account_code: string;
+  account_name: string;
+  debit_pesewas: number;
+  credit_pesewas: number;
+  branch_id: string;
+}
+
+export interface JournalEntryDetail {
+  entry: JournalEntry;
+  lines: JournalEntryLine[];
+}
+
 export interface CashierTill {
   id: string;
   branch_id: string;

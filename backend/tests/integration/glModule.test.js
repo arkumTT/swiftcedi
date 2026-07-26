@@ -626,5 +626,30 @@ describeIfDb('Module 7: GL, accounting & financial reporting', () => {
       expect(page1.length).toBe(2);
       expect(page1.map((r) => r.id)).not.toEqual(page2.map((r) => r.id));
     });
+
+    test('getJournalEntryDetail returns the entry plus its debit/credit lines with account code/name joined', async () => {
+      const ref = `LEDGER-DETAIL-${Date.now()}`;
+      const journalEntry = await glPosting.postJournalEntry(pool, {
+        branchId,
+        reference: ref,
+        entryDate: '2024-03-03',
+        sourceModule: 'susu',
+        createdBy: maker,
+        lines: [
+          { accountId: glAccounts.cashInHand.id, debitPesewas: 7777, branchId },
+          { accountId: glAccounts.income.id, creditPesewas: 7777, branchId },
+        ],
+      });
+
+      const detail = await glService.getJournalEntryDetail(pool, { journalEntryId: journalEntry.id });
+      expect(detail.entry.reference).toBe(ref);
+      expect(detail.lines).toHaveLength(2);
+      const debitLine = detail.lines.find((l) => Number(l.debit_pesewas) === 7777);
+      const creditLine = detail.lines.find((l) => Number(l.credit_pesewas) === 7777);
+      expect(debitLine.account_code).toBe(glAccounts.cashInHand.code);
+      expect(creditLine.account_code).toBe(glAccounts.income.code);
+
+      await expect(glService.getJournalEntryDetail(pool, { journalEntryId: 9999999 })).rejects.toThrow(glService.GlNotFoundError);
+    });
   });
 });

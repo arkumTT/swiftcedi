@@ -26,6 +26,7 @@ import { InvestmentsListPage } from './features/main/investments/InvestmentsList
 import { InvestmentDetailPage } from './features/main/investments/InvestmentDetailPage';
 import { CashierVaultPage } from './features/main/cashier/CashierVaultPage';
 import { TillDetailPage } from './features/main/cashier/TillDetailPage';
+import { TransactionsPage } from './features/main/transactions/TransactionsPage';
 
 const ADMIN_ANY_OF = [
   'rbac.manage_users',
@@ -148,7 +149,7 @@ function App() {
         <Route path="investments/:id" element={<InvestmentDetailPage />} />
         <Route path="cashier" element={<CashierVaultPage />} />
         <Route path="cashier/tills/:id" element={<TillDetailPage />} />
-        <Route path="transactions" element={<PlaceholderPage title="Transactions" />} />
+        <Route path="transactions" element={<TransactionsPage />} />
         <Route path="branches" element={<PlaceholderPage title="Branches" />} />
         <Route path="agents" element={<PlaceholderPage title="Field Agents" />} />
         <Route path="reports" element={<PlaceholderPage title="Reports & Analytics" />} />

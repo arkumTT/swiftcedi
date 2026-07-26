@@ -91,6 +91,15 @@ function glRouter(pool) {
     })
   );
 
+  router.get(
+    '/journal-entries/:id/lines',
+    auth,
+    requirePermission('gl.view_reports'),
+    asyncHandler(async (req, res) => {
+      res.json(await glService.getJournalEntryDetail(pool, { journalEntryId: req.params.id }));
+    })
+  );
+
   router.post(
     '/journal-entries',
     auth,

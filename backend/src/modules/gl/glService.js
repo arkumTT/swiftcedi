@@ -491,6 +491,28 @@ async function listJournalEntries(pool, { branchId, sourceModule, fromDate, toDa
   return rows;
 }
 
+/**
+ * The transaction-drill-down counterpart to listJournalEntries — the
+ * ledger list shows one net amount per entry; this returns the entry's
+ * actual debit/credit lines (account code/name joined for readability) so
+ * a "detailed transaction record" screen can show what actually moved.
+ */
+async function getJournalEntryDetail(pool, { journalEntryId }) {
+  const { rows: entryRows } = await pool.query('SELECT * FROM gl_journal_entries WHERE id = $1', [journalEntryId]);
+  const entry = entryRows[0];
+  if (!entry) throw new GlNotFoundError(`gl_journal_entries ${journalEntryId} not found`);
+
+  const { rows: lines } = await pool.query(
+    `SELECT l.*, a.code AS account_code, a.name AS account_name
+       FROM gl_journal_lines l
+       JOIN gl_accounts a ON a.id = l.account_id
+      WHERE l.journal_entry_id = $1
+      ORDER BY l.id`,
+    [journalEntryId]
+  );
+  return { entry, lines };
+}
+
 // --- Manual JV (always maker-checker) -----------------------------------------
 
 /**
@@ -855,6 +877,7 @@ module.exports = {
   getDailyBalanceSummary,
   getAnnualTransactionReport,
   listJournalEntries,
+  getJournalEntryDetail,
   requestManualJournalEntry,
   applyManualJournalEntryApprovalDecision,
   postApprovedManualJournalEntry,
