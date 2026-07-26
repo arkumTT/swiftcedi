@@ -52,6 +52,14 @@ describeIfDb('Module 4: savings, susu & standing orders', () => {
     await pool.query('TRUNCATE overdraft_interest_accruals RESTART IDENTITY CASCADE');
     await pool.query('TRUNCATE investment_accruals RESTART IDENTITY CASCADE');
     for (const table of [
+      'job_run_history',
+      'scheduled_jobs',
+      'archived_records',
+      'archive_policies',
+      'backup_runs',
+      'subscription_licences',
+      'reminder_notifications',
+      'working_calendar',
       'aml_flags',
       'aml_rules',
       'sanctions_screening_results',
@@ -628,7 +636,9 @@ describeIfDb('Module 4: savings, susu & standing orders', () => {
     expect(result.success).toBe(true);
     expect(result.sourceBalanceAfterPesewas).toBe(45000);
     expect(result.destinationBalanceAfterPesewas).toBe(5000);
-    expect(result.nextRunDate).toBe('2026-03-01');
+    // 2026-03-01 is a Sunday — Module 12's working-calendar rolls the
+    // computed next run date forward to the next working day (Monday).
+    expect(result.nextRunDate).toBe('2026-03-02');
   });
 
   test('an insufficient-funds run is recorded as a failure, reschedules by the retry policy, and suspends after max failures', async () => {

@@ -4,6 +4,8 @@ const auditLog = require('../../shared/auditLog');
 const glPosting = require('../../shared/glPosting');
 const savingsMath = require('./savingsMath');
 const savingsService = require('./savingsService');
+const calendarMath = require('../systemAdmin/calendarMath');
+const calendarService = require('../systemAdmin/calendarService');
 
 /**
  * Module 4: standing orders — recurring transfers between savings
@@ -237,7 +239,15 @@ async function executeOrder(pool, { standingOrderId, runDate = todayIso(), execu
     ],
   });
 
-  const nextRun = savingsMath.nextRunDate(runDate, order.frequency);
+  // Module 12: roll the computed next run date forward past non-working
+  // days — see calendarMath.js. Only ever applied here, at the moment a
+  // FUTURE run date is computed, never retroactively to a past run.
+  const rawNextRun = savingsMath.nextRunDate(runDate, order.frequency);
+  const calendarOverrides = await calendarService.getWorkingCalendarOverrides(pool, {
+    fromDate: rawNextRun,
+    toDate: savingsMath.addDaysToDateString(rawNextRun, 14),
+  });
+  const nextRun = calendarMath.rollForwardToWorkingDay(rawNextRun, calendarOverrides);
   const completed = order.end_date && nextRun > order.end_date.toISOString().slice(0, 10);
 
   const { rows: runRows } = await pool.query(

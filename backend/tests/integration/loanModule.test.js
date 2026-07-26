@@ -51,6 +51,14 @@ describeIfDb('Module 3: loan management', () => {
     await pool.query('TRUNCATE overdraft_interest_accruals RESTART IDENTITY CASCADE');
     await pool.query('TRUNCATE investment_accruals RESTART IDENTITY CASCADE');
     for (const table of [
+      'job_run_history',
+      'scheduled_jobs',
+      'archived_records',
+      'archive_policies',
+      'backup_runs',
+      'subscription_licences',
+      'reminder_notifications',
+      'working_calendar',
       'aml_flags',
       'aml_rules',
       'sanctions_screening_results',
@@ -592,10 +600,12 @@ describeIfDb('Module 3: loan management', () => {
       disbursementDate: '2026-01-01',
     });
 
-    // First installment falls due 2026-02-01; as of 2026-03-05 it is ~32 days late.
+    // First installment's raw due date is 2026-02-01, a Sunday — Module
+    // 12's working-calendar rolls it forward to 2026-02-02 (Monday), so
+    // as of 2026-03-05 it is 31 days late, not 32.
     const report = await loanService.getArrearsReport(pool, { branchId, asOfDate: '2026-03-05' });
     const entry = report.loans.find((l) => l.loanId === Number(disbursed.id));
-    expect(entry.daysOverdue).toBe(32);
+    expect(entry.daysOverdue).toBe(31);
     expect(entry.bucket).toBe('31-60');
     expect(entry.outstandingPrincipalPesewas).toBe(90000);
 

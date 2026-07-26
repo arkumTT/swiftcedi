@@ -212,7 +212,15 @@ authentication header, versioning approach._
   `/compliance/reports/:id/submit`, `/compliance/aml/rules/:id/status`,
   `/compliance/aml/screen`, `/compliance/aml/flags/:id/review`,
   `/compliance/sanctions/screen`, `/compliance/sanctions/screen-batch`,
-  `/compliance/sanctions/results/:id/resolve`.
+  `/compliance/sanctions/results/:id/resolve`, `/system-admin/jobs`,
+  `/system-admin/jobs/:id/status`, `/system-admin/jobs/trigger`,
+  `/system-admin/job-run-history`, `/system-admin/calendar`,
+  `/system-admin/archive-policies`, `/system-admin/archive-policies/:id/run`,
+  `/system-admin/archived-records`, `/system-admin/backups`,
+  `/system-admin/backups/restore`, `/system-admin/export/:tableName`,
+  `/system-admin/subscriptions`, `/system-admin/reminders`,
+  `/system-admin/reminders/:id/mark-sent`,
+  `/system-admin/reminders/:id/mark-failed`.
 - Route file ordering rule (see `backend/src/routes/branches.js`): every
   fixed-prefix path (`/regions`, `/clusters`, `/transfers`,
   `/performance/compare`) must be registered before the `/:id` catch-all,
@@ -303,6 +311,14 @@ values, loan status values, account status values._
 | `aml_rules.status` | `active`, `inactive` | 8 |
 | `aml_flags.status` | `open`, `reviewed`, `cleared` | 8 — NEVER auto-clears (module prompt's own rule); `reviewAmlFlag()` is the only path off `open`, and never back to it. A CHECK constraint ties `open` 1:1 to `reviewed_by`/`reviewed_at`/`review_notes` all being null |
 | `sanctions_screening_results.match_status` | `no_match`, `potential_match`, `confirmed_match`, `cleared` | 8 — the automatic screening pass can only ever produce `no_match`/`potential_match`; `confirmed_match`/`cleared` are reachable ONLY via `resolveScreeningMatch()`, same "never auto-resolve a compliance finding" discipline as `aml_flags.status` |
+| `scheduled_jobs.status` | `active`, `paused` | 12 |
+| `scheduled_jobs.last_status` / `job_run_history.status` | `success`, `failed` (`job_run_history` also has `running`, the transient in-flight value between insert and completion) | 12 — every `triggerJob()` call writes a `job_run_history` row, so a failure is never silent (module prompt's own rule) |
+| `archive_policies.status` | `active`, `inactive` | 12 |
+| `archive_policies.entity_type` / `archived_records.entity_type` | `closed_loans`, `closed_savings_accounts` | 12 — see `ARCHIVE_ENTITY_CONFIG` in the System administration service section for which live-table statuses count as eligible per entity type |
+| `backup_runs.status` | `running`, `success`, `failed` | 12 |
+| `subscription_licences.status` | `active`, `expired`, `cancelled` | 12 — SaaS-readiness tracking only, nothing enforces tenant isolation on it today |
+| `reminder_notifications.status` | `pending`, `sent`, `failed` | 12 — log-only; nothing in this codebase transitions a row off `pending` automatically (no real SMS/push/email gateway wired up yet) |
+| `reminder_notifications.notification_type` | `repayment_due`, `susu_collection_due` | 12 |
 
 **`branches.status` transition table** (`branchService.VALID_STATUS_TRANSITIONS`):
 
@@ -1568,6 +1584,140 @@ addSanctionsListEntry(pool, {...}) / screenCustomer(pool, { customerId, screened
   system_admin, the actual day-to-day compliance work) — see Open
   Questions.
 
+### System administration service — `backend/src/modules/systemAdmin/` (Module 12)
+
+Split across three files on purpose: `calendarMath.js` (pure, no DB access,
+same convention as `loanMath.js`/`savingsMath.js`), `calendarService.js`
+(the small, dependency-free DB-backed calendar CRUD that `loanService.js`
+and `standingOrderService.js` call into directly), and
+`systemAdminService.js` (the job registry, archiving, backups, subscriptions,
+reminders — this is the file that imports `branchService`/`loanService`/
+`investmentService`/`cashierService`/`standingOrderService`/`agentService`).
+`calendarService.js` is deliberately its own file, NOT part of
+`systemAdminService.js`, specifically so `loanService`/`standingOrderService`
+can depend on the calendar without a circular require back through the
+bigger file.
+
+```js
+// calendarMath.js (pure)
+isWeekendUtc(dateStr) / addDaysUtc(dateStr, days)
+isNonWorkingDay(dateStr, overrides) -> boolean          // overrides: Map<'YYYY-MM-DD', boolean>; an explicit override always wins over the Sat/Sun default
+rollForwardToWorkingDay(dateStr, overrides) -> 'YYYY-MM-DD'  // forward-only, 3650-day misconfiguration guard
+
+// calendarService.js
+upsertWorkingCalendarDay(db, { date, isWorkingDay, holidayName, createdBy, actorBranchId }) -> row  // ON CONFLICT upsert, audit-logged
+listWorkingCalendar(db, { fromDate, toDate }) -> rows[]
+getWorkingCalendarOverrides(db, { fromDate, toDate }) -> Map<'YYYY-MM-DD', boolean>   // calendarMath's overrides argument
+
+// systemAdminService.js
+JOB_REGISTRY  // { jobType: thin wrapper fn } — see below
+createScheduledJob(pool, { jobType, cronExpression, runAsUserId, createdBy }) / listScheduledJobs(pool, { status }) / updateScheduledJobStatus(pool, { jobId, status, updatedBy })
+triggerJob(pool, { jobId, jobType, triggeredBy, params }) -> { runId, jobType, status, result | error }   // the ONE entry point every job run goes through
+listJobRunHistory(pool, { jobType, status, fromDate, toDate }) -> rows[]
+createArchivePolicy(pool, { entityType, retentionPeriodDays, archiveLocation, createdBy }) / listArchivePolicies(pool, { status })
+runArchivePolicy(pool, { policyId, triggeredBy }) -> { entityType, archivedCount, ids }
+listArchivedRecords(pool, { entityType }) -> rows[]
+triggerBackup(pool, { triggeredBy }) -> backup_runs row   // real pg_dump via execFile
+listBackupRuns(pool, { status })
+triggerRestore(pool, { filePath, triggeredBy, actorBranchId, confirm }) -> { restored, filePath }   // HIGH RISK — see below
+exportTableToCsv(pool, { tableName }) -> csv string   // EXPORTABLE_TABLES allowlist only
+createSubscriptionLicence(pool, {...}) / listSubscriptionLicences(pool, { status })
+listReminderNotifications(pool, { status, notificationType, customerId }) / markNotificationSent(pool, { notificationId }) / markNotificationFailed(pool, { notificationId })
+```
+
+- **The module's own "BEFORE YOU WRITE CODE" instruction is "own the
+  scheduling infrastructure, not the financial calculations" — taken
+  literally.** Every `JOB_REGISTRY` entry is a thin wrapper that calls an
+  EXISTING function in the module that actually owns that math:
+  `loan_overdraft_interest_accrual` → `loanService.accrueOverdraftInterest`,
+  `investment_interest_accrual` → `investmentService.accrueInterest`,
+  `cashier_day_close` → `cashierService.closeOutPeriod`,
+  `standing_order_execution` → `standingOrderService.executeDueOrders`,
+  `agent_location_purge` → `agentService.purgeOldLocations`. Module 12
+  itself contains zero interest/accrual/close-out math.
+- **No live cron daemon was started.** `scheduled_jobs.cron_expression`/
+  `next_run_at` are bookkeeping for a future real scheduler process;
+  nothing in this codebase calls `triggerJob` on a timer. This is a
+  deliberate scope decision, not an oversight — starting a background
+  process that periodically mutates financial data (interest accrual,
+  day-close, reminders) is a bigger architectural commitment (leader
+  election if this app is ever scaled to multiple instances, a supervision
+  story if the process dies mid-run) than "build the scheduler module"
+  implies on its own, and doing it silently would be a surprising side
+  effect of this session. See Open Questions.
+- **`triggerJob` never rethrows a job-EXECUTION failure** — it always
+  inserts a `job_run_history` row first, then catches any error from the
+  job function and records `status = 'failed'` + `error_message` on that
+  same row, returning `{ status: 'failed', error }` rather than throwing.
+  The module prompt's "a failed job must alert an administrator, not fail
+  silently" is satisfied by "always recorded and visible in
+  `job_run_history`," not by "crashes the caller." A CALLER mistake (an
+  unknown `jobId` or `jobType`) is different and still throws immediately,
+  before any run row is even created — there's nothing to record yet.
+- **`run_as_user_id` on `scheduled_jobs` is configuration for a future real
+  scheduler, not what `triggerJob` actually uses today.** This codebase has
+  no "system" user concept, and every underlying Module 3/5/6/10 function
+  needs a real user id for its OWN audit trail, so `triggerJob` always acts
+  as the calling admin (`triggeredBy`), never the stored `run_as_user_id`.
+- **Archiving is a soft flag in place, never a physical data move.**
+  `loans.archived_at`/`savings_accounts.archived_at` (nullable) plus an
+  `archived_records` LOG table (entity_type, entity_id, policy_id,
+  archive_location) — the row is never relocated or deleted, so every
+  existing query/report (Module 7's historical reports included) keeps
+  resolving it exactly as before, trivially satisfying "Module 7's
+  historical reports must still resolve archived data." "Never archive a
+  record still referenced by an open workflow" is satisfied
+  STRUCTURALLY, not by a separate runtime check: `ARCHIVE_ENTITY_CONFIG`
+  only ever targets terminal statuses (`closed`/`written_off` for loans,
+  `closed` for savings accounts), which Module 3/4 already guarantee have
+  no outstanding balance or open repayment/overdraft workflow before
+  reaching that status.
+- **"Backup-to-Excel" is implemented honestly as CSV** (`exportTableToCsv`,
+  opens directly in Excel) rather than adding a new `xlsx`/`exceljs`
+  dependency this codebase doesn't otherwise need. Restricted to a fixed
+  `EXPORTABLE_TABLES` allowlist — the table name is never interpolated
+  from caller input without going through that allowlist check first, to
+  avoid a SQL-injection-via-identifier surface.
+- **`triggerBackup` runs a real `pg_dump`** via `execFile` (never a shell
+  string) against the server's own `DATABASE_URL` env var, writing to
+  `backend/var/backups/` (gitignored). **`triggerRestore` is explicitly
+  HIGH RISK** — gated by an explicit `confirm: true` body flag, a
+  `filePath` resolved-and-checked to stay inside the backup directory
+  (rejecting path traversal to an arbitrary filesystem path), and an
+  audit-log write BEFORE the destructive `psql` command runs. It was
+  deliberately NOT exercised against a real database in this session's own
+  tests, for the same reason it's risky in production — see Open
+  Questions.
+- **Working-day default is Sat/Sun non-working; an explicit
+  `working_calendar` row always overrides it, in either direction** (can
+  mark a weekend as working, or a weekday as a holiday). Documented as "an
+  operational banking-week convention, not a BOG rule" — nothing here
+  claims to be a verified Bank of Ghana public-holiday list (see Open
+  Questions).
+- **Calendar changes apply going forward only, satisfied structurally, not
+  by a special-cased check**: `calendarMath.rollForwardToWorkingDay` is
+  only ever called at schedule/next-run-date GENERATION time
+  (`loanService.disburseLoan`, `loanService.applyRestructureOnApproval`'s
+  schedule regeneration, `standingOrderService.executeOrder`'s `nextRun`
+  computation) — never as a retroactive update to an existing
+  `loan_schedules`/`standing_orders` row. This is exactly what the module
+  prompt's "calendar changes should not retroactively alter already-
+  generated loan schedules" rule requires.
+- **Subscription/licence tracking is SaaS-readiness ONLY** — this codebase
+  is single-tenant today; nothing reads `subscription_licences` to enforce
+  tenant isolation or gate any feature. `subscription_expiry_check` moves
+  a past-`end_date` `active` licence to `expired` and stamps
+  `renewal_reminder_sent_at` on one nearing expiry, both idempotently.
+- **Reminder notifications are log-only** — `repayment_due_reminders` and
+  `susu_collection_due_reminders` write `reminder_notifications` rows
+  (`ON CONFLICT DO NOTHING` on `(notification_type, entity_type,
+  entity_id, due_date)`, so re-running the job never duplicates a
+  reminder). `markNotificationSent`/`markNotificationFailed` are the
+  integration points a real SMS/push/email gateway would call after
+  actually dispatching one — nothing in this codebase calls them
+  automatically yet, same "workflow is real, delivery integration is a gap"
+  shape as Module 5/6's payments-integration placeholder.
+
 ---
 
 ## Branch Scoping Convention
@@ -1913,6 +2063,43 @@ knowledge — plus any module prompt conflicts that need a human call._
       structuring/smurfing detection, velocity rules) but none of those
       have real evaluation logic yet; only flag this as a gap if/when a
       real compliance requirement needs them.
+- [ ] **Module 12 has no live cron daemon** — `scheduled_jobs` rows are
+      real and `triggerJob` is a real, fully-working dispatcher, but
+      nothing calls it on a timer. Every job execution in this codebase
+      today is a manual/API-driven `triggerJob` call. Before any of
+      `loan_overdraft_interest_accrual`, `investment_interest_accrual`,
+      `cashier_day_close`, `standing_order_execution`,
+      `repayment_due_reminders`, or `susu_collection_due_reminders` can run
+      unattended in production, a real scheduler process needs to be
+      wired up (e.g. `node-cron` or an external scheduler hitting
+      `POST /system-admin/jobs/trigger`), plus a decision on
+      leader-election/locking if this app is ever scaled to multiple
+      instances so the same job doesn't fire twice concurrently. See the
+      System administration service section for why this was a deliberate
+      scope stop, not an oversight.
+- [ ] **`triggerRestore` was never exercised against a real database in
+      this session's own tests** — deliberately, since it's a genuinely
+      destructive operation (overwrites live data via `psql`). Only its
+      guard rails (`confirm: true` requirement, path-traversal rejection,
+      missing-file 404) are test-covered. Before this endpoint is trusted
+      operationally, do a real dry-run restore against a disposable
+      database, not the first production use.
+- [ ] **The working-day calendar's default (Sat/Sun non-working) is an
+      assumed banking-week convention, not a verified Bank of Ghana public-
+      holiday calendar.** `working_calendar` ships with ZERO seeded holiday
+      rows — every actual Ghanaian public holiday (New Year's, Independence
+      Day, Eid, Christmas, etc.) needs to be entered as real data by an
+      admin via `PUT /system-admin/calendar` before loan/standing-order
+      due-date rolling is correct for a real deployment. This is the same
+      "never hardcode a regulation/calendar fact from general knowledge, flag
+      it for verification" discipline CLAUDE.md rule 7 requires for BOG/GRA
+      figures, applied here even though holidays aren't strictly a BOG rule.
+- [ ] **Archiving has no "un-archive" endpoint.** `archived_at` is a
+      one-way flag today — if a written-off loan or closed savings account
+      is later found to have been archived in error, the only fix is a
+      direct `UPDATE ... SET archived_at = NULL`, not a service-layer call.
+      Add one if this gap is ever hit for real, rather than reaching for
+      raw SQL each time.
 
 ---
 
@@ -2112,3 +2299,32 @@ deliberately changed._
   its own integration test runs and any manual smoke-testing. If Module 8
   later needs its own analytics/report-pack section, that's a genuine
   extension to build then, not something this session blocked on.
+- **Module 10 (Agent & Field Ops) was also built before Module 8
+  (Regulatory & Compliance)**, same deviation shape as the Module 9 entry
+  immediately above and for the same reason — an explicit instruction to
+  start Module 10 next, not a discovered dependency. Checked before
+  starting: Module 10's functional requirements (field agent location
+  pinging, agent-cash reconciliation against Module 6 tills and Module 4
+  susu collections/remittances) don't reference anything Module 8 owns.
+  Module 8's own AML screening (built afterward) does read
+  `field_agents`/`agent_locations`-adjacent activity only indirectly (via
+  `savings_transactions`/`loans`, not agent tables directly), so no
+  rework was needed either direction. Actual execution order across this
+  whole project ended up 1, 2, 3, 4, (overdraft), 5, 6, 7, 9, 10, 8, 12 —
+  every deviation from the CLAUDE.md/prompt-document suggested order is
+  called out individually in this section; Module 12 itself was built
+  last, matching the suggested order.
+- **Module 12's archiving, backup/restore, and CSV-export functionality
+  is all genuinely new/wired-up as of this session** — there was no
+  earlier partial implementation or stub left over from an earlier
+  module to reconcile against. The calendar wiring into Module 3/4
+  (`calendarMath`/`calendarService` called from `loanService.disburseLoan`,
+  `loanService.applyRestructureOnApproval`, and
+  `standingOrderService.executeOrder`) changed two pre-existing, already-
+  passing integration test assertions (`savingsModule.test.js`'s
+  `nextRunDate` and `loanModule.test.js`'s arrears-bucket `daysOverdue`)
+  because both tests' fixture dates happened to land on a Sunday that now
+  correctly rolls forward to Monday — both were confirmed as correct NEW
+  behavior (calendar-aware rolling working as designed), not regressions,
+  and updated with a comment explaining why, rather than adjusting the
+  fixture dates to dodge the weekend.

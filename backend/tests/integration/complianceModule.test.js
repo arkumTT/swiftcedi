@@ -62,6 +62,14 @@ describeIfDb('Module 8: regulatory & compliance reporting', () => {
     await pool.query('DELETE FROM regulatory_ratio_definitions');
     await pool.query('DELETE FROM loan_classifications');
     await pool.query('DELETE FROM loan_classification_configs');
+    await pool.query('DELETE FROM job_run_history');
+    await pool.query('DELETE FROM scheduled_jobs');
+    await pool.query('DELETE FROM archived_records');
+    await pool.query('DELETE FROM archive_policies');
+    await pool.query('DELETE FROM backup_runs');
+    await pool.query('DELETE FROM subscription_licences');
+    await pool.query('DELETE FROM reminder_notifications');
+    await pool.query('DELETE FROM working_calendar');
     await pool.query('TRUNCATE gl_journal_lines, gl_journal_entries RESTART IDENTITY CASCADE');
     await pool.query('TRUNCATE audit_log RESTART IDENTITY CASCADE');
     await pool.query('TRUNCATE loan_repayments RESTART IDENTITY CASCADE');

@@ -5,6 +5,8 @@ const approvalWorkflow = require('../../shared/approvalWorkflow');
 const glPosting = require('../../shared/glPosting');
 const loanMath = require('./loanMath');
 const savingsService = require('../savings/savingsService');
+const calendarMath = require('../systemAdmin/calendarMath');
+const calendarService = require('../systemAdmin/calendarService');
 
 /**
  * Module 3: Loan Management. Uses the Module 11/7 shared services
@@ -595,12 +597,21 @@ async function disburseLoan(pool, { loanId, disbursedBy, disbursementDate = toda
       startDate: disbursementDate,
     });
 
+    // Module 12: roll each due date forward past non-working days — see
+    // calendarMath.js. Fetched once for the whole schedule's date range,
+    // applied only at this GENERATION step, never retroactively.
+    const calendarOverrides = await calendarService.getWorkingCalendarOverrides(client, {
+      fromDate: disbursementDate,
+      toDate: schedule[schedule.length - 1].dueDate,
+    });
+
     for (const row of schedule) {
+      const dueDate = calendarMath.rollForwardToWorkingDay(row.dueDate, calendarOverrides);
       await client.query(
         `INSERT INTO loan_schedules
            (loan_id, schedule_version, installment_number, due_date, principal_due_pesewas, interest_due_pesewas)
          VALUES ($1, $2, $3, $4, $5, $6)`,
-        [loanId, loan.current_schedule_version, row.installmentNumber, row.dueDate, row.principalDuePesewas, row.interestDuePesewas]
+        [loanId, loan.current_schedule_version, row.installmentNumber, dueDate, row.principalDuePesewas, row.interestDuePesewas]
       );
     }
 
@@ -1110,12 +1121,18 @@ async function applyRestructureOnApproval(approvalRequest, db) {
     startDate: todayIso(),
   });
 
+  const calendarOverrides = await calendarService.getWorkingCalendarOverrides(db, {
+    fromDate: todayIso(),
+    toDate: newSchedule[newSchedule.length - 1].dueDate,
+  });
+
   for (const row of newSchedule) {
+    const dueDate = calendarMath.rollForwardToWorkingDay(row.dueDate, calendarOverrides);
     await db.query(
       `INSERT INTO loan_schedules
          (loan_id, schedule_version, installment_number, due_date, principal_due_pesewas, interest_due_pesewas)
        VALUES ($1, $2, $3, $4, $5, $6)`,
-      [loanId, newVersion, row.installmentNumber, row.dueDate, row.principalDuePesewas, row.interestDuePesewas]
+      [loanId, newVersion, row.installmentNumber, dueDate, row.principalDuePesewas, row.interestDuePesewas]
     );
   }
 

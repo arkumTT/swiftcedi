@@ -48,6 +48,14 @@ describeIfDb('Module 5: investment management', () => {
     await pool.query('TRUNCATE overdraft_interest_accruals RESTART IDENTITY CASCADE');
     await pool.query('TRUNCATE investment_accruals RESTART IDENTITY CASCADE');
     for (const table of [
+      'job_run_history',
+      'scheduled_jobs',
+      'archived_records',
+      'archive_policies',
+      'backup_runs',
+      'subscription_licences',
+      'reminder_notifications',
+      'working_calendar',
       'aml_flags',
       'aml_rules',
       'sanctions_screening_results',
