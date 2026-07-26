@@ -3,7 +3,6 @@ import { LoginPage } from './auth/LoginPage';
 import { RequireAuth, RequirePermission } from './auth/RequireAuth';
 import { AdminLayout } from './layouts/AdminLayout';
 import { MainAppLayout } from './layouts/MainAppLayout';
-import { PlaceholderPage } from './components/PlaceholderPage';
 import { SettingsPage } from './features/settings/SettingsPage';
 import { UsersRolesPage } from './features/admin/UsersRolesPage';
 import { RolesPermissionsPage } from './features/admin/RolesPermissionsPage';
@@ -31,6 +30,8 @@ import { BranchesPage } from './features/main/branches/BranchesPage';
 import { BranchDetailPage } from './features/main/branches/BranchDetailPage';
 import { FieldAgentsPage } from './features/main/agents/FieldAgentsPage';
 import { FieldAgentDetailPage } from './features/main/agents/FieldAgentDetailPage';
+import { ReportsPage } from './features/main/reports/ReportsPage';
+import { CompliancePage } from './features/main/compliance/CompliancePage';
 
 const ADMIN_ANY_OF = [
   'rbac.manage_users',
@@ -158,8 +159,8 @@ function App() {
         <Route path="branches/:id" element={<BranchDetailPage />} />
         <Route path="agents" element={<FieldAgentsPage />} />
         <Route path="agents/:id" element={<FieldAgentDetailPage />} />
-        <Route path="reports" element={<PlaceholderPage title="Reports & Analytics" />} />
-        <Route path="compliance" element={<PlaceholderPage title="Compliance & Regulatory" />} />
+        <Route path="reports" element={<ReportsPage />} />
+        <Route path="compliance" element={<CompliancePage />} />
         <Route path="settings" element={<SettingsPage />} />
       </Route>
 

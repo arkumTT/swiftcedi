@@ -2112,6 +2112,35 @@ is completed._
     (Playwright-verified with a mocked coordinate), not a manually-typed
     lat/lng, matching how an actual field agent would use this in the
     field.
+- **Reports & Analytics (`src/features/main/reports/ReportsPage.tsx`) and
+  Compliance & Regulatory (`src/features/main/compliance/CompliancePage.tsx`)
+  needed zero backend additions** — both consume the existing Module 7/8/9
+  read and write surface as-is. Also caught and fixed the same
+  `resolveConsolidatedBranchScope`-sentinel gap discovered for Field
+  Agents: `ReportsPage`'s executive-report-pack query now sends
+  `branchId: 'all'` for cross-branch roles (the GL financial-statement
+  routes don't need it — they never scoped by `resolveBranchScope` in the
+  first place, so omitting `branchId` there already means "all
+  branches").
+  - Regulatory report TEMPLATE management (create/version/retire) already
+    lives in the Admin Back Office (`RegulatoryTemplatesPage`, built
+    earlier); `CompliancePage` is deliberately the OPERATIONAL side only —
+    generating a report from an existing template, tracking submissions,
+    running AML screening and reviewing flags, and sanctions
+    list/screening — so the two screens don't duplicate the same CRUD.
+  - Regulatory ratio computation (CAR, liquidity) and the GRA
+    withholding/VAT summaries exist at the service layer
+    (`complianceService.computeRatio`/`getWithholdingTaxSummary`/
+    `getVatSummary`) but were left off this pass's UI — they need a ratio-
+    definition picker that doesn't exist anywhere in the admin UI yet
+    (`ratio-definitions` is `compliance.manage_config`-gated, config-only,
+    with no screen of its own), so surfacing them here first would mean
+    guessing definition names rather than reading them from a real list.
+    Flagged here rather than bolted on with a free-text ratio-name input.
+  - "Mark submitted" records only a `fileReference` string — there is no
+    live regulator submission integration, and the modal says so, the
+    same honesty pattern used for investment/redemption payment
+    references elsewhere in this log.
 
 ---
 

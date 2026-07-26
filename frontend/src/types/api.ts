@@ -121,6 +121,126 @@ export interface AgentReconciliation {
   resolution_notes: string | null;
 }
 
+export interface GlAccountLine {
+  accountId: number;
+  code: string;
+  name: string;
+  accountType: 'asset' | 'liability' | 'equity' | 'income' | 'expense';
+  balancePesewas?: number;
+  debitPesewas?: number;
+  creditPesewas?: number;
+}
+
+export interface TrialBalance {
+  asOfDate: string;
+  lines: GlAccountLine[];
+  totalDebitPesewas: number;
+  totalCreditPesewas: number;
+  balanced: boolean;
+}
+
+export interface BalanceSheet {
+  asOfDate: string;
+  assets: GlAccountLine[];
+  liabilities: GlAccountLine[];
+  equity: GlAccountLine[];
+  totalAssetsPesewas: number;
+  totalLiabilitiesPesewas: number;
+  totalEquityPesewas: number;
+  netIncomePesewas: number;
+  totalEquityAndNetIncomePesewas: number;
+}
+
+export interface IncomeStatement {
+  fromDate: string;
+  toDate: string;
+  income: GlAccountLine[];
+  expense: GlAccountLine[];
+  totalIncomePesewas: number;
+  totalExpensePesewas: number;
+  netIncomePesewas: number;
+}
+
+export interface ExecutiveReportPack {
+  asOfDate: string;
+  fromDate: string;
+  toDate: string;
+  balanceSheet: BalanceSheet;
+  incomeStatement: IncomeStatement;
+  portfolioSummary: {
+    loanCount: number;
+    totalOutstandingPesewas: number;
+    par30: { atRiskPesewas: number; ratio: number | null };
+    par60: { atRiskPesewas: number; ratio: number | null };
+    par90: { atRiskPesewas: number; ratio: number | null };
+  };
+  socialPerformance: {
+    activeCustomersByGender: { gender: string; count: number }[];
+    activeSusuParticipants: number;
+    activeBorrowerCount: number;
+    averageLoanSizePesewas: number;
+    activeBorrowersBySector: { sector: string; borrowerCount: number }[];
+  };
+}
+
+export interface ReportTemplate {
+  id: string;
+  name: string;
+  target_authority: string;
+  version: string;
+  status: 'active' | 'retired';
+  effective_date: string;
+}
+
+export interface ReportSubmission {
+  id: string;
+  template_id: string;
+  template_version: number;
+  period_start: string | null;
+  period_end: string | null;
+  generated_at: string;
+  status: 'generated' | 'submitted';
+  file_reference: string | null;
+}
+
+export interface AmlRule {
+  id: string;
+  name: string;
+  rule_type: string;
+  threshold_pesewas: number;
+  transaction_scope: 'all' | 'savings' | 'loan_disbursement' | 'investment';
+  status: 'active' | 'inactive';
+}
+
+export interface AmlFlag {
+  id: string;
+  rule_id: string;
+  transaction_type: string;
+  transaction_id: string;
+  customer_id: string | null;
+  branch_id: string;
+  amount_pesewas: number;
+  flagged_at: string;
+  status: 'open' | 'reviewed' | 'cleared';
+  review_notes: string | null;
+}
+
+export interface SanctionsListEntry {
+  id: string;
+  full_name: string;
+  list_source: string;
+  notes: string | null;
+  added_at: string;
+}
+
+export interface SanctionsScreeningResult {
+  id: string;
+  customer_id: string;
+  screened_at: string;
+  match_status: 'no_match' | 'potential_match' | 'confirmed_match' | 'cleared';
+  resolution_notes: string | null;
+}
+
 export interface Customer {
   id: string;
   customer_type: 'individual' | 'sme' | 'group';
