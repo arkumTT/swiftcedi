@@ -348,6 +348,23 @@ describeIfDb('Module 4: savings, susu & standing orders', () => {
     );
   });
 
+  test('an account with an active overdraft limit cannot be closed even at a zero balance', async () => {
+    const { account } = await openFundedAccount(0);
+    // Simulates what loanService.activateOverdraft sets on disbursement —
+    // this suite doesn't depend on the loan module, so the column is set
+    // directly rather than going through a real overdraft loan.
+    await pool.query('UPDATE savings_accounts SET overdraft_limit_pesewas = 500000 WHERE id = $1', [account.id]);
+
+    await expect(savingsService.closeAccount(pool, { accountId: account.id, closedBy: maker })).rejects.toThrow(
+      /active overdraft facility/
+    );
+
+    await pool.query('UPDATE savings_accounts SET overdraft_limit_pesewas = 0 WHERE id = $1', [account.id]);
+    await expect(savingsService.closeAccount(pool, { accountId: account.id, closedBy: maker })).resolves.toMatchObject({
+      status: 'closed',
+    });
+  });
+
   test('the stored subledger balance always reconciles to the immutable ledger and to the GL control account', async () => {
     const { account } = await openFundedAccount(30000, { withdrawalFeePesewas: 100, withdrawalApprovalThresholdPesewas: 1000000 });
     await savingsService.requestWithdrawal(pool, { accountId: account.id, amountPesewas: 5000, requestedBy: maker });

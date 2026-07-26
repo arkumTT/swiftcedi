@@ -193,6 +193,11 @@ async function closeAccount(pool, { accountId, closedBy, reason = null }) {
       `savings_account ${accountId} cannot be closed with a non-zero balance (${account.balance_pesewas} pesewas) — withdraw or transfer the funds first`
     );
   }
+  if (Number(account.overdraft_limit_pesewas) > 0) {
+    throw new SavingsConflictError(
+      `savings_account ${accountId} has an active overdraft facility (limit ${account.overdraft_limit_pesewas} pesewas) — close the overdraft loan first`
+    );
+  }
 
   const { rows } = await pool.query(
     "UPDATE savings_accounts SET status = 'closed', closed_at = now(), updated_at = now() WHERE id = $1 RETURNING *",

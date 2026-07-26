@@ -855,6 +855,60 @@ describeIfDb('Module 3: loan management', () => {
       expect(result).toEqual({ loanId: Number(loan.id), accrued: false, interestPesewas: 0 });
     });
 
+    test('accrueOverdraftInterest is a no-op (not a constraint-violation error) when the computed interest rounds to zero', async () => {
+      const product = await createProduct({ loanType: 'overdraft', annualInterestRateBps: 0 });
+      const customer = await createVerifiedCustomer('OD Zero Rate Borrower');
+      const account = await openOverdraftAccount(customer);
+      const loan = await loanService.applyForLoan(pool, {
+        customerId: customer.id,
+        productId: product.id,
+        principalPesewas: 100000,
+        termMonths: 6,
+        overdraftSavingsAccountId: account.id,
+        appliedBy: maker,
+      });
+      await loanService.submitAppraisal(pool, { loanId: loan.id, checklist: {}, recommendation: 'recommend', appraiserId: maker });
+      const approval = await loanService.requestLoanApproval(pool, { loanId: loan.id, requestedBy: maker });
+      await decideAs(approval.id, checker);
+      await loanService.disburseLoan(pool, { loanId: loan.id, disbursedBy: maker });
+      await savingsService.requestWithdrawal(pool, { accountId: account.id, amountPesewas: 50000, requestedBy: maker });
+
+      const result = await loanService.accrueOverdraftInterest(pool, { loanId: loan.id, days: 30, accruedBy: maker });
+      expect(result).toEqual({ loanId: Number(loan.id), accrued: false, interestPesewas: 0 });
+      // No row should have been written for a no-op accrual.
+      const { rows } = await pool.query('SELECT id FROM overdraft_interest_accruals WHERE loan_id = $1', [loan.id]);
+      expect(rows).toHaveLength(0);
+    });
+
+    test('activation is rejected if the linked savings account was closed after application but before disbursement', async () => {
+      const product = await createProduct({ loanType: 'overdraft' });
+      const customer = await createVerifiedCustomer('OD Closed Account Borrower');
+      const account = await openOverdraftAccount(customer);
+      const loan = await loanService.applyForLoan(pool, {
+        customerId: customer.id,
+        productId: product.id,
+        principalPesewas: 100000,
+        termMonths: 6,
+        overdraftSavingsAccountId: account.id,
+        appliedBy: maker,
+      });
+      await loanService.submitAppraisal(pool, { loanId: loan.id, checklist: {}, recommendation: 'recommend', appraiserId: maker });
+      const approval = await loanService.requestLoanApproval(pool, { loanId: loan.id, requestedBy: maker });
+      await decideAs(approval.id, checker);
+
+      // The account is still at a zero balance and no overdraft limit is
+      // set yet (activation hasn't run), so an ordinary close succeeds —
+      // exactly the gap activateOverdraft must catch.
+      await savingsService.closeAccount(pool, { accountId: account.id, closedBy: maker });
+
+      await expect(loanService.disburseLoan(pool, { loanId: loan.id, disbursedBy: maker })).rejects.toThrow(
+        /is not active \(status: closed\)/
+      );
+
+      const untouchedLoan = await loanService.getLoan(pool, loan.id);
+      expect(untouchedLoan.status).toBe('approved');
+    });
+
     test('write-off of a drawn overdraft debits Loan Loss Expense and credits Customer Deposits, zeroing the balance and the limit', async () => {
       const product = await createProduct({ loanType: 'overdraft' });
       const customer = await createVerifiedCustomer('OD Write-Off Borrower');

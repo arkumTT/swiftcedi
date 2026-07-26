@@ -497,6 +497,22 @@ async function activateOverdraft(pool, { loanId, disbursedBy, disbursementDate }
     await client.query('BEGIN');
     loan = await assertApprovedForDisbursement(client, loanId);
 
+    // The linked account could have been closed (or gone dormant) in the
+    // gap between application and disbursement — re-verify it here rather
+    // than trusting the check applyForLoan already did at a different
+    // point in time, so a closed account can never end up with a nonzero
+    // overdraft_limit_pesewas.
+    const { rows: accountRows } = await client.query('SELECT * FROM savings_accounts WHERE id = $1 FOR UPDATE', [
+      loan.overdraft_savings_account_id,
+    ]);
+    const account = accountRows[0];
+    if (!account) throw new LoanNotFoundError(`savings_account ${loan.overdraft_savings_account_id} not found`);
+    if (account.status !== 'active') {
+      throw new LoanConflictError(
+        `savings_account ${loan.overdraft_savings_account_id} is not active (status: ${account.status}) — cannot activate the overdraft`
+      );
+    }
+
     await client.query('UPDATE savings_accounts SET overdraft_limit_pesewas = $1, updated_at = now() WHERE id = $2', [
       Number(loan.principal_pesewas),
       loan.overdraft_savings_account_id,
@@ -716,6 +732,12 @@ async function accrueOverdraftInterest(pool, { loanId, accrualDate = todayIso(),
     annualInterestRateBps: loan.annual_interest_rate_bps,
     days,
   });
+  // A zero (or 0%-rate) rounding result is a no-op, not an error — without
+  // this, it would hit overdraft_interest_accruals' interest_pesewas > 0
+  // CHECK constraint as a raw, unhelpful 500.
+  if (interestPesewas <= 0) {
+    return { loanId: Number(loanId), accrued: false, interestPesewas: 0 };
+  }
 
   const { rows: existingRows } = await pool.query(
     'SELECT id FROM overdraft_interest_accruals WHERE loan_id = $1 AND accrual_date = $2',

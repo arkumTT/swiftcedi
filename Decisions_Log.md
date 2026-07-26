@@ -726,6 +726,21 @@ check for any `allows_overdraft` account.
 - **Closing** (`closeOverdraft`) requires the drawn balance already repaid
   to zero (same precondition as closing an ordinary savings account),
   resets `overdraft_limit_pesewas` to 0, and marks the loan `closed`.
+- **Three edge cases found and fixed during a post-build review** (before
+  anything shipped, so no migration needed):
+  1. `savingsService.closeAccount` now also rejects closing an account
+     with `overdraft_limit_pesewas > 0` — otherwise a customer could close
+     an account with a zero *balance* while a facility limit was still
+     attached to it, orphaning an active loan from its account.
+  2. `activateOverdraft` re-locks and re-checks the linked account is
+     still `active` at disbursement time, not just at application time — a
+     savings account can be closed in the (potentially long) gap between
+     applying for an overdraft and it being appraised/approved/disbursed.
+  3. `accrueOverdraftInterest` treats a computed `interestPesewas` of 0
+     (e.g. a 0%-rate product, or a very short period) as a no-op rather
+     than attempting the insert, which would otherwise hit
+     `overdraft_interest_accruals`' `interest_pesewas > 0` CHECK
+     constraint as a raw, unhelpful 500.
 - **The real bug this replaced**: `savingsMath.assessWithdrawal` took an
   `allowsOverdraft` boolean that, when true, skipped the balance/minimum-
   balance check ENTIRELY — any account on an `allows_overdraft` product had
