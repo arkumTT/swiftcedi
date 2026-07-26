@@ -39,13 +39,17 @@ describeIfDb('Module 7: GL, accounting & financial reporting', () => {
 
     pool = new Pool({ connectionString });
 
-    // bank_accounts and gl_manual_entries are deleted explicitly (not just
-    // relied on via CASCADE) since bank_accounts references gl_accounts/
-    // branches directly rather than via gl_journal_entries/lines, so it
-    // would survive the journal TRUNCATE CASCADE below untouched.
+    // bank_accounts, gl_manual_entries, and dashboard_widget_configs are
+    // deleted explicitly (not just relied on via CASCADE) since none of
+    // them reference gl_journal_entries/lines, so none would be touched
+    // by the journal TRUNCATE CASCADE below — dashboard_widget_configs is
+    // only ever populated by analyticsModule.test.js, but every suite's
+    // own `DELETE FROM users` needs it gone first regardless of which
+    // suite created it, since it references users directly.
     await pool.query('DELETE FROM bank_statement_lines');
     await pool.query('DELETE FROM bank_accounts');
     await pool.query('DELETE FROM gl_manual_entries');
+    await pool.query('DELETE FROM dashboard_widget_configs');
     await pool.query('TRUNCATE gl_journal_lines, gl_journal_entries RESTART IDENTITY CASCADE');
     await pool.query('TRUNCATE audit_log RESTART IDENTITY CASCADE');
     await pool.query('TRUNCATE loan_repayments RESTART IDENTITY CASCADE');

@@ -52,6 +52,7 @@ describeIfDb('Module 4: savings, susu & standing orders', () => {
     await pool.query('TRUNCATE overdraft_interest_accruals RESTART IDENTITY CASCADE');
     await pool.query('TRUNCATE investment_accruals RESTART IDENTITY CASCADE');
     for (const table of [
+      'dashboard_widget_configs',
       'bank_accounts',
       'gl_prior_period_adjustments',
       'day_close_snapshots',

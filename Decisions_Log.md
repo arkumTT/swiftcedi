@@ -195,7 +195,11 @@ authentication header, versioning approach._
   `/savings/standing-orders`, `/savings/standing-orders/execute-due`,
   `/savings/standing-orders/failures`, `/susu`, `/susu/:id/collections`,
   `/susu/:id/complete-cycle`, `/susu/:id/payout`, `/susu/remittances`,
-  `/susu/agents/:agentId/commissions`.
+  `/susu/agents/:agentId/commissions`, `/analytics/live-stats`,
+  `/analytics/portfolio-quality`, `/analytics/profitability`,
+  `/analytics/top-loan-customers`, `/analytics/growth-trends`,
+  `/analytics/agent-productivity`, `/analytics/report-pack`,
+  `/analytics/dashboard-configs/mine`, `/analytics/dashboard-configs/:roleId`.
 - Route file ordering rule (see `backend/src/routes/branches.js`): every
   fixed-prefix path (`/regions`, `/clusters`, `/transfers`,
   `/performance/compare`) must be registered before the `/:id` catch-all,
@@ -1244,6 +1248,99 @@ registerGlModuleExecutionHandlers()  // 'gl.manual_jv'
   `reconcileBranchDeposits` — no new endpoint was added here to avoid a
   second, parallel reconciliation mechanism for the same concern.
 
+### Analytics & owner dashboard service — `backend/src/modules/analytics/analyticsService.js` (Module 9)
+
+Per the module prompt, this module is "primarily read/aggregation logic
+... over other modules' tables — avoid duplicating source-of-truth data",
+so it owns exactly ONE table (`dashboard_widget_configs`) and reuses every
+other module's own service wherever one already exists —
+`cashierService.getBranchCashPosition`/`getConsolidatedCashPosition` for
+cash position, `glService.getBalanceSheet`/`getIncomeStatement` for the
+financial-statement pieces, `susuService.getAgentCommissionSummary` for
+susu commissions — rather than re-deriving any of those a second way.
+
+```js
+// analyticsService.js
+getLiveStats(pool, { branchId, date }) -> { cashPosition, todaysDisbursements, todaysCollections, nonCashTransactionCount, branchSnapshotGrid? }
+getLoanBookSnapshot(pool, { asOfDate, branchId, loanOfficerId }) -> per-loan { outstandingPrincipalPesewas, daysOverdue }[]  // the shared base every portfolio-quality figure is built on
+getPortfolioQuality(pool, { asOfDate, branchId, loanOfficerId, requestingUser, largestExposuresLimit }) -> { par30/60/90, agingBuckets, largestExposures }
+getProfitability(pool, { fromDate, toDate, branchId }) -> { costToIncomeRatio, operationalSelfSufficiencyRatio, branchPL? }
+getTopLoanCustomersByRevenue(pool, { fromDate, toDate, branchId, limit }) -> interest+fee revenue per customer, ranked
+getGrowthTrends(pool, { fromDate, toDate, branchId, granularity }) -> { customerRecruitment, disbursementTrend, depositGrowth, sectorBreakdown }
+getAgentProductivity(pool, { agentId, fromDate, toDate, requestingUser }) -> { susu: {...}, loanOfficer: {...} }
+generateExecutiveReportPack(pool, { asOfDate, fromDate, toDate, branchId }) -> { balanceSheet, incomeStatement, portfolioSummary, socialPerformance }
+listWidgetConfigs(pool, { roleId }) / upsertWidgetConfig(pool, { roleId, widgetKey, position, visible, updatedBy, actorBranchId }) / deleteWidgetConfig(pool, { configId, deletedBy, actorBranchId })
+resolveLoanOfficerScope(requestingUser, requestedOfficerId)  // the own-book enforcement, see below
+```
+
+- **No `daily_metrics_snapshot` table.** The module prompt itself frames
+  it as "populated by a scheduled job (Module 12)", and Module 12 doesn't
+  exist yet — adding an unpopulated snapshot table now would be exactly
+  the half-finished, nothing-writes-to-it pattern CLAUDE.md's working
+  agreement warns against, the same reasoning already applied to
+  `savings_accounts.status = 'dormant'` and `investments.status =
+  'matured'` (both exist in their CHECK constraints with no producer
+  until a Module 12 sweep exists). Every figure is instead computed live
+  from the source tables, same "reconstruct, never a stale cached number"
+  philosophy Module 7's reports already follow. Revisit if/when real data
+  volume makes live computation too slow for a dashboard page load.
+- **Role/branch/own-book scoping is enforced in TWO places, deliberately**,
+  per the module prompt's explicit "incapable of returning another
+  officer's book even if they inspect network requests": ordinary branch
+  scoping goes through the existing `resolveBranchScope`/`canAccessBranch`
+  middleware (`backend/src/middleware/requirePermission.js`) at the ROUTE
+  layer, same convention every other module already follows (see "Branch
+  Scoping Convention" below) — not duplicated here. But the NEW dimension
+  this module introduces, a loan officer's own-book restriction, is
+  enforced a SECOND time inside `analyticsService.js` itself
+  (`resolveLoanOfficerScope`), called from `getPortfolioQuality` and
+  `getAgentProductivity` — whatever `loanOfficerId`/`agentId` a caller
+  passes is silently overridden to the requesting user's own id whenever
+  `requestingUser.roleName === 'loan_officer'`. This is belt-and-suspenders
+  by design: the route always forwards `requestingUser`, but the
+  restriction lives at the layer a route bug can't bypass.
+- **"Loan officer" is approximated as `loans.applied_by`** — this schema
+  has no dedicated `loan_officer_id`/case-reassignment column (the closest
+  real field is who filed the application), and adding one was judged out
+  of scope for a reporting module (a real "reassign this loan to a
+  different officer" workflow is a Module 3 business-process question,
+  not something to bolt on from Module 9). See Open Questions.
+- **"Sector" is approximated as the existing `customers.classification`
+  free-form tag** (added in Module 2 for "risk tier / product eligibility
+  / susu classification"), rather than adding a new dedicated
+  `business_sector` column — reusing an existing free-form grouping field
+  is more consistent with CLAUDE.md's anti-duplication rule than adding a
+  parallel one for a very similar purpose. See Open Questions: no BOG-style
+  sector taxonomy has been verified, so this is descriptive grouping only,
+  not a regulatory classification.
+- **Operational self-sufficiency ratio is simplified to income / expense**
+  (no separate loan-loss-provision line exists to split out of "expense"
+  yet) — a textbook OSS calculation nets financing expense and loan-loss
+  provision separately from operating expense; this schema doesn't yet
+  distinguish them at that granularity. Flagged as an approximation, not
+  presented as the audited ratio.
+- **"Loan customer profitability" is approximated as interest+fee revenue
+  collected per customer**, ranked descending — a true fully-loaded
+  profitability figure would need overhead-cost allocation this schema has
+  no basis for, so this is deliberately a defensible proxy
+  (`getTopLoanCustomersByRevenue`), not presented as final P&L per customer.
+- **"Social performance" (the module prompt's own, otherwise-undefined
+  term) is interpreted as the standard microfinance outreach figures this
+  schema can actually support**: active customer/borrower counts, a
+  gender split (the existing `customers.gender` column), and susu
+  participation count — rather than inventing an undefined metric.
+- **Dashboard widget config is per-ROLE, not per-user**, matching the
+  module prompt's own framing ("Configurable dashboard widgets per
+  role"). `widget_key` is deliberately free-form `VARCHAR`, not a
+  CHECK-constrained enum — same reasoning as `customers.classification`:
+  the registry of known keys (`KNOWN_WIDGET_KEYS`) lives in
+  `analyticsService.js` and can grow without a migration, while a caller
+  still gets a clear validation error for a typo'd key. Any
+  `analytics.view` holder may read their OWN role's config
+  (`GET /dashboard-configs/mine`, always the caller's own `roleId`,
+  ignoring anything else); only `analytics.manage_dashboards` (owner/
+  system_admin) can view another role's config or write.
+
 ---
 
 ## Branch Scoping Convention
@@ -1490,6 +1587,35 @@ knowledge — plus any module prompt conflicts that need a human call._
       some branches but not others in one call (each `closeOutPeriod`
       call is single-branch). If the business needs finer-grained locking
       than that, it's a new decision, not an extension of this mechanism.
+- [ ] **Module 9's "loan officer" is approximated as `loans.applied_by`** —
+      there is no dedicated `loan_officer_id`/case-reassignment column
+      anywhere in this schema. In most real usage a loan officer likely IS
+      whoever takes the application, but a genuine "reassign this loan to
+      a different officer" business need would require an actual schema
+      addition (a Module 3 decision, not a Module 9 one) — flagging here
+      rather than silently treating the approximation as exact.
+- [ ] **Module 9's "sector analysis" reuses the existing
+      `customers.classification` free-form tag**, not a dedicated
+      `business_sector` column or any verified BOG sectoral-classification
+      taxonomy. No historical customers have a value populated (nothing
+      before Module 9 ever set it for this purpose), so sector analysis
+      will read as mostly "unspecified" until customer onboarding actually
+      captures a real value. If BOG's own sector taxonomy for microfinance
+      reporting needs to be followed exactly, that's a regulatory-figures
+      question per CLAUDE.md ("never hardcode BOG thresholds... from
+      general knowledge") and needs verification before this classification
+      is presented as anything more than descriptive grouping.
+- [ ] **Module 9's operational self-sufficiency ratio is simplified**
+      (income / expense, no separate loan-loss-provision split) — see the
+      Analytics service section. If a real OSS figure needs to match a
+      specific regulatory or investor-reporting definition, verify the
+      exact formula before presenting it as that number.
+- [ ] **No `daily_metrics_snapshot` table exists yet** (Module 9's own
+      module prompt frames it as a Module 12 scheduled-job artifact) —
+      every analytics figure is computed live from source tables. Revisit
+      if/when dashboard load times at real data volume make live
+      computation impractical; build the scheduled snapshot job in Module
+      12 then, not as an unpopulated table now.
 
 ---
 
@@ -1673,3 +1799,19 @@ deliberately changed._
   locked period, not just cashier operations — same reasoning Module 1
   used when it added `registerExecutionHandler` to `approvalWorkflow.js`
   for branch closure rather than building a bespoke decide endpoint.
+- **Module 9 (Analytics & Owner Dashboard) was built before Module 8
+  (Regulatory & Compliance) and before payments integration**, out of
+  CLAUDE.md's suggested order (`... 8. Module 8 ... 9. Module 9 ...`) —
+  done on an explicit instruction to start Module 9 next, not a discovered
+  dependency reason. Checked before starting: Module 9's own functional
+  requirements (live stats, portfolio quality, profitability, growth
+  trends, agent productivity, an executive report pack, dashboard configs)
+  don't actually reference anything Module 8 or payments integration would
+  own — they read from Modules 1-7's existing tables only. The module
+  prompt's "build this last, after Modules 1-8 have real data flowing"
+  note is a data-freshness recommendation (dashboards read better against
+  real activity than empty tables), not a hard technical dependency, and
+  this codebase already has real activity across every built module from
+  its own integration test runs and any manual smoke-testing. If Module 8
+  later needs its own analytics/report-pack section, that's a genuine
+  extension to build then, not something this session blocked on.
