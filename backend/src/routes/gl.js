@@ -76,6 +76,21 @@ function glRouter(pool) {
 
   // --- Journal entries ------------------------------------------------------
 
+  // The closest thing to a unified transaction ledger — every module's
+  // financial action posts through glPosting, so this lists across all of
+  // them at once. Powers the frontend's Transactions screen and dashboard
+  // recent-activity widget. Registered before POST /journal-entries only
+  // for readability; there's no /:id catch-all here to worry about.
+  router.get(
+    '/journal-entries',
+    auth,
+    requirePermission('gl.view_reports'),
+    asyncHandler(async (req, res) => {
+      const { branchId, sourceModule, fromDate, toDate, limit, offset } = req.query;
+      res.json(await glService.listJournalEntries(pool, { branchId, sourceModule, fromDate, toDate, limit, offset }));
+    })
+  );
+
   router.post(
     '/journal-entries',
     auth,

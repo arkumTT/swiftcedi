@@ -39,6 +39,24 @@ function resolveBranchScope(req) {
 }
 
 /**
+ * Like resolveBranchScope, but lets a cross-branch role explicitly request
+ * a true org-wide, all-branches view via `?branchId=all` — resolveBranchScope
+ * itself always falls back to the caller's OWN home branch when no branchId
+ * is given (a deliberate default so "no query param" means "my branch" for
+ * every role, not an accident), which left owner/system_admin with no way
+ * to ask for the consolidated view every analytics function already
+ * supports at the service layer (`branchId: null`). Only recognizes 'all'
+ * for CROSS_BRANCH_ROLES; every other caller (and every other branchId
+ * value) defers to the exact same resolveBranchScope behavior as before —
+ * see Decisions_Log.md. Used by the analytics routes the frontend
+ * dashboard needs a real consolidated view from.
+ */
+function resolveAnalyticsBranchScope(req) {
+  if (req.query.branchId === 'all' && CROSS_BRANCH_ROLES.has(req.user.roleName)) return null;
+  return resolveBranchScope(req);
+}
+
+/**
  * For endpoints scoped by a path param (e.g. GET /branches/:id/performance)
  * rather than a ?branchId= query param — same access rule as
  * resolveBranchScope, just checked against an arbitrary branchId instead of
@@ -51,4 +69,4 @@ function canAccessBranch(req, branchId) {
   return Boolean(req.user.crossBranchAccessibleBranchIds && req.user.crossBranchAccessibleBranchIds.has(id));
 }
 
-module.exports = { requirePermission, resolveBranchScope, canAccessBranch, CROSS_BRANCH_ROLES };
+module.exports = { requirePermission, resolveBranchScope, resolveAnalyticsBranchScope, canAccessBranch, CROSS_BRANCH_ROLES };

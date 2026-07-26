@@ -14,6 +14,7 @@ import { SystemJobsPage } from './features/admin/SystemJobsPage';
 import { AuditLogPage } from './features/admin/AuditLogPage';
 import { BackupsDataPage } from './features/admin/BackupsDataPage';
 import { SystemHealthPage } from './features/admin/SystemHealthPage';
+import { DashboardPage } from './features/main/dashboard/DashboardPage';
 
 const ADMIN_ANY_OF = [
   'rbac.manage_users',
@@ -124,7 +125,7 @@ function App() {
           </RequireAuth>
         }
       >
-        <Route index element={<PlaceholderPage title="Dashboard" />} />
+        <Route index element={<DashboardPage />} />
         <Route path="customers" element={<PlaceholderPage title="Customers & CRM" />} />
         <Route path="loans" element={<PlaceholderPage title="Loans & Credit" />} />
         <Route path="savings" element={<PlaceholderPage title="Savings & Susu" />} />

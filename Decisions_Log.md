@@ -1248,6 +1248,7 @@ listGlAccounts(pool, { branchId, accountType, status }) -> gl_accounts[]
 createGlAccount(pool, { code, name, accountType, branchId, parentAccountId, createdBy, actorBranchId }) -> gl_account
 updateGlAccount(pool, { accountId, updatedBy, actorBranchId, fields }) -> gl_account  // name/status always editable; code/accountType only pre-activity; branchId/parentAccountId never editable
 getTrialBalance(pool, { asOfDate, branchId }) / getBalanceSheet(pool, { asOfDate, branchId }) / getIncomeStatement(pool, { fromDate, toDate, branchId }) / getDailyBalanceSummary(pool, { date, branchId }) / getAnnualTransactionReport(pool, { year, branchId })
+listJournalEntries(pool, { branchId, sourceModule, fromDate, toDate, limit, offset }) -> gl_journal_entries[] with amountPesewas  // GET /gl/journal-entries, paginated, newest first
 requestManualJournalEntry(pool, { branchId, entryDate, description, lines, requestedBy }) -> { entry, approvalRequest }  // ALWAYS maker-checker
 postApprovedManualJournalEntry(pool, { entryId, postedBy }) -> { entry, journalEntry }
 createBankAccount(pool, { glAccountId, branchId, bankName, accountNumber, createdBy, actorBranchId }) -> bank_account  // glAccountId must already exist and be account_type='asset'
@@ -1274,6 +1275,17 @@ registerGlModuleExecutionHandlers()  // 'gl.manual_jv'
   `Assets = Liabilities + Equity` hold by construction (the fundamental
   accounting identity, guaranteed as long as every posted entry balanced,
   which `glPosting.js` already enforces) rather than an approximation.
+- **`listJournalEntries` added while building the frontend's Transactions
+  screen and dashboard** — before this, `gl_journal_entries` had a POST
+  (via `glPosting.postJournalEntry`) and year-scoped/unpaginated report
+  reads (`getAnnualTransactionReport`), but no general paginated list.
+  Since every module's financial action posts through the same shared
+  interface, this is the closest thing to a real "unified transaction
+  ledger" without inventing a parallel table — the frontend derives
+  Collections/Payouts/Commissions filter categories from each entry's
+  `reference` suffix (`-RPY`/`-DEP`/`-COL` vs. `-DISB`/`-WDL`/`-PYT` vs.
+  `-COMM`), a convention every module's own posting code already follows,
+  rather than adding a new `transaction_category` column.
 - **Manual JV (`gl_manual_entries`, migration 041) is ALWAYS maker-checker,
   no threshold** — same reasoning as `loan.approve`/`investment.book`/
   `investment.redeem`/`gl.reversal`/`gl.prior_period_adjustment`: a
@@ -1872,6 +1884,28 @@ is completed._
   happens server-side (this codebase's own established discipline). Kept
   on the current version rather than downgrading to a pre-7.12 release
   for an inapplicable CVE.
+- **The Main App Dashboard branches its content by role, not by a
+  hardcoded role-name switch** — it checks `isCrossBranchRole` (owner/
+  system_admin get a consolidated view + branch PAR30 comparison bar
+  chart) and whether the caller is specifically `loan_officer` (their
+  portfolio-quality call passes `loanOfficerId`, giving "My loan book"
+  scoped to their own assigned loans, per Section 7.2's role-scope table)
+  — everything else (branch_manager, cashier, field_agent) gets the
+  single-branch dashboard variant with a permission-gated Quick Actions
+  row instead of the cross-branch chart, since building each of those
+  roles' full dedicated landing experience (till view, collection round)
+  is those modules' own screens (Cashier & Vault, Field Agents), not a
+  dashboard concern to duplicate. No `investor` role exists anywhere in
+  this codebase's seeded role set (owner, branch_manager, loan_officer,
+  cashier, field_agent, system_admin) — Module 11 never created one — so
+  the spec's investor-only read-only statement view has no role to gate
+  behind yet; flagged in Open Questions rather than inventing role logic
+  the backend doesn't support.
+- **`glService.listJournalEntries` (added above) is what both the
+  dashboard's recent-transactions widget and the Reports Transactions
+  screen read from** — one query, one component
+  (`RecentTransactionsWidget`), reused in both places rather than two
+  separate implementations.
 
 ---
 
@@ -1903,6 +1937,21 @@ once and applied everywhere._
   can't escalate scope by editing the query string or path.
 - This mirrors the CLAUDE.md rule that permission/scope checks happen
   server-side, never trusting the frontend.
+- **`resolveAnalyticsBranchScope(req)` added (same file) while building the
+  frontend dashboard** — `resolveBranchScope`'s "no `?branchId=` means the
+  caller's own home branch" default is deliberate everywhere else, but it
+  left `CROSS_BRANCH_ROLES` with no way to ask Module 9's analytics
+  endpoints (`live-stats`, `portfolio-quality`, `profitability`,
+  `top-loan-customers`, `growth-trends`, `report-pack`) for the
+  consolidated, all-branches view those functions already support at the
+  service layer (`branchId: null`) — an owner's dashboard was silently
+  scoped to just their own home branch. Fixed narrowly: `?branchId=all`
+  resolves to `null` for a `CROSS_BRANCH_ROLES` member only; every other
+  input (a real id, no param at all, or `'all'` from a non-cross-branch
+  role) defers to the exact same `resolveBranchScope` behavior as before,
+  so nothing else changes. The frontend sends `branchId=all` explicitly
+  for owner/system_admin's dashboard queries — see
+  `frontend/src/lib/roleScope.ts`.
 
 ---
 
@@ -2276,6 +2325,16 @@ knowledge — plus any module prompt conflicts that need a human call._
       rather than presenting a fake device list; building real 2FA
       enrollment and a persisted multi-session table is a significant
       follow-up, not a frontend-only task.
+- [ ] **No `investor` role exists in this codebase's RBAC role set**
+      (owner, branch_manager, loan_officer, cashier, field_agent,
+      system_admin — see migration 002) — the design spec's "Investor
+      (read-only): Investment statement" role-scope row has nothing to
+      gate behind today. If real external investors need platform
+      access, add a proper `investor` role (Module 11's RBAC CRUD) with a
+      narrow permission set (investment.view scoped to their own
+      holdings only — which itself needs a new "my investments" query
+      distinct from the branch-scoped one every other role uses), not a
+      frontend-only page with no real access control backing it.
 
 ---
 
