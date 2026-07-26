@@ -45,6 +45,7 @@ describeIfDb('Module 2: customer & CRM', () => {
     // loans before customers/users) because loans FK to customers.
     await pool.query('TRUNCATE loan_repayments RESTART IDENTITY CASCADE');
     await pool.query('TRUNCATE savings_transactions, susu_collections RESTART IDENTITY CASCADE');
+    await pool.query('TRUNCATE overdraft_interest_accruals RESTART IDENTITY CASCADE');
     for (const table of [
       'standing_order_runs',
       'standing_orders',

@@ -226,6 +226,13 @@ async function getChargesConfigForAccount(db, account) {
  *
  * `glLines` is a function of the branch's GL accounts so callers describe
  * their own posting without this helper knowing about every txn type.
+ *
+ * `minAllowedBalancePesewas` is the real floor the balance must not fall
+ * below (defaults to 0 — no overdraft). Callers pass the account's actual
+ * `-overdraft_limit_pesewas` here rather than bypassing the check
+ * entirely — a previous version took a `skipBalanceCheck` boolean that,
+ * for any allows_overdraft product, disabled the floor altogether. See
+ * Decisions_Log.md.
  */
 async function applyMovement(pool, params) {
   const {
@@ -239,7 +246,7 @@ async function applyMovement(pool, params) {
     reference,
     buildGlLines,
     allowClosedAccount = false,
-    skipBalanceCheck = false,
+    minAllowedBalancePesewas = 0,
   } = params;
 
   if (!createdBy) throw new SavingsValidationError('createdBy is required');
@@ -273,9 +280,9 @@ async function applyMovement(pool, params) {
     }
 
     const balanceAfter = Number(account.balance_pesewas) + deltaPesewas;
-    if (!skipBalanceCheck && balanceAfter < 0) {
+    if (balanceAfter < Number(minAllowedBalancePesewas)) {
       throw new SavingsValidationError(
-        `movement of ${deltaPesewas} would overdraw savings_account ${accountId} (balance ${account.balance_pesewas})`
+        `movement of ${deltaPesewas} would take savings_account ${accountId} below its allowed floor of ${minAllowedBalancePesewas} (balance ${account.balance_pesewas})`
       );
     }
 
@@ -380,12 +387,13 @@ async function requestWithdrawal(pool, { accountId, amountPesewas, requestedBy, 
   const account = await getAccount(pool, accountId);
   if (account.status === 'closed') throw new SavingsConflictError(`savings_account ${accountId} is closed`);
 
-  const { product, chargesConfig } = await getChargesConfigForAccount(pool, account);
+  const { chargesConfig } = await getChargesConfigForAccount(pool, account);
+  const overdraftLimitPesewas = Number(account.overdraft_limit_pesewas) || 0;
   const assessment = savingsMath.assessWithdrawal({
     balancePesewas: account.balance_pesewas,
     amountPesewas,
     chargesConfig,
-    allowsOverdraft: product.allows_overdraft,
+    overdraftLimitPesewas,
   });
   if (!assessment.ok) throw new SavingsValidationError(assessment.error);
 
@@ -422,14 +430,16 @@ async function requestWithdrawal(pool, { accountId, amountPesewas, requestedBy, 
 /** Performs the actual payout movement (fee included) for a withdrawal request. */
 async function payOutWithdrawal(pool, { withdrawalRequest, paidBy, entryDate = todayIso() }) {
   const account = await getAccount(pool, withdrawalRequest.account_id);
-  const { product, chargesConfig } = await getChargesConfigForAccount(pool, account);
+  const { chargesConfig } = await getChargesConfigForAccount(pool, account);
   const amountPesewas = Number(withdrawalRequest.amount_pesewas);
+  const overdraftLimitPesewas = Number(account.overdraft_limit_pesewas) || 0;
+  const minAllowedBalancePesewas = -overdraftLimitPesewas;
 
   const assessment = savingsMath.assessWithdrawal({
     balancePesewas: account.balance_pesewas,
     amountPesewas,
     chargesConfig,
-    allowsOverdraft: product.allows_overdraft,
+    overdraftLimitPesewas,
   });
   if (!assessment.ok) throw new SavingsValidationError(assessment.error);
 
@@ -441,7 +451,7 @@ async function payOutWithdrawal(pool, { withdrawalRequest, paidBy, entryDate = t
     createdBy: paidBy,
     entryDate,
     reference: `SAV-${account.id}-WDL-${withdrawalRequest.id}`,
-    skipBalanceCheck: product.allows_overdraft,
+    minAllowedBalancePesewas,
     buildGlLines: ({ glAccounts, branchId }) => [
       { accountId: glAccounts.customer_deposits_account_id, debitPesewas: amountPesewas, branchId },
       { accountId: glAccounts.cash_in_hand_account_id, creditPesewas: amountPesewas, branchId },
@@ -458,7 +468,7 @@ async function payOutWithdrawal(pool, { withdrawalRequest, paidBy, entryDate = t
       createdBy: paidBy,
       entryDate,
       reference: `SAV-${account.id}-WFEE-${withdrawalRequest.id}`,
-      skipBalanceCheck: product.allows_overdraft,
+      minAllowedBalancePesewas,
       buildGlLines: ({ glAccounts, branchId }) => [
         { accountId: glAccounts.customer_deposits_account_id, debitPesewas: assessment.feePesewas, branchId },
         { accountId: glAccounts.savings_fee_income_account_id, creditPesewas: assessment.feePesewas, branchId },

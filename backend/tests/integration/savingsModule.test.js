@@ -49,6 +49,7 @@ describeIfDb('Module 4: savings, susu & standing orders', () => {
     await pool.query('TRUNCATE audit_log RESTART IDENTITY CASCADE');
     await pool.query('TRUNCATE loan_repayments RESTART IDENTITY CASCADE');
     await pool.query('TRUNCATE savings_transactions, susu_collections RESTART IDENTITY CASCADE');
+    await pool.query('TRUNCATE overdraft_interest_accruals RESTART IDENTITY CASCADE');
     for (const table of [
       'standing_order_runs',
       'standing_orders',

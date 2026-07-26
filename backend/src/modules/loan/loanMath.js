@@ -180,6 +180,26 @@ function computeFeesPesewas(feeSchedule, principalPesewas) {
   }, 0);
 }
 
+/**
+ * Simple daily interest on a drawn overdraft balance for a given number of
+ * days: drawnBalancePesewas * (annualRateBps/10000) * (days/365), rounded
+ * to the nearest pesewa. Overdrafts have no schedule to amortize against,
+ * so — unlike term loans (interest recognized on receipt) — this accrual
+ * IS the interest recognition event; see Decisions_Log.md.
+ */
+function computeOverdraftInterestPesewas({ drawnBalancePesewas, annualInterestRateBps, days }) {
+  if (!Number.isInteger(drawnBalancePesewas) || drawnBalancePesewas <= 0) {
+    throw new Error('drawnBalancePesewas must be a positive integer');
+  }
+  if (!Number.isInteger(annualInterestRateBps) || annualInterestRateBps < 0) {
+    throw new Error('annualInterestRateBps must be a non-negative integer');
+  }
+  if (!Number.isInteger(days) || days <= 0) {
+    throw new Error('days must be a positive integer');
+  }
+  return Math.round((drawnBalancePesewas * annualInterestRateBps * days) / (365 * 10000));
+}
+
 module.exports = {
   addMonthsToDateString,
   generateLoanSchedule,
@@ -187,4 +207,5 @@ module.exports = {
   computeOutstandingPrincipalPesewas,
   bucketArrearsDays,
   computeFeesPesewas,
+  computeOverdraftInterestPesewas,
 };

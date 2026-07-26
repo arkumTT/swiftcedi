@@ -62,21 +62,33 @@ function withdrawalNeedsApproval(amountPesewas, thresholdPesewas) {
  * balance, INCLUDING any withdrawal fee (the fee comes out of the same
  * account, so it must fit too). Returns the fee so callers don't
  * re-derive it.
+ *
+ * `overdraftLimitPesewas` is the account's REAL, numeric overdraft ceiling
+ * (savings_accounts.overdraft_limit_pesewas — 0 unless an overdraft loan is
+ * actually disbursed against this account). The floor a withdrawal must
+ * respect is `minBalance - overdraftLimitPesewas`, never an unconditional
+ * bypass — a previous version of this function skipped the check entirely
+ * for any allows_overdraft product, giving every such account an
+ * unlimited, unattached overdraft. See Decisions_Log.md.
  */
-function assessWithdrawal({ balancePesewas, amountPesewas, chargesConfig, allowsOverdraft = false }) {
+function assessWithdrawal({ balancePesewas, amountPesewas, chargesConfig, overdraftLimitPesewas = 0 }) {
   const balance = Number(balancePesewas);
   const amount = Number(amountPesewas);
   const feePesewas = Number(chargesConfig.withdrawalFeePesewas) || 0;
   const totalDebit = amount + feePesewas;
   const balanceAfter = balance - totalDebit;
   const minBalance = Number(chargesConfig.minBalancePesewas) || 0;
+  const overdraftLimit = Number(overdraftLimitPesewas) || 0;
+  const floor = minBalance - overdraftLimit;
 
   let error = null;
   if (!Number.isInteger(amount) || amount <= 0) {
     error = 'amountPesewas must be a positive integer';
-  } else if (!allowsOverdraft && balanceAfter < minBalance) {
+  } else if (balanceAfter < floor) {
     error =
-      minBalance > 0
+      overdraftLimit > 0
+        ? `insufficient funds: withdrawing ${amount} (+${feePesewas} fee) would leave ${balanceAfter}, below the ${floor} floor (${minBalance} minimum balance less ${overdraftLimit} overdraft limit)`
+        : minBalance > 0
         ? `insufficient funds: withdrawing ${amount} (+${feePesewas} fee) would leave ${balanceAfter}, below the ${minBalance} minimum balance`
         : `insufficient funds: withdrawing ${amount} (+${feePesewas} fee) exceeds the available balance of ${balance}`;
   }

@@ -7,6 +7,7 @@ const {
   computeOutstandingPrincipalPesewas,
   bucketArrearsDays,
   computeFeesPesewas,
+  computeOverdraftInterestPesewas,
 } = require('../../src/modules/loan/loanMath');
 
 describe('addMonthsToDateString (pure)', () => {
@@ -261,5 +262,38 @@ describe('bucketArrearsDays (pure)', () => {
 
   test('works with custom, unsorted boundaries', () => {
     expect(bucketArrearsDays(10, [90, 30, 60])).toBe('1-30');
+  });
+});
+
+describe('computeOverdraftInterestPesewas (pure)', () => {
+  test('a full year at a round rate matches the simple-interest formula exactly', () => {
+    // 1,000,000 pesewas drawn at 24% p.a. for 365 days -> 240,000 pesewas.
+    expect(
+      computeOverdraftInterestPesewas({ drawnBalancePesewas: 1000000, annualInterestRateBps: 2400, days: 365 })
+    ).toBe(240000);
+  });
+
+  test('prorates by days', () => {
+    // 1,000,000 at 24% p.a. for 30 days -> round(1000000 * 0.24 * 30/365).
+    const expected = Math.round((1000000 * 2400 * 30) / (365 * 10000));
+    expect(computeOverdraftInterestPesewas({ drawnBalancePesewas: 1000000, annualInterestRateBps: 2400, days: 30 })).toBe(
+      expected
+    );
+  });
+
+  test('zero rate accrues nothing', () => {
+    expect(computeOverdraftInterestPesewas({ drawnBalancePesewas: 1000000, annualInterestRateBps: 0, days: 30 })).toBe(0);
+  });
+
+  test('rejects a non-positive drawn balance', () => {
+    expect(() => computeOverdraftInterestPesewas({ drawnBalancePesewas: 0, annualInterestRateBps: 2400, days: 30 })).toThrow(
+      /drawnBalancePesewas/
+    );
+  });
+
+  test('rejects a non-positive number of days', () => {
+    expect(() =>
+      computeOverdraftInterestPesewas({ drawnBalancePesewas: 1000000, annualInterestRateBps: 2400, days: 0 })
+    ).toThrow(/days/);
   });
 });

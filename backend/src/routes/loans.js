@@ -149,6 +149,42 @@ function loansRouter(pool) {
     })
   );
 
+  // --- Overdraft servicing --------------------------------------------------
+
+  router.get(
+    '/:id/overdraft-status',
+    auth,
+    asyncHandler(async (req, res) => {
+      res.json(await loanService.getOverdraftStatus(pool, { loanId: req.params.id }));
+    })
+  );
+
+  router.post(
+    '/:id/overdraft/accrue-interest',
+    auth,
+    requirePermission('loan.accrue_overdraft_interest'),
+    asyncHandler(async (req, res) => {
+      const { accrualDate, days } = req.body || {};
+      const result = await loanService.accrueOverdraftInterest(pool, {
+        loanId: req.params.id,
+        accrualDate,
+        days,
+        accruedBy: req.user.id,
+      });
+      res.status(201).json(result);
+    })
+  );
+
+  router.post(
+    '/:id/overdraft/close',
+    auth,
+    requirePermission('loan.close_overdraft'),
+    asyncHandler(async (req, res) => {
+      const loan = await loanService.closeOverdraft(pool, { loanId: req.params.id, closedBy: req.user.id });
+      res.json(loan);
+    })
+  );
+
   router.get(
     '/:id/schedule',
     auth,

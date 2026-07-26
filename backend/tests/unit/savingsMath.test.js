@@ -111,15 +111,30 @@ describe('assessWithdrawal (pure)', () => {
     expect(assessWithdrawal({ balancePesewas: 50000, amountPesewas: -100, chargesConfig: charges }).ok).toBe(false);
   });
 
-  test('an overdraft-enabled product bypasses the balance check', () => {
-    const result = assessWithdrawal({
+  test('a real overdraft limit permits drawing down to the floor (minBalance - limit), not further', () => {
+    // balance 100, minBalance 1000, overdraft limit 20000 -> floor = 1000 - 20000 = -19000
+    const atFloor = assessWithdrawal({
       balancePesewas: 100,
-      amountPesewas: 50000,
+      amountPesewas: 18900,
       chargesConfig: charges,
-      allowsOverdraft: true,
+      overdraftLimitPesewas: 20000,
     });
-    expect(result.ok).toBe(true);
-    expect(result.balanceAfterPesewas).toBe(100 - 50000 - 200);
+    expect(atFloor.ok).toBe(true);
+    expect(atFloor.balanceAfterPesewas).toBe(-19000);
+
+    const beyondFloor = assessWithdrawal({
+      balancePesewas: 100,
+      amountPesewas: 18901,
+      chargesConfig: charges,
+      overdraftLimitPesewas: 20000,
+    });
+    expect(beyondFloor.ok).toBe(false);
+    expect(beyondFloor.error).toMatch(/overdraft limit/);
+  });
+
+  test('an unbounded overdraft limit is never assumed — omitting it enforces the ordinary minimum balance', () => {
+    const result = assessWithdrawal({ balancePesewas: 100, amountPesewas: 50000, chargesConfig: charges });
+    expect(result.ok).toBe(false);
   });
 });
 

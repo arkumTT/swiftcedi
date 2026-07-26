@@ -4,6 +4,7 @@ const auditLog = require('../../shared/auditLog');
 const approvalWorkflow = require('../../shared/approvalWorkflow');
 const glPosting = require('../../shared/glPosting');
 const loanMath = require('./loanMath');
+const savingsService = require('../savings/savingsService');
 
 /**
  * Module 3: Loan Management. Uses the Module 11/7 shared services
@@ -212,7 +213,16 @@ async function findGroupCreditBlockers(db, groupCustomerId) {
 }
 
 async function applyForLoan(pool, params) {
-  const { customerId, productId, principalPesewas, termMonths, reasonCode = null, purposeNotes = null, appliedBy } = params;
+  const {
+    customerId,
+    productId,
+    principalPesewas,
+    termMonths,
+    reasonCode = null,
+    purposeNotes = null,
+    overdraftSavingsAccountId = null,
+    appliedBy,
+  } = params;
   if (!customerId || !productId || !appliedBy) {
     throw new LoanValidationError('customerId, productId, and appliedBy are required');
   }
@@ -258,11 +268,45 @@ async function applyForLoan(pool, params) {
     }
   }
 
+  // An overdraft loan is a revolving facility against a specific EXISTING
+  // savings account, not a standalone principal handed over — see
+  // Decisions_Log.md. principalPesewas is repurposed to mean "the
+  // requested/approved LIMIT" for this loan_type.
+  if (product.loan_type === 'overdraft') {
+    if (!overdraftSavingsAccountId) {
+      throw new LoanValidationError('overdraftSavingsAccountId is required for an overdraft loan application');
+    }
+    const account = await savingsService.getAccount(pool, overdraftSavingsAccountId);
+    if (Number(account.customer_id) !== Number(customerId)) {
+      throw new LoanValidationError(`savings_account ${overdraftSavingsAccountId} does not belong to customer ${customerId}`);
+    }
+    if (account.status !== 'active') {
+      throw new LoanConflictError(`savings_account ${overdraftSavingsAccountId} is not active (status: ${account.status})`);
+    }
+    const { product: savingsProduct } = await savingsService.getChargesConfigForAccount(pool, account);
+    if (!savingsProduct.allows_overdraft) {
+      throw new LoanConflictError(`savings_account ${overdraftSavingsAccountId}'s product does not allow overdraft`);
+    }
+    const { rows: existingRows } = await pool.query(
+      `SELECT id FROM loans
+        WHERE overdraft_savings_account_id = $1
+          AND status NOT IN ('rejected', 'closed', 'written_off')`,
+      [overdraftSavingsAccountId]
+    );
+    if (existingRows.length > 0) {
+      throw new LoanConflictError(
+        `savings_account ${overdraftSavingsAccountId} already has an active overdraft facility (loan ${existingRows[0].id})`
+      );
+    }
+  } else if (overdraftSavingsAccountId) {
+    throw new LoanValidationError(`overdraftSavingsAccountId is only applicable to overdraft loans`);
+  }
+
   const { rows } = await pool.query(
     `INSERT INTO loans
        (loan_type, customer_id, branch_id, product_id, principal_pesewas, term_months,
-        interest_method, annual_interest_rate_bps, reason_code, purpose_notes, applied_by)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        interest_method, annual_interest_rate_bps, reason_code, purpose_notes, overdraft_savings_account_id, applied_by)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
      RETURNING *`,
     [
       product.loan_type,
@@ -275,6 +319,7 @@ async function applyForLoan(pool, params) {
       product.annual_interest_rate_bps,
       reasonCode,
       purposeNotes,
+      overdraftSavingsAccountId,
       appliedBy,
     ]
   );
@@ -414,8 +459,82 @@ async function getBranchGlAccounts(db, branchId) {
 }
 
 /**
+ * Verifies (and locks) that a loan is `approved` with a matching approved
+ * maker-checker record — the shared precondition for BOTH ordinary
+ * disbursement and overdraft activation.
+ */
+async function assertApprovedForDisbursement(client, loanId) {
+  const { rows: loanRows } = await client.query('SELECT * FROM loans WHERE id = $1 FOR UPDATE', [loanId]);
+  const loan = loanRows[0];
+  if (!loan) throw new LoanNotFoundError(`loan ${loanId} not found`);
+  if (loan.status !== 'approved') {
+    throw new LoanConflictError(`loan ${loanId} must be approved before disbursement (status: ${loan.status})`);
+  }
+
+  const { rows: approvalRows } = await client.query(
+    `SELECT id FROM approval_requests
+      WHERE action_type = 'loan.approve' AND entity_type = 'loan' AND entity_id = $1 AND status = 'approved'
+      LIMIT 1`,
+    [String(loanId)]
+  );
+  if (approvalRows.length === 0) {
+    throw new LoanConflictError(`loan ${loanId} has no approved maker-checker approval on record`);
+  }
+  return loan;
+}
+
+/**
+ * Activates an overdraft loan: NO schedule is generated and NOTHING posts
+ * to GL — `principal_pesewas` is the approved LIMIT, and nothing is owed
+ * until the customer actually draws against the linked savings account
+ * (which happens through the ordinary withdrawal path once its real
+ * numeric `overdraft_limit_pesewas` is set here). See Decisions_Log.md.
+ */
+async function activateOverdraft(pool, { loanId, disbursedBy, disbursementDate }) {
+  const client = await pool.connect();
+  let loan;
+  try {
+    await client.query('BEGIN');
+    loan = await assertApprovedForDisbursement(client, loanId);
+
+    await client.query('UPDATE savings_accounts SET overdraft_limit_pesewas = $1, updated_at = now() WHERE id = $2', [
+      Number(loan.principal_pesewas),
+      loan.overdraft_savings_account_id,
+    ]);
+
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+
+  const { rows } = await pool.query(
+    `UPDATE loans
+        SET status = 'disbursed', disbursed_at = now(), disbursed_by = $1, updated_at = now()
+      WHERE id = $2
+      RETURNING *`,
+    [disbursedBy, loanId]
+  );
+
+  await auditLog.record(pool, {
+    userId: disbursedBy,
+    branchId: loan.branch_id,
+    action: 'loan.overdraft_activated',
+    entityType: 'loan',
+    entityId: loanId,
+    beforeState: { status: 'approved' },
+    afterState: { status: 'disbursed', overdraftLimitPesewas: Number(loan.principal_pesewas), savingsAccountId: loan.overdraft_savings_account_id },
+  });
+
+  return { ...rows[0], feesPesewas: 0, netCashPesewas: 0, journalEntry: null };
+}
+
+/**
  * Disburses an approved loan: generates the repayment schedule, posts the
- * GL entry, and (for group loans) snapshots joint liability.
+ * GL entry, and (for group loans) snapshots joint liability. Overdraft
+ * loans are dispatched to `activateOverdraft` instead — see there for why.
  *
  * GL mapping (see Decisions_Log.md):
  *   Dr Loans Receivable   principal
@@ -429,6 +548,11 @@ async function getBranchGlAccounts(db, branchId) {
 async function disburseLoan(pool, { loanId, disbursedBy, disbursementDate = todayIso() }) {
   if (!disbursedBy) throw new LoanValidationError('disbursedBy is required');
 
+  const existingLoan = await getLoan(pool, loanId);
+  if (existingLoan.loan_type === 'overdraft') {
+    return activateOverdraft(pool, { loanId, disbursedBy, disbursementDate });
+  }
+
   const client = await pool.connect();
   let loanForPosting;
   let feesPesewas;
@@ -437,22 +561,7 @@ async function disburseLoan(pool, { loanId, disbursedBy, disbursementDate = toda
   try {
     await client.query('BEGIN');
 
-    const { rows: loanRows } = await client.query('SELECT * FROM loans WHERE id = $1 FOR UPDATE', [loanId]);
-    const loan = loanRows[0];
-    if (!loan) throw new LoanNotFoundError(`loan ${loanId} not found`);
-    if (loan.status !== 'approved') {
-      throw new LoanConflictError(`loan ${loanId} must be approved before disbursement (status: ${loan.status})`);
-    }
-
-    const { rows: approvalRows } = await client.query(
-      `SELECT id FROM approval_requests
-        WHERE action_type = 'loan.approve' AND entity_type = 'loan' AND entity_id = $1 AND status = 'approved'
-        LIMIT 1`,
-      [String(loanId)]
-    );
-    if (approvalRows.length === 0) {
-      throw new LoanConflictError(`loan ${loanId} has no approved maker-checker approval on record`);
-    }
+    const loan = await assertApprovedForDisbursement(client, loanId);
 
     const product = await getLoanProduct(client, loan.product_id);
     feesPesewas = loanMath.computeFeesPesewas(product.fee_schedule, Number(loan.principal_pesewas));
@@ -549,6 +658,150 @@ async function disburseLoan(pool, { loanId, disbursedBy, disbursementDate = toda
   });
 
   return { ...rows[0], feesPesewas, netCashPesewas, journalEntry };
+}
+
+// --- Overdraft servicing -----------------------------------------------------
+
+/** Current draw/limit/availability snapshot for an overdraft facility. */
+async function getOverdraftStatus(pool, { loanId }) {
+  const loan = await getLoan(pool, loanId);
+  if (loan.loan_type !== 'overdraft') {
+    throw new LoanValidationError(`loan ${loanId} is not an overdraft facility`);
+  }
+  const account = await savingsService.getAccount(pool, loan.overdraft_savings_account_id);
+  const balancePesewas = Number(account.balance_pesewas);
+  const drawnPesewas = Math.max(0, -balancePesewas);
+  const limitPesewas = Number(account.overdraft_limit_pesewas);
+  return {
+    loanId: Number(loanId),
+    status: loan.status,
+    savingsAccountId: account.id,
+    limitPesewas,
+    balancePesewas,
+    drawnPesewas,
+    availablePesewas: Math.max(0, limitPesewas - drawnPesewas),
+  };
+}
+
+/**
+ * Accrues interest on the currently drawn overdraft balance and posts it —
+ * this IS the interest recognition event (overdrafts have no schedule to
+ * recognize interest against on receipt, unlike term loans — see
+ * Decisions_Log.md). A no-op (0 accrued) when nothing is currently drawn.
+ *
+ * GL mapping: Dr Customer Deposits / Cr Loan Interest Income — same
+ * direction as an ordinary withdrawal/fee, since Customer Deposits is a
+ * liability and interest owed further reduces what's owed back to the
+ * customer.
+ */
+async function accrueOverdraftInterest(pool, { loanId, accrualDate = todayIso(), days = 30, accruedBy }) {
+  if (!accruedBy) throw new LoanValidationError('accruedBy is required');
+
+  const loan = await getLoan(pool, loanId);
+  if (loan.loan_type !== 'overdraft') {
+    throw new LoanValidationError(`loan ${loanId} is not an overdraft facility`);
+  }
+  if (loan.status !== 'disbursed') {
+    throw new LoanConflictError(`overdraft ${loanId} is not active (status: ${loan.status})`);
+  }
+
+  const account = await savingsService.getAccount(pool, loan.overdraft_savings_account_id);
+  const drawnBalancePesewas = Math.max(0, -Number(account.balance_pesewas));
+  if (drawnBalancePesewas <= 0) {
+    return { loanId: Number(loanId), accrued: false, interestPesewas: 0 };
+  }
+
+  const interestPesewas = loanMath.computeOverdraftInterestPesewas({
+    drawnBalancePesewas,
+    annualInterestRateBps: loan.annual_interest_rate_bps,
+    days,
+  });
+
+  const { rows: existingRows } = await pool.query(
+    'SELECT id FROM overdraft_interest_accruals WHERE loan_id = $1 AND accrual_date = $2',
+    [loanId, accrualDate]
+  );
+  if (existingRows.length > 0) {
+    throw new LoanConflictError(`overdraft ${loanId} already accrued interest for ${accrualDate}`);
+  }
+
+  const movement = await savingsService.applyMovement(pool, {
+    accountId: account.id,
+    txnType: 'overdraft_interest',
+    deltaPesewas: -interestPesewas,
+    description: `Overdraft interest on loan ${loanId}`,
+    createdBy: accruedBy,
+    entryDate: accrualDate,
+    reference: `LOAN-${loanId}-ODINT-${accrualDate}`,
+    minAllowedBalancePesewas: -Number(account.overdraft_limit_pesewas),
+    buildGlLines: ({ glAccounts, branchId }) => [
+      { accountId: glAccounts.customer_deposits_account_id, debitPesewas: interestPesewas, branchId },
+      { accountId: glAccounts.loan_interest_income_account_id, creditPesewas: interestPesewas, branchId },
+    ],
+  });
+
+  const { rows } = await pool.query(
+    `INSERT INTO overdraft_interest_accruals
+       (loan_id, savings_account_id, savings_transaction_id, accrual_date, drawn_balance_pesewas, annual_interest_rate_bps, interest_pesewas, created_by)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+     RETURNING *`,
+    [loanId, account.id, movement.transaction.id, accrualDate, drawnBalancePesewas, loan.annual_interest_rate_bps, interestPesewas, accruedBy]
+  );
+
+  await auditLog.record(pool, {
+    userId: accruedBy,
+    branchId: loan.branch_id,
+    action: 'loan.overdraft_interest_accrued',
+    entityType: 'loan',
+    entityId: loanId,
+    afterState: { accrualDate, drawnBalancePesewas, interestPesewas, journalEntryId: movement.journalEntry.id },
+  });
+
+  return { loanId: Number(loanId), accrued: true, ...rows[0], interestPesewas, journalEntry: movement.journalEntry };
+}
+
+/**
+ * Closes an overdraft facility: withdraws the approved limit
+ * (`overdraft_limit_pesewas` back to 0, so the account can no longer be
+ * drawn below its ordinary minimum balance) and marks the loan `closed`.
+ * Requires the drawn balance to already be repaid to zero — same
+ * "no outstanding debt" precondition as an ordinary savings account close.
+ */
+async function closeOverdraft(pool, { loanId, closedBy }) {
+  if (!closedBy) throw new LoanValidationError('closedBy is required');
+
+  const loan = await getLoan(pool, loanId);
+  if (loan.loan_type !== 'overdraft') {
+    throw new LoanValidationError(`loan ${loanId} is not an overdraft facility`);
+  }
+  if (loan.status !== 'disbursed') {
+    throw new LoanConflictError(`overdraft ${loanId} is not active (status: ${loan.status})`);
+  }
+
+  const account = await savingsService.getAccount(pool, loan.overdraft_savings_account_id);
+  if (Number(account.balance_pesewas) < 0) {
+    throw new LoanConflictError(
+      `overdraft ${loanId} cannot be closed with a drawn balance of ${-Number(account.balance_pesewas)} pesewas outstanding — repay it first`
+    );
+  }
+
+  await pool.query('UPDATE savings_accounts SET overdraft_limit_pesewas = 0, updated_at = now() WHERE id = $1', [account.id]);
+  const { rows } = await pool.query(
+    "UPDATE loans SET status = 'closed', closed_at = now(), updated_at = now() WHERE id = $1 RETURNING *",
+    [loanId]
+  );
+
+  await auditLog.record(pool, {
+    userId: closedBy,
+    branchId: loan.branch_id,
+    action: 'loan.overdraft_closed',
+    entityType: 'loan',
+    entityId: loanId,
+    beforeState: { status: 'disbursed' },
+    afterState: { status: 'closed' },
+  });
+
+  return rows[0];
 }
 
 // --- Schedules & repayments -------------------------------------------------
@@ -865,7 +1118,63 @@ async function applyRestructureOnApproval(approvalRequest, db) {
 // --- Write-off ---------------------------------------------------------------
 
 /**
- * Writes off a loan's outstanding principal as a bad debt.
+ * Writes off an overdraft's currently drawn balance as a bad debt. Unlike a
+ * term loan, an overdraft's debt lives on the linked savings account's
+ * negative balance (nothing was ever posted to Loans Receivable — see
+ * Decisions_Log.md), so writing it off means bringing that balance back to
+ * zero through the ordinary applyMovement funnel, not crediting Loans
+ * Receivable.
+ *
+ * GL mapping: Dr Loan Loss Expense / Cr Customer Deposits.
+ */
+async function writeOffOverdraft(pool, { loan, reason, writtenOffBy, writeOffDate }) {
+  const account = await savingsService.getAccount(pool, loan.overdraft_savings_account_id);
+  const drawnBalancePesewas = Math.max(0, -Number(account.balance_pesewas));
+  if (drawnBalancePesewas <= 0) {
+    throw new LoanConflictError(`overdraft ${loan.id} has no drawn balance to write off`);
+  }
+
+  const movement = await savingsService.applyMovement(pool, {
+    accountId: account.id,
+    txnType: 'overdraft_writeoff',
+    deltaPesewas: drawnBalancePesewas,
+    description: `Write-off of overdraft loan ${loan.id}: ${reason}`,
+    createdBy: writtenOffBy,
+    entryDate: writeOffDate,
+    reference: `LOAN-${loan.id}-WOFF`,
+    buildGlLines: ({ glAccounts, branchId }) => [
+      { accountId: glAccounts.loan_loss_expense_account_id, debitPesewas: drawnBalancePesewas, branchId },
+      { accountId: glAccounts.customer_deposits_account_id, creditPesewas: drawnBalancePesewas, branchId },
+    ],
+  });
+
+  await pool.query('UPDATE savings_accounts SET overdraft_limit_pesewas = 0, updated_at = now() WHERE id = $1', [account.id]);
+
+  const { rows } = await pool.query(
+    `UPDATE loans
+        SET status = 'written_off', written_off_at = now(), written_off_by = $1,
+            write_off_journal_entry_id = $2, updated_at = now()
+      WHERE id = $3
+      RETURNING *`,
+    [writtenOffBy, movement.journalEntry.id, loan.id]
+  );
+
+  await auditLog.record(pool, {
+    userId: writtenOffBy,
+    branchId: loan.branch_id,
+    action: 'loan.written_off',
+    entityType: 'loan',
+    entityId: loan.id,
+    beforeState: { status: loan.status },
+    afterState: { status: 'written_off', drawnBalancePesewas, reason, journalEntryId: movement.journalEntry.id },
+  });
+
+  return { ...rows[0], writtenOffPrincipalPesewas: drawnBalancePesewas, journalEntry: movement.journalEntry };
+}
+
+/**
+ * Writes off a loan's outstanding principal as a bad debt. Overdraft loans
+ * are dispatched to `writeOffOverdraft` instead — see there for why.
  *
  * GL mapping (see Decisions_Log.md):
  *   Dr Loan Loss Expense   outstanding principal
@@ -881,6 +1190,10 @@ async function writeOffLoan(pool, { loanId, reason, writtenOffBy, writeOffDate =
   const loan = await getLoan(pool, loanId);
   if (loan.status !== 'disbursed') {
     throw new LoanConflictError(`only a disbursed loan can be written off (status: ${loan.status})`);
+  }
+
+  if (loan.loan_type === 'overdraft') {
+    return writeOffOverdraft(pool, { loan, reason, writtenOffBy, writeOffDate });
   }
 
   const schedule = await getLoanSchedule(pool, { loanId });
@@ -1083,6 +1396,10 @@ module.exports = {
   requestLoanApproval,
   applyLoanApprovalDecision,
   disburseLoan,
+  activateOverdraft,
+  getOverdraftStatus,
+  accrueOverdraftInterest,
+  closeOverdraft,
   getLoanSchedule,
   postRepayment,
   listRepayments,

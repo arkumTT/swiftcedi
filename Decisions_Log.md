@@ -102,8 +102,8 @@ _Naming patterns adopted for the schema so later modules stay consistent
   run the **full** `npm test`, not just your own file, and verify with a
   reversed file order. Note also that immutable tables (`audit_log`,
   `gl_journal_lines`, `loan_repayments`, `savings_transactions`,
-  `susu_collections`) need `TRUNCATE`, since their triggers block plain
-  `DELETE`.
+  `susu_collections`, `overdraft_interest_accruals`) need `TRUNCATE`, since
+  their triggers block plain `DELETE`.
 - **`branches`** started as a stub in Module 11/7's migrations (just `id,
   code, name, status, created_at, updated_at`) so every other table could
   carry a real `branch_id` FK immediately. Module 1 (migration
@@ -602,16 +602,24 @@ addMonthsToDateString(dateStr, months) -> string
 ```js
 createLoanProduct / listLoanProducts / getLoanProduct(pool, ...)
 calculateLoan(pool, { productId, principalPesewas, termMonths, startDate }) -> preview, creates nothing
-applyForLoan(pool, { customerId, productId, principalPesewas, termMonths, reasonCode, appliedBy }) -> loan
+applyForLoan(pool, { customerId, productId, principalPesewas, termMonths, reasonCode, overdraftSavingsAccountId?, appliedBy }) -> loan
 submitAppraisal(pool, { loanId, checklist, recommendation, appraiserId }) -> { appraisal, loan }
 requestLoanApproval(pool, { loanId, requestedBy }) -> approval_request
 disburseLoan(pool, { loanId, disbursedBy, disbursementDate }) -> loan + { feesPesewas, netCashPesewas, journalEntry }
+  // dispatches to activateOverdraft() for loan_type = 'overdraft' — see below
 postRepayment(pool, { loanId, amountPesewas, paymentDate, receivedBy }) -> { components, loanClosed, journalEntry }
 requestRestructure(pool, { loanId, newTermMonths, newAnnualInterestRateBps, reason, requestedBy }) -> restructure + approvalRequest
 writeOffLoan(pool, { loanId, reason, writtenOffBy }) -> loan + journalEntry
+  // dispatches to writeOffOverdraft() for loan_type = 'overdraft' — see below
 getArrearsReport(pool, { branchId, asOfDate }) -> { loans, totals: { buckets, parRatio } }
 findGroupCreditBlockers(db, groupCustomerId) -> blocking members
 registerLoanExecutionHandlers()  // 'loan.approve' + 'loan.restructure'
+
+// Overdraft servicing (Module 3, closing the Open Question below)
+activateOverdraft(pool, { loanId, disbursedBy, disbursementDate })  // called BY disburseLoan, not directly
+getOverdraftStatus(pool, { loanId }) -> { limitPesewas, balancePesewas, drawnPesewas, availablePesewas }
+accrueOverdraftInterest(pool, { loanId, accrualDate?, days?, accruedBy }) -> { accrued, interestPesewas, journalEntry }
+closeOverdraft(pool, { loanId, closedBy }) -> loan
 ```
 
 **GL mapping — the contract every other module should read before posting
@@ -623,6 +631,9 @@ direct writes):
 | Disbursement | Loans Receivable `principal` | Cash in Hand `principal - fees`; Loan Fee Income `fees` |
 | Repayment | Cash in Hand `amount` | Loans Receivable `principal component`; Loan Interest Income `interest component`; Loan Fee Income `fee component` |
 | Write-off | Loan Loss Expense `outstanding principal` | Loans Receivable `outstanding principal` |
+| **Overdraft activation** | *(nothing posts — see Overdraft loans below)* | |
+| **Overdraft interest accrual** | Customer Deposits `interest` | Loan Interest Income `interest` |
+| **Overdraft write-off** | Loan Loss Expense `drawn balance` | Customer Deposits `drawn balance` |
 
 - **Fees are charged once, at disbursement, netted from the cash handed
   over** — the borrower owes the full principal, receives
@@ -669,6 +680,66 @@ direct writes):
   doesn't exist yet when the repayment row is inserted. Every financial
   field stays immutable, and the trigger verifies nothing else changed.
 
+**Overdraft loans — finished, migration `032_overdraft.sql` /
+`033_overdraft_permissions_seed.sql`.** Closes the Open Question that used
+to sit at the bottom of this file: an overdraft is now a real revolving
+facility against a specific EXISTING savings account, not an amortizing
+term loan and not (the actual bug) an unconditional bypass of the balance
+check for any `allows_overdraft` account.
+
+- **`loans.principal_pesewas` is repurposed to mean the approved LIMIT**
+  for `loan_type = 'overdraft'` — no new "limit" column on `loans`. The
+  real, numeric ceiling actually enforced lives on the savings side:
+  `savings_accounts.overdraft_limit_pesewas` (0 unless an overdraft is
+  currently active against that account).
+- **`loans.overdraft_savings_account_id`** links the loan to the specific
+  account (`applyForLoan` validates: same customer, account `active`, and
+  the account's product has `allows_overdraft = true`; at most one
+  non-terminal overdraft loan per account at a time).
+- **Activation (`activateOverdraft`, dispatched from `disburseLoan` when
+  `loan_type = 'overdraft'`) generates NO schedule and posts NOTHING to
+  GL.** It only sets `savings_accounts.overdraft_limit_pesewas` to the
+  loan's principal. Nothing is owed until the customer actually draws —
+  and drawing happens through the **existing savings withdrawal path**
+  (`savingsService.requestWithdrawal`/`payOutWithdrawal`), not a new
+  disbursement-style money movement.
+- **Interest is accrued, not recognized on receipt** — a deliberate
+  exception to the "interest is recognized on receipt" rule term loans
+  follow (see above), because an overdraft has no schedule to recognize
+  interest against on receipt. `accrueOverdraftInterest` computes simple
+  interest on the currently drawn balance for a caller-supplied period
+  (`loanMath.computeOverdraftInterestPesewas`), posts it through
+  `savingsService.applyMovement` (txn_type `overdraft_interest`: Dr
+  Customer Deposits / Cr Loan Interest Income — same direction as an
+  ordinary withdrawal, since Customer Deposits is a liability and interest
+  owed further reduces what's owed back to the customer), and records an
+  `overdraft_interest_accruals` row. `UNIQUE(loan_id, accrual_date)` blocks
+  double-accruing the same day. A no-op (not an error) when nothing is
+  currently drawn.
+- **Write-off** (`writeOffOverdraft`, dispatched from `writeOffLoan`) is
+  DIFFERENT from a term loan's write-off: the debt lives on the linked
+  savings account's negative balance, not on Loans Receivable (nothing was
+  ever posted there for an overdraft). Writing it off brings that balance
+  back to zero through `applyMovement` (txn_type `overdraft_writeoff`: Dr
+  Loan Loss Expense / Cr Customer Deposits) and resets
+  `overdraft_limit_pesewas` to 0.
+- **Closing** (`closeOverdraft`) requires the drawn balance already repaid
+  to zero (same precondition as closing an ordinary savings account),
+  resets `overdraft_limit_pesewas` to 0, and marks the loan `closed`.
+- **The real bug this replaced**: `savingsMath.assessWithdrawal` took an
+  `allowsOverdraft` boolean that, when true, skipped the balance/minimum-
+  balance check ENTIRELY — any account on an `allows_overdraft` product had
+  an *unlimited*, unattached overdraft. Likewise
+  `savingsService.applyMovement`'s `skipBalanceCheck` boolean fully
+  bypassed the `balanceAfter < 0` check. Both are now real numeric floors:
+  `assessWithdrawal({ ..., overdraftLimitPesewas })` checks
+  `balanceAfter >= minBalance - overdraftLimitPesewas`, and
+  `applyMovement({ ..., minAllowedBalancePesewas })` checks
+  `balanceAfter >= minAllowedBalancePesewas` (default 0). Callers derive
+  both from the account's actual `overdraft_limit_pesewas` — 0 for every
+  account without an active facility, so ordinary savings behavior is
+  unchanged.
+
 ### Savings / susu / standing orders — `backend/src/modules/savings/` (Module 4)
 
 `savingsMath.js` is pure (no db) and separately unit-tested, same split as
@@ -704,6 +775,8 @@ customer), which is why a deposit *credits* the control account:
 | **Agent remittance (banking it)** | Cash in Hand | **Cash with Agents (1030)** |
 | Agent commission accrual | Agent Commission Expense | Agent Commission Payable |
 | Susu cycle payout | Susu Deposits | Customer Deposits |
+| **Overdraft interest accrual (Module 3)** | Customer Deposits | Loan Interest Income |
+| **Overdraft write-off (Module 3)** | Loan Loss Expense | Customer Deposits |
 
 - **`1030` Cash with Agents answers Module 4's "BEFORE YOU WRITE CODE"
   question.** Cash an agent collects in the field is NOT branch cash until
@@ -753,6 +826,16 @@ customer), which is why a deposit *credits* the control account:
   `buildGlLines` callback so the funnel doesn't need to know every
   transaction type. Any future module touching savings balances should go
   through it rather than updating `balance_pesewas` directly.
+- **Overdraft is a real numeric floor, not a bypass** — fixed alongside
+  Module 3's overdraft loan work (see the Loan service section above for
+  the full design). `assessWithdrawal`'s `allowsOverdraft` boolean and
+  `applyMovement`'s `skipBalanceCheck` boolean previously disabled the
+  balance check ENTIRELY for any `allows_overdraft` account, i.e. an
+  unlimited, unattached overdraft. They are now `overdraftLimitPesewas`
+  and `minAllowedBalancePesewas` — real numbers callers derive from
+  `savings_accounts.overdraft_limit_pesewas` (0 unless an overdraft loan is
+  actually disbursed against the account), so the floor is always
+  `minBalance - actualApprovedLimit`, never "no floor at all".
 - **Standing orders never fail silently**: every run writes a
   `standing_order_runs` row; a failure records the reason, reschedules by
   the order's own `retry_after_days`, and suspends the order once
@@ -867,16 +950,26 @@ knowledge — plus any module prompt conflicts that need a human call._
       bureau lookup a precondition of loan approval** precisely because
       the stub's output is meaningless — wire that in when the real
       integration lands.
-- [ ] **Overdraft loans are still not implemented — but are now
-      unblocked.** `overdraft` is a valid `loan_type` and
-      `savings_products.allows_overdraft` now exists (Module 4 honours it
-      in `assessWithdrawal`, letting a flagged account go negative), so
-      the savings side of the dependency is in place. What is still
-      missing is Module 3 linking an overdraft loan to a savings account
-      and servicing it as a revolving facility rather than an amortizing
-      term loan — `applyForLoan()` would still build a term schedule for
-      it. Either finish it in Module 3 or reject `overdraft` at the
-      application boundary until someone does.
+- [x] ~~Overdraft loans are still not implemented.~~ **Resolved**:
+      migrations `032_overdraft.sql` / `033_overdraft_permissions_seed.sql`
+      + `loanService.js`'s `activateOverdraft` / `getOverdraftStatus` /
+      `accrueOverdraftInterest` / `closeOverdraft` / `writeOffOverdraft`.
+      `applyForLoan()` now links an overdraft loan to a specific existing
+      savings account and validates it (same customer, active, product
+      `allows_overdraft`); disbursement activates a real numeric limit on
+      that account with no schedule and no GL posting; drawing happens
+      through the ordinary savings withdrawal path; interest is accrued
+      (not recognized on receipt, unlike term loans — a deliberate
+      exception, see the Loan service section) and posted through
+      `savingsService.applyMovement`. **This also fixed a real bug**
+      uncovered while building it: `assessWithdrawal`'s `allowsOverdraft`
+      boolean and `applyMovement`'s `skipBalanceCheck` boolean previously
+      disabled the balance floor ENTIRELY for any `allows_overdraft`
+      account — an unlimited, unattached overdraft with no ties to an
+      actual approved facility. Both are now real numeric parameters
+      (`overdraftLimitPesewas` / `minAllowedBalancePesewas`) tied to
+      `savings_accounts.overdraft_limit_pesewas`, which is 0 unless an
+      overdraft loan is actually disbursed against that account.
 - [ ] **Interest is recognized on receipt, not accrual** (see the Loan
       service section). This is a coherent, simple model for a
       cash-basis microfinance book, but Module 8 (BOG prudential returns,

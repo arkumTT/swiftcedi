@@ -15,6 +15,7 @@ const { execFileSync } = require('child_process');
 const path = require('path');
 
 const loanService = require('../../src/modules/loan/loanService');
+const savingsService = require('../../src/modules/savings/savingsService');
 const branchService = require('../../src/modules/branch/branchService');
 const customerService = require('../../src/modules/customer/customerService');
 const approvalWorkflow = require('../../src/shared/approvalWorkflow');
@@ -47,6 +48,7 @@ describeIfDb('Module 3: loan management', () => {
     await pool.query('TRUNCATE audit_log RESTART IDENTITY CASCADE');
     await pool.query('TRUNCATE loan_repayments RESTART IDENTITY CASCADE');
     await pool.query('TRUNCATE savings_transactions, susu_collections RESTART IDENTITY CASCADE');
+    await pool.query('TRUNCATE overdraft_interest_accruals RESTART IDENTITY CASCADE');
     for (const table of [
       'standing_order_runs',
       'standing_orders',
@@ -88,6 +90,7 @@ describeIfDb('Module 3: loan management', () => {
     branchService.registerBranchExecutionHandlers();
     customerService.registerCustomerExecutionHandlers();
     loanService.registerLoanExecutionHandlers();
+    savingsService.registerSavingsExecutionHandlers();
 
     const { rows: roleRows } = await pool.query("SELECT id FROM roles WHERE name = 'owner'");
     ownerRoleId = roleRows[0].id;
@@ -145,6 +148,26 @@ describeIfDb('Module 3: loan management', () => {
       createdBy: maker,
       ...overrides,
     });
+  }
+
+  let savingsProductSeq = 0;
+  async function createOverdraftSavingsProduct() {
+    savingsProductSeq += 1;
+    return savingsService.createSavingsProduct(pool, {
+      name: `OD Savings ${savingsProductSeq}`,
+      code: `ODSAV${savingsProductSeq}`,
+      allowsOverdraft: true,
+      // High enough that ordinary test withdrawals pay out immediately
+      // rather than queuing for maker-checker approval — that flow is
+      // already covered by savingsModule.test.js.
+      withdrawalApprovalThresholdPesewas: 100000000,
+      createdBy: maker,
+    });
+  }
+
+  async function openOverdraftAccount(customer) {
+    const product = await createOverdraftSavingsProduct();
+    return savingsService.openAccount(pool, { customerId: customer.id, productId: product.id, createdBy: maker });
   }
 
   /** Runs decide() in its own transaction, the way the HTTP endpoint does. */
@@ -617,5 +640,254 @@ describeIfDb('Module 3: loan management', () => {
     await expect(
       pool.query('UPDATE loan_repayments SET journal_entry_id = NULL WHERE id = $1', [repayment.id])
     ).rejects.toThrow(/immutable/);
+  });
+
+  describe('overdraft loans', () => {
+    test('application requires a linked savings account', async () => {
+      const product = await createProduct({ loanType: 'overdraft' });
+      const customer = await createVerifiedCustomer('OD No Account Borrower');
+
+      await expect(
+        loanService.applyForLoan(pool, {
+          customerId: customer.id,
+          productId: product.id,
+          principalPesewas: 200000,
+          termMonths: 12,
+          appliedBy: maker,
+        })
+      ).rejects.toThrow(/overdraftSavingsAccountId is required/);
+    });
+
+    test('rejects a savings account that belongs to a different customer', async () => {
+      const product = await createProduct({ loanType: 'overdraft' });
+      const customer = await createVerifiedCustomer('OD Wrong Owner Borrower');
+      const otherCustomer = await createVerifiedCustomer('OD Other Owner');
+      const account = await openOverdraftAccount(otherCustomer);
+
+      await expect(
+        loanService.applyForLoan(pool, {
+          customerId: customer.id,
+          productId: product.id,
+          principalPesewas: 200000,
+          termMonths: 12,
+          overdraftSavingsAccountId: account.id,
+          appliedBy: maker,
+        })
+      ).rejects.toThrow(loanService.LoanValidationError);
+    });
+
+    test('rejects a savings account whose product does not allow overdraft', async () => {
+      const product = await createProduct({ loanType: 'overdraft' });
+      const customer = await createVerifiedCustomer('OD Non-Overdraft Product Borrower');
+      const ordinaryProduct = await savingsService.createSavingsProduct(pool, {
+        name: 'Ordinary Savings',
+        code: `ORD${Date.now()}`,
+        createdBy: maker,
+      });
+      const account = await savingsService.openAccount(pool, {
+        customerId: customer.id,
+        productId: ordinaryProduct.id,
+        createdBy: maker,
+      });
+
+      await expect(
+        loanService.applyForLoan(pool, {
+          customerId: customer.id,
+          productId: product.id,
+          principalPesewas: 200000,
+          termMonths: 12,
+          overdraftSavingsAccountId: account.id,
+          appliedBy: maker,
+        })
+      ).rejects.toThrow(loanService.LoanConflictError);
+    });
+
+    test('rejects overdraftSavingsAccountId on a non-overdraft product', async () => {
+      const product = await createProduct(); // individual
+      const customer = await createVerifiedCustomer('OD Mismatched Type Borrower');
+      const account = await openOverdraftAccount(customer);
+
+      await expect(
+        loanService.applyForLoan(pool, {
+          customerId: customer.id,
+          productId: product.id,
+          principalPesewas: 20000,
+          termMonths: 6,
+          overdraftSavingsAccountId: account.id,
+          appliedBy: maker,
+        })
+      ).rejects.toThrow(/only applicable to overdraft loans/);
+    });
+
+    test('a second overdraft cannot be opened against an account that already has an active one', async () => {
+      const product = await createProduct({ loanType: 'overdraft' });
+      const customer = await createVerifiedCustomer('OD Double Facility Borrower');
+      const account = await openOverdraftAccount(customer);
+
+      await loanService.applyForLoan(pool, {
+        customerId: customer.id,
+        productId: product.id,
+        principalPesewas: 100000,
+        termMonths: 12,
+        overdraftSavingsAccountId: account.id,
+        appliedBy: maker,
+      });
+
+      await expect(
+        loanService.applyForLoan(pool, {
+          customerId: customer.id,
+          productId: product.id,
+          principalPesewas: 50000,
+          termMonths: 12,
+          overdraftSavingsAccountId: account.id,
+          appliedBy: maker,
+        })
+      ).rejects.toThrow(/already has an active overdraft facility/);
+    });
+
+    test('activation posts no schedule and no GL entry; draws are limited to the real approved limit', async () => {
+      const product = await createProduct({ loanType: 'overdraft', annualInterestRateBps: 3000 });
+      const customer = await createVerifiedCustomer('OD Happy Path Borrower');
+      const account = await openOverdraftAccount(customer);
+
+      const loan = await loanService.applyForLoan(pool, {
+        customerId: customer.id,
+        productId: product.id,
+        principalPesewas: 500000,
+        termMonths: 12,
+        overdraftSavingsAccountId: account.id,
+        appliedBy: maker,
+      });
+      await loanService.submitAppraisal(pool, {
+        loanId: loan.id,
+        checklist: { verified: true },
+        recommendation: 'recommend',
+        appraiserId: maker,
+      });
+      const approval = await loanService.requestLoanApproval(pool, { loanId: loan.id, requestedBy: maker });
+      await decideAs(approval.id, checker);
+
+      const disbursed = await loanService.disburseLoan(pool, { loanId: loan.id, disbursedBy: maker });
+      expect(disbursed.status).toBe('disbursed');
+      expect(disbursed.journalEntry).toBeNull();
+      expect(disbursed.disbursement_journal_entry_id).toBeNull();
+
+      const schedule = await loanService.getLoanSchedule(pool, { loanId: loan.id });
+      expect(schedule).toHaveLength(0);
+
+      const updatedAccount = await savingsService.getAccount(pool, account.id);
+      expect(Number(updatedAccount.overdraft_limit_pesewas)).toBe(500000);
+
+      let status = await loanService.getOverdraftStatus(pool, { loanId: loan.id });
+      expect(status).toMatchObject({ limitPesewas: 500000, balancePesewas: 0, drawnPesewas: 0, availablePesewas: 500000 });
+
+      // Draw against the real limit via the ORDINARY withdrawal path.
+      const draw = await savingsService.requestWithdrawal(pool, { accountId: account.id, amountPesewas: 300000, requestedBy: maker });
+      expect(draw.paidOut).toBe(true);
+      expect(draw.balanceAfterPesewas).toBe(-300000);
+
+      status = await loanService.getOverdraftStatus(pool, { loanId: loan.id });
+      expect(status).toMatchObject({ balancePesewas: -300000, drawnPesewas: 300000, availablePesewas: 200000 });
+
+      // Drawing beyond the real limit is rejected — no unlimited bypass.
+      await expect(
+        savingsService.requestWithdrawal(pool, { accountId: account.id, amountPesewas: 250000, requestedBy: maker })
+      ).rejects.toThrow(/overdraft limit/);
+
+      // Accrue interest: balanced GL entry, debits Customer Deposits further.
+      const accrual = await loanService.accrueOverdraftInterest(pool, {
+        loanId: loan.id,
+        accrualDate: '2026-02-01',
+        days: 30,
+        accruedBy: maker,
+      });
+      expect(accrual.accrued).toBe(true);
+      const expectedInterest = Math.round((300000 * 3000 * 30) / (365 * 10000));
+      expect(accrual.interestPesewas).toBe(expectedInterest);
+      expect(accrual.journalEntry.lines).toHaveLength(2);
+      const [line1, line2] = accrual.journalEntry.lines;
+      expect(Number(line1.debit_pesewas) + Number(line2.debit_pesewas)).toBe(
+        Number(line1.credit_pesewas) + Number(line2.credit_pesewas)
+      );
+
+      // Re-accruing on the same day is rejected (no double-accrual).
+      await expect(
+        loanService.accrueOverdraftInterest(pool, { loanId: loan.id, accrualDate: '2026-02-01', days: 30, accruedBy: maker })
+      ).rejects.toThrow(/already accrued interest/);
+
+      const afterAccrual = await savingsService.getAccount(pool, account.id);
+      expect(Number(afterAccrual.balance_pesewas)).toBe(-300000 - expectedInterest);
+
+      // Closing while still drawn is rejected.
+      await expect(loanService.closeOverdraft(pool, { loanId: loan.id, closedBy: maker })).rejects.toThrow(
+        /outstanding — repay it first/
+      );
+
+      // Repay the full drawn balance, then close.
+      const outstanding = -Number(afterAccrual.balance_pesewas);
+      await savingsService.deposit(pool, { accountId: account.id, amountPesewas: outstanding, depositedBy: maker });
+      const closed = await loanService.closeOverdraft(pool, { loanId: loan.id, closedBy: maker });
+      expect(closed.status).toBe('closed');
+
+      const closedAccount = await savingsService.getAccount(pool, account.id);
+      expect(Number(closedAccount.overdraft_limit_pesewas)).toBe(0);
+      expect(Number(closedAccount.balance_pesewas)).toBe(0);
+    });
+
+    test('accrueOverdraftInterest is a no-op when nothing is drawn', async () => {
+      const product = await createProduct({ loanType: 'overdraft' });
+      const customer = await createVerifiedCustomer('OD No Draw Borrower');
+      const account = await openOverdraftAccount(customer);
+      const loan = await loanService.applyForLoan(pool, {
+        customerId: customer.id,
+        productId: product.id,
+        principalPesewas: 100000,
+        termMonths: 6,
+        overdraftSavingsAccountId: account.id,
+        appliedBy: maker,
+      });
+      await loanService.submitAppraisal(pool, { loanId: loan.id, checklist: {}, recommendation: 'recommend', appraiserId: maker });
+      const approval = await loanService.requestLoanApproval(pool, { loanId: loan.id, requestedBy: maker });
+      await decideAs(approval.id, checker);
+      await loanService.disburseLoan(pool, { loanId: loan.id, disbursedBy: maker });
+
+      const result = await loanService.accrueOverdraftInterest(pool, { loanId: loan.id, accruedBy: maker });
+      expect(result).toEqual({ loanId: Number(loan.id), accrued: false, interestPesewas: 0 });
+    });
+
+    test('write-off of a drawn overdraft debits Loan Loss Expense and credits Customer Deposits, zeroing the balance and the limit', async () => {
+      const product = await createProduct({ loanType: 'overdraft' });
+      const customer = await createVerifiedCustomer('OD Write-Off Borrower');
+      const account = await openOverdraftAccount(customer);
+      const loan = await loanService.applyForLoan(pool, {
+        customerId: customer.id,
+        productId: product.id,
+        principalPesewas: 200000,
+        termMonths: 6,
+        overdraftSavingsAccountId: account.id,
+        appliedBy: maker,
+      });
+      await loanService.submitAppraisal(pool, { loanId: loan.id, checklist: {}, recommendation: 'recommend', appraiserId: maker });
+      const approval = await loanService.requestLoanApproval(pool, { loanId: loan.id, requestedBy: maker });
+      await decideAs(approval.id, checker);
+      await loanService.disburseLoan(pool, { loanId: loan.id, disbursedBy: maker });
+
+      await savingsService.requestWithdrawal(pool, { accountId: account.id, amountPesewas: 150000, requestedBy: maker });
+
+      const writtenOff = await loanService.writeOffLoan(pool, { loanId: loan.id, reason: 'absconded', writtenOffBy: maker });
+      expect(writtenOff.status).toBe('written_off');
+      expect(writtenOff.writtenOffPrincipalPesewas).toBe(150000);
+
+      const lines = writtenOff.journalEntry.lines;
+      const glAccounts = await savingsService.getBranchGlAccounts(pool, branchId);
+      const expenseLine = lines.find((l) => Number(l.account_id) === Number(glAccounts.loan_loss_expense_account_id));
+      const depositsLine = lines.find((l) => Number(l.account_id) === Number(glAccounts.customer_deposits_account_id));
+      expect(Number(expenseLine.debit_pesewas)).toBe(150000);
+      expect(Number(depositsLine.credit_pesewas)).toBe(150000);
+
+      const finalAccount = await savingsService.getAccount(pool, account.id);
+      expect(Number(finalAccount.balance_pesewas)).toBe(0);
+      expect(Number(finalAccount.overdraft_limit_pesewas)).toBe(0);
+    });
   });
 });
