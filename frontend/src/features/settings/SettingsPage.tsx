@@ -1,5 +1,6 @@
 import { Card } from '../../components/Card';
 import { useThemePreferences, type Density, type ThemeMode } from '../../theme/ThemeContext';
+import { useNotificationPreferences, type NotificationKind } from '../../lib/notificationPreferences';
 import { useAuth } from '../../auth/AuthContext';
 import clsx from 'clsx';
 
@@ -70,6 +71,31 @@ function ToggleRow({
   );
 }
 
+const NOTIFICATION_CATEGORIES: { kind: NotificationKind; label: string; description: string; anyOf: string[] }[] = [
+  { kind: 'approval', label: 'Approvals awaiting me', description: 'A maker-checker action is pending my decision.', anyOf: ['approval.decide'] },
+  { kind: 'aml_flag', label: 'AML flags', description: 'A transaction was flagged for anti-money-laundering review.', anyOf: ['compliance.manage_aml'] },
+  { kind: 'job_failure', label: 'Scheduled job failures', description: 'A background job (interest accrual, standing orders, etc.) failed to run.', anyOf: ['sysadmin.manage_jobs'] },
+  { kind: 'reminder', label: 'Repayment & collection reminders', description: 'A loan repayment or susu collection is due soon.', anyOf: ['sysadmin.manage_jobs'] },
+];
+
+const CHANGELOG: { date: string; title: string; detail: string }[] = [
+  {
+    date: '26-Jul-2026',
+    title: 'Main Banking Application screens',
+    detail: 'Customers & CRM, Loans & Credit, Savings & Susu, Investments, Cashier & Vault, Transactions, Branches, Field Agents, Reports & Analytics, and Compliance & Regulatory are all now live.',
+  },
+  {
+    date: '26-Jul-2026',
+    title: 'Admin Back Office and Dashboard',
+    detail: 'Users & Roles, Roles & Permissions, Access & Approval Rules, Branches, Regulatory Templates, System Jobs, Audit Log, Backups, System Health, and the role-scoped main dashboard shipped.',
+  },
+  {
+    date: '25-Jul-2026',
+    title: 'Platform core (Modules 1–12)',
+    detail: 'Branch management, Customer/CRM, Loans, Savings & Susu, Investments, Cashier/Vault, General Ledger, Analytics, Field Agents, Compliance, RBAC/Audit, and System Administration were built end to end.',
+  },
+];
+
 export function SettingsPage() {
   const {
     themeMode,
@@ -83,7 +109,9 @@ export function SettingsPage() {
     largeText,
     setLargeText,
   } = useThemePreferences();
-  const { user, logout } = useAuth();
+  const { user, hasAnyPermission, logout } = useAuth();
+  const notificationPrefs = useNotificationPreferences();
+  const visibleNotificationCategories = NOTIFICATION_CATEGORIES.filter((c) => hasAnyPermission(c.anyOf));
 
   return (
     <div className="flex flex-col gap-4">
@@ -144,6 +172,25 @@ export function SettingsPage() {
         </div>
       </Card>
 
+      {visibleNotificationCategories.length > 0 && (
+        <Card title="Notifications">
+          <p className="mb-2 text-[13px] text-text-secondary">
+            Controls what shows up in the notification bell. In-app only for now — email and SMS delivery aren't wired up yet.
+          </p>
+          <div className="flex flex-col divide-y divide-border">
+            {visibleNotificationCategories.map((category) => (
+              <ToggleRow
+                key={category.kind}
+                label={category.label}
+                description={category.description}
+                checked={notificationPrefs[category.kind]}
+                onChange={(v) => notificationPrefs.setKindEnabled(category.kind, v)}
+              />
+            ))}
+          </div>
+        </Card>
+      )}
+
       <Card title="Account">
         <div className="flex flex-col gap-1 text-[13px]">
           <p>
@@ -174,6 +221,20 @@ export function SettingsPage() {
         >
           Sign out of this session
         </button>
+      </Card>
+
+      <Card title="What's new">
+        <div className="flex flex-col divide-y divide-border">
+          {CHANGELOG.map((entry) => (
+            <div key={entry.title} className="py-3 first:pt-0 last:pb-0">
+              <div className="flex items-baseline justify-between gap-2">
+                <p className="text-[13px] font-medium text-text-primary">{entry.title}</p>
+                <p className="shrink-0 text-[12px] text-text-muted">{entry.date}</p>
+              </div>
+              <p className="mt-0.5 text-[12.5px] text-text-secondary">{entry.detail}</p>
+            </div>
+          ))}
+        </div>
       </Card>
     </div>
   );

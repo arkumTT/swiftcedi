@@ -1,6 +1,7 @@
 import { useQuery } from '@tanstack/react-query';
 import { api } from './apiClient';
 import { useAuth } from '../auth/AuthContext';
+import { useNotificationPreferences } from './notificationPreferences';
 
 export interface NotificationItem {
   id: string;
@@ -46,6 +47,7 @@ interface ApprovalRow {
  */
 export function useNotifications() {
   const { hasAnyPermission } = useAuth();
+  const notificationPrefs = useNotificationPreferences();
 
   const canSeeReminders = hasAnyPermission(['sysadmin.manage_jobs']);
   const canSeeJobs = hasAnyPermission(['sysadmin.manage_jobs']);
@@ -110,7 +112,9 @@ export function useNotifications() {
       at: a.created_at,
       tone: 'warning' as const,
     })),
-  ].sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime());
+  ]
+    .filter((item) => notificationPrefs[item.kind])
+    .sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime());
 
   return {
     items,

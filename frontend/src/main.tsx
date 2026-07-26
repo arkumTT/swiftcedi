@@ -6,6 +6,7 @@ import './index.css';
 import App from './App.tsx';
 import { AuthProvider } from './auth/AuthContext';
 import { ThemeProvider } from './theme/ThemeContext';
+import { NotificationPreferencesProvider } from './lib/notificationPreferences';
 import { queryClient } from './lib/queryClient';
 
 createRoot(document.getElementById('root')!).render(
@@ -14,7 +15,9 @@ createRoot(document.getElementById('root')!).render(
       <QueryClientProvider client={queryClient}>
         <BrowserRouter>
           <AuthProvider>
-            <App />
+            <NotificationPreferencesProvider>
+              <App />
+            </NotificationPreferencesProvider>
           </AuthProvider>
         </BrowserRouter>
       </QueryClientProvider>

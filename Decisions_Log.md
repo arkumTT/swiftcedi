@@ -2141,6 +2141,42 @@ is completed._
     live regulator submission integration, and the modal says so, the
     same honesty pattern used for investment/redemption payment
     references elsewhere in this log.
+- **Settings & Preferences got two additions this pass: per-category
+  notification toggles and a "What's new" changelog card** — both
+  client-only, no backend changes.
+  - `NotificationPreferencesProvider` (`src/lib/notificationPreferences.tsx`)
+    is a `localStorage`-backed React Context, the exact same shape as
+    `ThemeContext`: read on mount, persist on every change, throw if the
+    hook is used outside the Provider. There is no per-user preferences
+    table (same reasoning as the density/reduced-motion/high-contrast
+    settings above), so this is in-app-only and does not follow a user
+    across devices — the Settings copy says so explicitly ("In-app only
+    for now — email and SMS delivery aren't wired up yet"), rather than
+    implying a channel that doesn't exist.
+  - `useNotifications()` (`src/lib/notifications.ts`) filters its final
+    constructed `items` array by `notificationPrefs[item.kind]` rather
+    than gating each source query's `enabled` flag by the same
+    preference. Both were tried; gating `enabled` was reverted because
+    React Query does not clear a query's cached `.data` when `enabled`
+    transitions to `false`, so a category toggled off mid-session would
+    still show its last-fetched (stale) items until an unrelated refetch
+    cleared them — filtering the constructed array is correct regardless
+    of cache state and was verified live: toggling "Approvals awaiting
+    me" off in Settings immediately emptied that category from the bell
+    dropdown, which had been showing one real pending `savings.withdraw`
+    approval.
+  - Each toggle row is only shown if the caller holds the permission that
+    already gates that category's underlying source screen (mirrors the
+    per-source gating already documented for `NotificationCenter` above),
+    so a role without `compliance.manage_aml` never even sees an "AML
+    flags" toggle to turn on or off.
+  - The "What's new" card is a static, hand-written array of dated
+    entries describing what actually shipped this session (verified
+    against the task list, not invented feature claims) — there is no
+    backend release/changelog table, and building one for a single static
+    list was judged out of scope; flagged as a candidate for a real
+    changelog endpoint if this becomes a maintained product rather than a
+    single build session.
 
 ---
 
