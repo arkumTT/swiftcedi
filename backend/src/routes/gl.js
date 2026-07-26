@@ -4,19 +4,24 @@ const express = require('express');
 const { requireAuth } = require('../middleware/auth');
 const { requirePermission } = require('../middleware/requirePermission');
 const { asyncHandler } = require('../utils/asyncHandler');
-const auditLog = require('../shared/auditLog');
 const glPosting = require('../shared/glPosting');
+const glService = require('../modules/gl/glService');
 
+// Route order: fixed-prefix paths (/accounts/rollup, /reports/..., /manual-
+// entries/:id/post, /bank-accounts/:id/statement-lines) are registered
+// before any /:id catch-all — see Decisions_Log.md's route ordering rule.
 function glRouter(pool) {
   const router = express.Router();
   const auth = requireAuth(pool);
+
+  // --- Chart of accounts ---------------------------------------------------
 
   router.get(
     '/accounts',
     auth,
     asyncHandler(async (req, res) => {
-      const { rows } = await pool.query('SELECT * FROM gl_accounts ORDER BY code');
-      res.json(rows);
+      const { branchId, accountType, status } = req.query;
+      res.json(await glService.listGlAccounts(pool, { branchId, accountType, status }));
     })
   );
 
@@ -26,53 +31,31 @@ function glRouter(pool) {
     requirePermission('gl.manage_accounts'),
     asyncHandler(async (req, res) => {
       const { code, name, accountType, branchId, parentAccountId } = req.body || {};
-      if (!code || !name || !accountType) {
-        return res.status(400).json({ error: 'code, name, accountType are required' });
-      }
-
-      const { rows } = await pool.query(
-        `INSERT INTO gl_accounts (code, name, account_type, branch_id, parent_account_id)
-         VALUES ($1, $2, $3, $4, $5)
-         RETURNING *`,
-        [code, name, accountType, branchId || null, parentAccountId || null]
-      );
-      await auditLog.record(pool, {
-        userId: req.user.id,
-        branchId: req.user.homeBranchId,
-        action: 'gl.account_created',
-        entityType: 'gl_account',
-        entityId: rows[0].id,
-        afterState: rows[0],
+      const account = await glService.createGlAccount(pool, {
+        code,
+        name,
+        accountType,
+        branchId: branchId || null,
+        parentAccountId: parentAccountId || null,
+        createdBy: req.user.id,
+        actorBranchId: req.user.homeBranchId,
       });
-      res.status(201).json(rows[0]);
+      res.status(201).json(account);
     })
   );
 
-  router.post(
-    '/journal-entries',
+  router.patch(
+    '/accounts/:id',
     auth,
-    requirePermission('gl.post_journal'),
+    requirePermission('gl.manage_accounts'),
     asyncHandler(async (req, res) => {
-      const { reference, description, entryDate, sourceModule, entryType, lines, approvedBy } = req.body || {};
-      try {
-        const result = await glPosting.postJournalEntry(pool, {
-          branchId: req.user.homeBranchId,
-          reference,
-          description,
-          entryDate,
-          sourceModule: sourceModule || 'manual_jv',
-          createdBy: req.user.id,
-          approvedBy: approvedBy || null,
-          entryType: entryType || 'standard',
-          lines,
-        });
-        res.status(201).json(result);
-      } catch (err) {
-        if (err instanceof glPosting.GlPostingValidationError || err instanceof glPosting.PeriodLockedError) {
-          return res.status(400).json({ error: err.message });
-        }
-        throw err;
-      }
+      const account = await glService.updateGlAccount(pool, {
+        accountId: req.params.id,
+        updatedBy: req.user.id,
+        actorBranchId: req.user.homeBranchId,
+        fields: req.body || {},
+      });
+      res.json(account);
     })
   );
 
@@ -82,19 +65,193 @@ function glRouter(pool) {
     requirePermission('gl.view_reports'),
     asyncHandler(async (req, res) => {
       const { asOfDate, branchId } = req.query;
-      try {
-        const balancePesewas = await glPosting.getAccountBalance(pool, {
-          accountId: req.params.id,
-          asOfDate: asOfDate || null,
-          branchId: branchId || null,
-        });
-        res.json({ accountId: Number(req.params.id), asOfDate: asOfDate || null, balancePesewas });
-      } catch (err) {
-        if (err instanceof glPosting.GlPostingValidationError) {
-          return res.status(404).json({ error: err.message });
-        }
-        throw err;
-      }
+      const balancePesewas = await glPosting.getAccountBalance(pool, {
+        accountId: req.params.id,
+        asOfDate: asOfDate || null,
+        branchId: branchId || null,
+      });
+      res.json({ accountId: Number(req.params.id), asOfDate: asOfDate || null, balancePesewas });
+    })
+  );
+
+  // --- Journal entries ------------------------------------------------------
+
+  router.post(
+    '/journal-entries',
+    auth,
+    requirePermission('gl.post_journal'),
+    asyncHandler(async (req, res) => {
+      const { reference, description, entryDate, sourceModule, entryType, lines, approvedBy } = req.body || {};
+      const result = await glPosting.postJournalEntry(pool, {
+        branchId: req.user.homeBranchId,
+        reference,
+        description,
+        entryDate,
+        sourceModule: sourceModule || 'manual_jv',
+        createdBy: req.user.id,
+        approvedBy: approvedBy || null,
+        entryType: entryType || 'standard',
+        lines,
+      });
+      res.status(201).json(result);
+    })
+  );
+
+  // --- Manual JV (maker-checker) --------------------------------------------
+
+  router.post(
+    '/manual-entries',
+    auth,
+    requirePermission('gl.request_manual_jv'),
+    asyncHandler(async (req, res) => {
+      const { branchId, entryDate, description, lines } = req.body || {};
+      const result = await glService.requestManualJournalEntry(pool, {
+        branchId: branchId || req.user.homeBranchId,
+        entryDate,
+        description,
+        lines,
+        requestedBy: req.user.id,
+      });
+      res.status(202).json(result);
+    })
+  );
+
+  router.post(
+    '/manual-entries/:id/post',
+    auth,
+    requirePermission('gl.post_journal'),
+    asyncHandler(async (req, res) => {
+      const result = await glService.postApprovedManualJournalEntry(pool, {
+        entryId: req.params.id,
+        postedBy: req.user.id,
+      });
+      res.json(result);
+    })
+  );
+
+  // --- Reports ---------------------------------------------------------------
+
+  router.get(
+    '/reports/trial-balance',
+    auth,
+    requirePermission('gl.view_reports'),
+    asyncHandler(async (req, res) => {
+      const { asOfDate, branchId } = req.query;
+      res.json(await glService.getTrialBalance(pool, { asOfDate, branchId: branchId || null }));
+    })
+  );
+
+  router.get(
+    '/reports/balance-sheet',
+    auth,
+    requirePermission('gl.view_reports'),
+    asyncHandler(async (req, res) => {
+      const { asOfDate, branchId } = req.query;
+      res.json(await glService.getBalanceSheet(pool, { asOfDate, branchId: branchId || null }));
+    })
+  );
+
+  router.get(
+    '/reports/income-statement',
+    auth,
+    requirePermission('gl.view_reports'),
+    asyncHandler(async (req, res) => {
+      const { fromDate, toDate, branchId } = req.query;
+      res.json(await glService.getIncomeStatement(pool, { fromDate, toDate, branchId: branchId || null }));
+    })
+  );
+
+  router.get(
+    '/reports/daily-balance-summary',
+    auth,
+    requirePermission('gl.view_reports'),
+    asyncHandler(async (req, res) => {
+      const { date, branchId } = req.query;
+      res.json(await glService.getDailyBalanceSummary(pool, { date, branchId: branchId || null }));
+    })
+  );
+
+  router.get(
+    '/reports/annual-transactions',
+    auth,
+    requirePermission('gl.view_reports'),
+    asyncHandler(async (req, res) => {
+      const { year, branchId } = req.query;
+      res.json(await glService.getAnnualTransactionReport(pool, { year: Number(year), branchId: branchId || null }));
+    })
+  );
+
+  // --- Bank reconciliation ----------------------------------------------------
+
+  router.get(
+    '/bank-accounts',
+    auth,
+    requirePermission('gl.reconcile_bank'),
+    asyncHandler(async (req, res) => {
+      const { branchId, status } = req.query;
+      res.json(await glService.listBankAccounts(pool, { branchId, status }));
+    })
+  );
+
+  router.post(
+    '/bank-accounts',
+    auth,
+    requirePermission('gl.manage_accounts'),
+    asyncHandler(async (req, res) => {
+      const { glAccountId, branchId, bankName, accountNumber } = req.body || {};
+      const bankAccount = await glService.createBankAccount(pool, {
+        glAccountId,
+        branchId: branchId || null,
+        bankName,
+        accountNumber,
+        createdBy: req.user.id,
+        actorBranchId: req.user.homeBranchId,
+      });
+      res.status(201).json(bankAccount);
+    })
+  );
+
+  router.post(
+    '/bank-accounts/:id/statement-lines',
+    auth,
+    requirePermission('gl.reconcile_bank'),
+    asyncHandler(async (req, res) => {
+      const { lines } = req.body || {};
+      const result = await glService.importStatementLines(pool, {
+        bankAccountId: req.params.id,
+        lines,
+        uploadedBy: req.user.id,
+        actorBranchId: req.user.homeBranchId,
+      });
+      res.status(201).json(result);
+    })
+  );
+
+  router.post(
+    '/statement-lines/:id/match',
+    auth,
+    requirePermission('gl.reconcile_bank'),
+    asyncHandler(async (req, res) => {
+      const { journalLineId } = req.body || {};
+      const result = await glService.matchStatementLine(pool, {
+        statementLineId: req.params.id,
+        journalLineId,
+        matchedBy: req.user.id,
+        actorBranchId: req.user.homeBranchId,
+      });
+      res.json(result);
+    })
+  );
+
+  router.get(
+    '/bank-accounts/:id/reconciliation',
+    auth,
+    requirePermission('gl.reconcile_bank'),
+    asyncHandler(async (req, res) => {
+      const { asOfDate } = req.query;
+      const params = { bankAccountId: req.params.id };
+      if (asOfDate) params.asOfDate = asOfDate;
+      res.json(await glService.getBankReconciliation(pool, params));
     })
   );
 

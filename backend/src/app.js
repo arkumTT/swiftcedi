@@ -21,6 +21,7 @@ const { registerSavingsExecutionHandlers } = require('./modules/savings/savingsS
 const { registerInvestmentExecutionHandlers } = require('./modules/investment/investmentService');
 const { registerCashierExecutionHandlers } = require('./modules/cashier/cashierService');
 const { registerGlExecutionHandlers } = require('./shared/glPosting');
+const { registerGlModuleExecutionHandlers } = require('./modules/gl/glService');
 const { requireAuth } = require('./middleware/auth');
 const { asyncHandler } = require('./utils/asyncHandler');
 
@@ -39,6 +40,7 @@ function createApp(pool) {
   registerInvestmentExecutionHandlers();
   registerCashierExecutionHandlers();
   registerGlExecutionHandlers();
+  registerGlModuleExecutionHandlers();
 
   app.get('/health', (req, res) => res.json({ status: 'ok' }));
 

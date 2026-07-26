@@ -275,6 +275,9 @@ values, loan status values, account status values._
 | `transaction_reversals.status` | `pending`, `approved`, `reversed`, `rejected` | 6 — same never-jumps-straight-to-executed shape as `investment_redemptions.status` |
 | `day_close_snapshots.period_type` | `day`, `month`, `year` | 6 — `month`/`year` also create+lock a `gl_periods` row; `day` has no `gl_periods` equivalent (that table only supports month/year), so a day-lock is enforced by `cashierService` itself, not `glPosting` |
 | `gl_prior_period_adjustments.status` | `pending`, `approved`, `posted`, `rejected` | 6/7 (shared `glPosting.js`, added while building Module 6 — see the Cashier service section) |
+| `gl_manual_entries.status` | `pending`, `approved`, `posted`, `rejected` | 7 — same shape as `gl_prior_period_adjustments.status`, deliberately a separate table (see the GL service section) |
+| `bank_accounts.status` | `active`, `inactive` | 7 |
+| `bank_statement_lines.status` | `unmatched`, `matched` | 7 — `matched` requires (and is the only status paired with) a non-null `matched_journal_line_id`, enforced by a CHECK constraint |
 
 **`branches.status` transition table** (`branchService.VALID_STATUS_TRANSITIONS`):
 
@@ -1138,6 +1141,108 @@ registerCashierExecutionHandlers()  // 'cashback.request' + 'gl.reversal'
   `'day'` has no `gl_periods` equivalent, so its lock is enforced by
   `assertDayNotLocked()` inside `cashierService` itself, checked before
   every `openTill()`.
+
+### GL, accounting & financial reporting service — `backend/src/modules/gl/glService.js` (Module 7)
+
+`glPosting.js` (shared, above) is the cross-module POSTING primitive every
+module calls into; `glService.js` is Module 7's OWN business logic layered
+on top — chart-of-accounts admin, the financial statements, the manual-JV
+maker-checker workflow, and bank reconciliation. Same split as every other
+module (`approvalWorkflow.js`/`glPosting.js` shared vs. `loanService.js`
+Module 3's own logic).
+
+```js
+// glService.js
+listGlAccounts(pool, { branchId, accountType, status }) -> gl_accounts[]
+createGlAccount(pool, { code, name, accountType, branchId, parentAccountId, createdBy, actorBranchId }) -> gl_account
+updateGlAccount(pool, { accountId, updatedBy, actorBranchId, fields }) -> gl_account  // name/status always editable; code/accountType only pre-activity; branchId/parentAccountId never editable
+getTrialBalance(pool, { asOfDate, branchId }) / getBalanceSheet(pool, { asOfDate, branchId }) / getIncomeStatement(pool, { fromDate, toDate, branchId }) / getDailyBalanceSummary(pool, { date, branchId }) / getAnnualTransactionReport(pool, { year, branchId })
+requestManualJournalEntry(pool, { branchId, entryDate, description, lines, requestedBy }) -> { entry, approvalRequest }  // ALWAYS maker-checker
+postApprovedManualJournalEntry(pool, { entryId, postedBy }) -> { entry, journalEntry }
+createBankAccount(pool, { glAccountId, branchId, bankName, accountNumber, createdBy, actorBranchId }) -> bank_account  // glAccountId must already exist and be account_type='asset'
+importStatementLines(pool, { bankAccountId, lines, uploadedBy, actorBranchId }) -> bank_statement_lines[]
+matchStatementLine(pool, { statementLineId, journalLineId, matchedBy, actorBranchId }) -> bank_statement_line
+getBankReconciliation(pool, { bankAccountId, asOfDate }) -> { glBalancePesewas, statementBalancePesewas, outstandingOnStatementNotInGl, outstandingInGlNotOnStatement, adjustedGlBalancePesewas, adjustedStatementBalancePesewas, reconciled }
+registerGlModuleExecutionHandlers()  // 'gl.manual_jv'
+```
+
+- **Financial statements are all built on one shared rollup query,
+  `getAccountRollup`** — reconstructed from `gl_journal_lines` directly
+  (never a running balance), for either a point in time (`asOfDate`) or a
+  period (`fromDate`..`toDate`). Every account maps to
+  `COALESCE(parent_account_id, id)`: a branch's own sub-account (e.g.
+  `1000.NRA-01`) rolls up into its org-wide control row (`1000`). Passing
+  `branchId` restricts to that branch's own accounts (a branch-level
+  statement); omitting it aggregates every branch under each control row
+  (a consolidated statement). Zero-activity accounts still appear (LEFT
+  JOIN), matching standard trial-balance convention.
+- **Balance sheet's "Net Income (current period)" is a plug, not a real
+  equity account** — income minus expense (same as-of date/scope) shown as
+  its own equity line, since nothing in this codebase formally closes
+  income/expense into retained earnings at period-end. This is what makes
+  `Assets = Liabilities + Equity` hold by construction (the fundamental
+  accounting identity, guaranteed as long as every posted entry balanced,
+  which `glPosting.js` already enforces) rather than an approximation.
+- **Manual JV (`gl_manual_entries`, migration 041) is ALWAYS maker-checker,
+  no threshold** — same reasoning as `loan.approve`/`investment.book`/
+  `investment.redeem`/`gl.reversal`/`gl.prior_period_adjustment`: a
+  hand-entered manual JV has no natural "product" to hang a configurable
+  default threshold off, and it's arguably the single most arbitrary,
+  error-prone entry point in the system (no business-rule validation
+  beyond "it balances," unlike every module's own postings which are
+  already gated by that module's own upstream approval step). Deliberately
+  a SEPARATE table from `gl_prior_period_adjustments` (migration 038)
+  despite the nearly identical shape: that one is specifically for
+  corrections into a LOCKED period (`entryType: 'prior_period_adjustment'`);
+  this one is for ordinary open-period entries (`entryType: 'standard'`) —
+  reusing the other's name here would be misleading for an everyday
+  in-period JV. Same two-phase shape as every other approval-gated GL
+  posting: the registered execution handler only flips the entry to
+  `approved` inside `decide()`'s transaction (`postJournalEntry` owns its
+  own transaction, can't run inside `decide()`'s); the actual posting is a
+  separate, explicit follow-up call. `lines` is snapshotted at request time
+  so what eventually posts can never silently drift from what a checker
+  reviewed. If the target period has since been locked,
+  `postApprovedManualJournalEntry` lets `postJournalEntry` itself throw
+  `PeriodLockedError` rather than silently reclassifying as a prior-period
+  adjustment — the requester must use that dedicated workflow instead.
+- **Bank reconciliation (`bank_accounts` / `bank_statement_lines`,
+  migration 042) deliberately does NOT auto-create a bank GL sub-account
+  per branch** the way cash-in-hand/vault/cash-in-transit do
+  (`branchService.js`'s `CONTROL_ACCOUNT_CODES`/`createSubAccount`
+  pattern) — unlike cash and a vault, not every branch necessarily holds
+  its own bank account, so registering one is an explicit, occasional
+  admin action (`createBankAccount`, linking an already-existing asset
+  account created via the ordinary chart-of-accounts endpoints) rather
+  than something every branch needs at creation time.
+- **`bank_statement_lines.amount_pesewas` is signed from the bank's own
+  point of view** (positive = money in, negative = money out) — this lines
+  up directly with `normalizeBalance('asset', debit, credit)` since a bank
+  account is a debit-normal asset, so a matched GL journal line's
+  `debit_pesewas - credit_pesewas` must equal the statement line's
+  `amount_pesewas` exactly. `matchStatementLine` enforces this equality —
+  never a fuzzy/tolerance match — and a GL journal line can settle at most
+  one statement line (`bank_statement_lines_matched_journal_line_uidx`).
+- **`reconciled` means "every transaction on both sides has been matched,"
+  not "the adjusted balances agree."** A real bug caught during this
+  module's own integration testing: the initially-written formula compared
+  `glBalance + unmatchedStatementTotal` against
+  `statementBalance + unmatchedJournalTotal` and called them "reconciled"
+  when equal — but algebraically that difference always reduces to
+  `matchedJournalTotal - matchedStatementTotal`, which is always zero
+  (every match is validated to have equal amounts by construction), making
+  the check a tautology: it read `reconciled: true` even for a wholly
+  fictitious, unmatched GL entry with zero bank corroboration. Fixed by
+  redefining `reconciled` as `outstandingOnStatementNotInGl.length === 0 &&
+  outstandingInGlNotOnStatement.length === 0` — genuinely meaningful,
+  since it can only be true once every line has a validated, exactly-equal
+  counterpart. The adjusted-balance figures are still returned (a useful
+  "projected true cash position" once outstanding items clear as expected)
+  but are no longer treated as the pass/fail signal.
+- **GL-to-customer-account reconciliation** (the spec's other reconciliation
+  report) is already satisfied by Module 4's `reconcileAccount`/
+  `reconcileBranchDeposits` — no new endpoint was added here to avoid a
+  second, parallel reconciliation mechanism for the same concern.
 
 ---
 
