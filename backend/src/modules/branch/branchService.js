@@ -658,6 +658,19 @@ async function listActiveCrossBranchGrants(pool, { userId }) {
   return rows.filter((grant) => isGrantActive(grant));
 }
 
+/** All grants (active, expired, and revoked) for one branch, with the grantee's name — the admin "Access & Approval Rules" screen's list view, as opposed to listActiveCrossBranchGrants' per-user active-only check used by requirePermission.js. */
+async function listCrossBranchGrantsForBranch(pool, { branchId }) {
+  const { rows } = await pool.query(
+    `SELECT g.*, u.full_name AS user_full_name, u.email AS user_email
+       FROM cross_branch_access_grants g
+       JOIN users u ON u.id = g.user_id
+      WHERE g.branch_id = $1
+      ORDER BY g.start_date DESC`,
+    [branchId]
+  );
+  return rows;
+}
+
 // --- Cash-in-transit branch transfers -----------------------------------------
 
 async function initiateTransfer(pool, { sourceBranchId, destinationBranchId, amountPesewas, reason = null, initiatedBy }) {
@@ -872,6 +885,7 @@ module.exports = {
   grantCrossBranchAccess,
   revokeCrossBranchAccess,
   listActiveCrossBranchGrants,
+  listCrossBranchGrantsForBranch,
   initiateTransfer,
   getTransfer,
   confirmTransfer,

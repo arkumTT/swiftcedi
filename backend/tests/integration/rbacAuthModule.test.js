@@ -301,4 +301,98 @@ describeIfDb('RBAC/auth HTTP routes (Module 11 additions)', () => {
       .send({ status: 'suspended' });
     expect(notFound.status).toBe(404);
   });
+
+  test('GET /approvals lists approval_requests and filters by status/actionType', async () => {
+    await pool.query(
+      `INSERT INTO approval_requests (action_type, entity_type, entity_id, branch_id, amount_pesewas, requested_by, status)
+       VALUES ('loan.disburse', 'loan', '1', $1, 500000, $2, 'pending')`,
+      [hqBranchId, adminUserId]
+    );
+
+    const all = await request(app).get('/approvals').set('Authorization', `Bearer ${adminToken}`);
+    expect(all.status).toBe(200);
+    expect(all.body.some((a) => a.action_type === 'loan.disburse')).toBe(true);
+
+    const byStatus = await request(app)
+      .get('/approvals')
+      .query({ status: 'pending', actionType: 'loan.disburse' })
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(byStatus.body.every((a) => a.status === 'pending' && a.action_type === 'loan.disburse')).toBe(true);
+  });
+
+  test('GET /approvals requires approval.decide', async () => {
+    const passwordHash = await hashPassword('TestPassword123!');
+    const { rows: loanOfficerRoleRows } = await pool.query("SELECT id FROM roles WHERE name = 'loan_officer'");
+    await pool.query(
+      `INSERT INTO users (full_name, email, password_hash, role_id, home_branch_id)
+       VALUES ($1, $2, $3, $4, $5)`,
+      ['No Decide Permission', 'no-decide@test.local', passwordHash, loanOfficerRoleRows[0].id, hqBranchId]
+    );
+    const loginRes = await request(app)
+      .post('/auth/login')
+      .send({ email: 'no-decide@test.local', password: 'TestPassword123!' });
+    const res = await request(app).get('/approvals').set('Authorization', `Bearer ${loginRes.body.token}`);
+    expect(res.status).toBe(403);
+  });
+
+  test('GET/POST/PATCH /approvals/thresholds round-trips a threshold, upserts on the same action/branch pair, and validates required fields', async () => {
+    const missingFields = await request(app)
+      .post('/approvals/thresholds')
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ actionType: 'test.threshold' });
+    expect(missingFields.status).toBe(400);
+
+    const created = await request(app)
+      .post('/approvals/thresholds')
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ actionType: 'test.threshold', amountThresholdPesewas: 100000, requiredApproverRoleId: ownerRoleId });
+    expect(created.status).toBe(201);
+    expect(Number(created.body.amount_threshold_pesewas)).toBe(100000);
+
+    const upserted = await request(app)
+      .post('/approvals/thresholds')
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ actionType: 'test.threshold', amountThresholdPesewas: 250000, requiredApproverRoleId: ownerRoleId });
+    expect(Number(upserted.body.id)).toBe(Number(created.body.id));
+    expect(Number(upserted.body.amount_threshold_pesewas)).toBe(250000);
+
+    const list = await request(app)
+      .get('/approvals/thresholds')
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(list.body.some((t) => Number(t.id) === Number(created.body.id))).toBe(true);
+
+    const patched = await request(app)
+      .patch(`/approvals/thresholds/${created.body.id}`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ amountThresholdPesewas: 300000 });
+    expect(Number(patched.body.amount_threshold_pesewas)).toBe(300000);
+
+    const notFound = await request(app)
+      .patch('/approvals/thresholds/999999')
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ amountThresholdPesewas: 1 });
+    expect(notFound.status).toBe(404);
+  });
+
+  test('GET /branches/:id/cross-branch-grants lists grants for a branch, including revoked ones', async () => {
+    const passwordHash = await hashPassword('TestPassword123!');
+    const { rows: granteeRows } = await pool.query(
+      `INSERT INTO users (full_name, email, password_hash, role_id, home_branch_id)
+       VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+      ['Grant Recipient', 'grant-recipient@test.local', passwordHash, ownerRoleId, hqBranchId]
+    );
+
+    const grantRes = await request(app)
+      .post(`/branches/${hqBranchId}/cross-branch-grants`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ userId: granteeRows[0].id, startDate: '2026-01-01', endDate: '2026-12-31' });
+    expect(grantRes.status).toBe(201);
+
+    const list = await request(app)
+      .get(`/branches/${hqBranchId}/cross-branch-grants`)
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(list.status).toBe(200);
+    expect(list.body.some((g) => Number(g.id) === Number(grantRes.body.id))).toBe(true);
+    expect(list.body[0]).toHaveProperty('user_full_name');
+  });
 });

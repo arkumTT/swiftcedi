@@ -260,6 +260,15 @@ function branchesRouter(pool) {
     })
   );
 
+  router.get(
+    '/:id/cross-branch-grants',
+    auth,
+    requirePermission('branch.manage_staff'),
+    asyncHandler(async (req, res) => {
+      res.json(await branchService.listCrossBranchGrantsForBranch(pool, { branchId: req.params.id }));
+    })
+  );
+
   router.post(
     '/:id/cross-branch-grants',
     auth,

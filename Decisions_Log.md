@@ -171,7 +171,9 @@ authentication header, versioning approach._
   (no `/api/v1` prefix yet — add versioning when a breaking change is
   actually needed, not preemptively): `/auth/me`, `/rbac/roles`,
   `/rbac/roles/:roleId/permissions`, `/rbac/users`,
-  `/rbac/users/:userId/status`,
+  `/rbac/users/:userId/status`, `/approvals` (GET, the review queue),
+  `/approvals/thresholds`, `/approvals/thresholds/:id`,
+  `/branches/:id/cross-branch-grants` (GET, list),
   `/audit-log`, `/approvals`, `/gl/accounts`, `/gl/journal-entries`,
   `/branches`, `/branches/regions`, `/branches/clusters`,
   `/branches/transfers`, `/branches/:id/status`,
@@ -575,6 +577,30 @@ validateBalancedLines(lines) -> void  // pure, throws UnbalancedEntryError; no d
   methods + a Bearer header, no cookies) doesn't need it. Required once a
   frontend SPA (necessarily a different origin from this API in any real
   deployment) exists to call it from a browser.
+- **`approvalWorkflow.listApprovals(db, { status, actionType, entityType,
+  branchId })` added** — `approval_requests` had a request/decide path since
+  Module 11 but no way to LIST them at all; every "approval queue" screen
+  the frontend needs (Admin's Access & Approval Rules, a notification
+  center, any module's own "approval trail" view) needs this. Exposed as
+  `GET /approvals`, gated by `approval.decide` (the reviewer-queue
+  permission) since it's a queue of things to decide, not a personal
+  request history.
+- **`approval_thresholds` CRUD added** (`GET/POST /approvals/thresholds`,
+  `PATCH /approvals/thresholds/:id`) — the table has existed since
+  migration 003 but was config-by-migration-only; a new
+  `approval.manage_thresholds` permission (owner + system_admin, migration
+  052) gates it. `POST` upserts on the `(action_type, branch_id)` unique
+  index rather than erroring on a duplicate — "set the threshold for X" is
+  the natural admin mental model, not "create a new threshold row and
+  reject if one exists."
+- **`branchService.listCrossBranchGrantsForBranch(pool, { branchId })` +
+  `GET /branches/:id/cross-branch-grants` added** — the existing
+  `listActiveCrossBranchGrants` is scoped to one user's currently-active
+  grants (used by `requireAuth`'s own branch-scope resolution); the admin
+  "Access & Approval Rules" screen needs the inverse view — every grant
+  (active, expired, revoked) for one branch, with the grantee's name — so
+  this is a new function alongside it, not a modification of the
+  permission-check path.
 
 ### Branch service — `backend/src/modules/branch/branchService.js` (Module 1)
 

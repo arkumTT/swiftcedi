@@ -4,6 +4,7 @@ const {
   isApprovalRequired,
   requestApproval,
   decide,
+  listApprovals,
   registerExecutionHandler,
   ApprovalValidationError,
   ApprovalNotFoundError,
@@ -198,5 +199,28 @@ describe('decide', () => {
 
     expect(explicitExecute).toHaveBeenCalledWith(updated, db);
     expect(registeredHandler).not.toHaveBeenCalled();
+  });
+});
+
+describe('listApprovals', () => {
+  test('queries with no filters when none are given', async () => {
+    const rows = [{ id: 1 }, { id: 2 }];
+    const db = makeSequentialDb([{ rows }]);
+    const result = await listApprovals(db, {});
+    expect(result).toBe(rows);
+    const [sql, params] = db.query.mock.calls[0];
+    expect(sql).not.toMatch(/WHERE/);
+    expect(params).toEqual([]);
+  });
+
+  test('builds a parameterized WHERE clause from provided filters', async () => {
+    const db = makeSequentialDb([{ rows: [] }]);
+    await listApprovals(db, { status: 'pending', actionType: 'loan.disburse', entityType: 'loan', branchId: 3 });
+    const [sql, params] = db.query.mock.calls[0];
+    expect(sql).toMatch(/status = \$1/);
+    expect(sql).toMatch(/action_type = \$2/);
+    expect(sql).toMatch(/entity_type = \$3/);
+    expect(sql).toMatch(/branch_id = \$4/);
+    expect(params).toEqual(['pending', 'loan.disburse', 'loan', 3]);
   });
 });
