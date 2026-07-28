@@ -2292,6 +2292,20 @@ once and applied everywhere._
   so nothing else changes. The frontend sends `branchId=all` explicitly
   for owner/system_admin's dashboard queries — see
   `frontend/src/lib/roleScope.ts`.
+- **`npm run dev`/`npm start` now bootstrap the database automatically**
+  (`predev`/`prestart` run `migrate` then `seed:admin` before the server
+  starts) rather than requiring migrations and the first admin user to
+  be created as separate manual steps — this matters most for a fresh
+  deploy (e.g. Railway), where forgetting either step previously meant
+  the app came up against an unmigrated schema or with no way to log in.
+  `seedAdmin.js` itself changed to match: it used to `throw` if
+  `SEED_ADMIN_PASSWORD` wasn't set (correct for a deliberate standalone
+  invocation, wrong for something now wired into every server boot) — it
+  now logs a line and no-ops instead, so `npm run dev`/`npm start` never
+  crash for someone who hasn't set that var yet. Both steps stay
+  idempotent (`schema_migrations` tracks applied migrations;
+  `seedAdmin.js` checks for the email first), so re-running them on every
+  boot is safe.
 
 ---
 

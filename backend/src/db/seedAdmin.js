@@ -5,6 +5,14 @@
 // endpoints require an authenticated system_admin/owner user to create
 // further users and there's otherwise no way to create the first one.
 // Usage: SEED_ADMIN_EMAIL=... SEED_ADMIN_PASSWORD=... npm run seed:admin
+//
+// Also runs automatically before `npm run dev`/`npm start` (see package.json's
+// predev/prestart) so a fresh checkout gets a working login without a
+// separate manual step. Silently skips (exit 0) rather than throwing when
+// SEED_ADMIN_PASSWORD isn't set, since that chain must not break `npm run
+// dev`/`npm start` for anyone who hasn't configured it yet — running it
+// directly via `npm run seed:admin` without the password still won't create
+// anything, it just no-ops with an explanatory log line instead of crashing.
 
 require('dotenv').config();
 const { Client } = require('pg');
@@ -14,7 +22,8 @@ async function run() {
   const email = process.env.SEED_ADMIN_EMAIL || 'admin@swiftcedi.local';
   const password = process.env.SEED_ADMIN_PASSWORD;
   if (!password) {
-    throw new Error('SEED_ADMIN_PASSWORD env var is required');
+    console.log('SEED_ADMIN_PASSWORD not set — skipping admin seed.');
+    return;
   }
 
   const client = new Client({ connectionString: process.env.DATABASE_URL });

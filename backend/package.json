@@ -5,7 +5,9 @@
   "private": true,
   "main": "src/server.js",
   "scripts": {
+    "predev": "npm run migrate && npm run seed:admin",
     "start": "node src/server.js",
+    "prestart": "npm run migrate && npm run seed:admin",
     "dev": "node --watch src/server.js",
     "migrate": "node src/db/migrate.js",
     "seed:admin": "node src/db/seedAdmin.js",

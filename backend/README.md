@@ -17,16 +17,35 @@ npm install
 # 3. Configure env
 cp .env.example .env
 # .env's DATABASE_URL/TEST_DATABASE_URL already match the docker-compose defaults
+# Add SEED_ADMIN_EMAIL/SEED_ADMIN_PASSWORD here too if you want step 4 below
+# to bootstrap your first login automatically (see "Bootstrapping the first
+# admin user" below) — safe to leave unset for now and add later.
 
-# 4. Run migrations (creates schema + seeds roles/permissions/HQ branch)
-npm run migrate
-
-# 5. Bootstrap the first system_admin user (RBAC endpoints require an
-#    authenticated admin to create further users)
-SEED_ADMIN_EMAIL=admin@swiftcedi.local SEED_ADMIN_PASSWORD='ChangeMe123!' npm run seed:admin
-
-# 6. Run the API
+# 4. Run the API — this also runs migrations and (if SEED_ADMIN_PASSWORD is
+#    set) bootstraps the first system_admin user automatically first
 npm run dev
+```
+
+## Bootstrapping the first admin user
+
+RBAC endpoints require an authenticated `system_admin`/`owner` user to create
+further users, so something has to create the very first one. `npm run dev`
+and `npm start` both run `src/db/seedAdmin.js` automatically before starting
+the server (via `predev`/`prestart`) — it's idempotent (no-ops if the email
+already exists) and skips itself with a log line, rather than crashing the
+server, if `SEED_ADMIN_PASSWORD` isn't set.
+
+Set it either in `.env` or inline:
+
+```bash
+SEED_ADMIN_EMAIL=admin@swiftcedi.local SEED_ADMIN_PASSWORD='ChangeMe123!' npm run dev
+```
+
+Or run it standalone at any time (e.g. against a deployed database) without
+starting the server:
+
+```bash
+SEED_ADMIN_EMAIL=admin@swiftcedi.local SEED_ADMIN_PASSWORD='ChangeMe123!' npm run seed:admin
 ```
 
 ## Tests
