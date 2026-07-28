@@ -1,4 +1,4 @@
-const API_BASE_URL = 'http://localhost:4000' //|| import.meta.env.VITE_API_BASE_URL || '/api';
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'https://tender-endurance-production-d784.up.railway.app';
 const TOKEN_STORAGE_KEY = 'swiftcedi.token';
 
 export class ApiError extends Error {
