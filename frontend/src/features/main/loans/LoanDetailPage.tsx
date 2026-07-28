@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { ArrowLeft, ClipboardCheck, Send, Banknote, HandCoins, Repeat, Ban, Plus } from 'lucide-react';
+import { ArrowLeft, ClipboardCheck, Send, Banknote, HandCoins, Repeat, Ban, Plus, Percent } from 'lucide-react';
 import { useAuth } from '../../../auth/AuthContext';
 import { api, ApiError } from '../../../lib/apiClient';
 import { useBranches } from '../../../lib/adminHooks';
@@ -13,7 +13,7 @@ import { Modal } from '../../../components/Modal';
 import { KpiCard } from '../../../components/KpiCard';
 import { FormField, inputClasses, selectClasses, textareaClasses } from '../../../components/FormField';
 import { ErrorState } from '../../../components/ErrorState';
-import { formatDate, formatGhs, parseGhsInput, parsePercentToBps } from '../../../lib/format';
+import { formatDate, formatGhs, formatBps, parseGhsInput, parsePercentToBps } from '../../../lib/format';
 import type {
   Loan,
   LoanProduct,
@@ -22,9 +22,12 @@ import type {
   LoanAppraisal,
   LoanCollateral,
   LoanGuarantor,
+  LoanConcession,
   OverdraftStatus,
   Customer,
 } from '../../../types/api';
+
+const CONCESSION_ELIGIBLE_STATUSES = ['applied', 'appraised', 'pending_approval', 'approved'];
 
 export function LoanDetailPage() {
   const { id } = useParams<{ id: string }>();
@@ -41,6 +44,7 @@ export function LoanDetailPage() {
   const [accrueOpen, setAccrueOpen] = useState(false);
   const [collateralOpen, setCollateralOpen] = useState(false);
   const [guarantorOpen, setGuarantorOpen] = useState(false);
+  const [concessionOpen, setConcessionOpen] = useState(false);
 
   const invalidateLoan = () => queryClient.invalidateQueries({ queryKey: ['loan', id] });
 
@@ -66,6 +70,7 @@ export function LoanDetailPage() {
   const appraisalsQuery = useQuery({ queryKey: ['loan-appraisals', id], queryFn: () => api.get<LoanAppraisal[]>(`/loans/${id}/appraisals`), enabled: Boolean(id) });
   const collateralQuery = useQuery({ queryKey: ['loan-collateral', id], queryFn: () => api.get<LoanCollateral[]>(`/loans/${id}/collateral`), enabled: Boolean(id) });
   const guarantorsQuery = useQuery({ queryKey: ['loan-guarantors', id], queryFn: () => api.get<LoanGuarantor[]>(`/loans/${id}/guarantors`), enabled: Boolean(id) });
+  const concessionsQuery = useQuery({ queryKey: ['loan-concessions', id], queryFn: () => api.get<LoanConcession[]>(`/loans/${id}/concessions`), enabled: Boolean(id) });
   const overdraftQuery = useQuery({
     queryKey: ['loan-overdraft-status', id],
     queryFn: () => api.get<OverdraftStatus>(`/loans/${id}/overdraft-status`),
@@ -173,6 +178,11 @@ export function LoanDetailPage() {
                 <Repeat size={14} /> Restructure
               </Button>
             )}
+            {hasPermission('loan.grant_concession') && CONCESSION_ELIGIBLE_STATUSES.includes(loan.status) && (
+              <Button variant="secondary" size="sm" onClick={() => setConcessionOpen(true)}>
+                <Percent size={14} /> Propose concession
+              </Button>
+            )}
             {hasPermission('loan.write_off') && loan.status === 'disbursed' && (
               <Button variant="danger" size="sm" onClick={() => setWriteOffOpen(true)}>
                 <Ban size={14} /> Write off
@@ -181,6 +191,8 @@ export function LoanDetailPage() {
           </div>
         </div>
       </Card>
+
+      <TermsCard loan={loan} product={productQuery.data} concessions={concessionsQuery.data ?? []} isLoading={concessionsQuery.isLoading} />
 
       {isOverdraft && overdraftQuery.data && (
         <Card title="Overdraft facility">
@@ -280,6 +292,17 @@ export function LoanDetailPage() {
       <DisburseModal open={disburseOpen} onClose={() => setDisburseOpen(false)} loanId={loan.id} onSaved={invalidateLoan} />
       <RepaymentModal open={repaymentOpen} onClose={() => setRepaymentOpen(false)} loanId={loan.id} onSaved={() => { invalidateLoan(); queryClient.invalidateQueries({ queryKey: ['loan-schedule', id] }); queryClient.invalidateQueries({ queryKey: ['loan-repayments', id] }); }} />
       <RestructureModal open={restructureOpen} onClose={() => setRestructureOpen(false)} loanId={loan.id} onSaved={invalidateLoan} />
+      <ConcessionModal
+        open={concessionOpen}
+        onClose={() => setConcessionOpen(false)}
+        loanId={loan.id}
+        loan={loan}
+        product={productQuery.data}
+        onSaved={() => {
+          invalidateLoan();
+          queryClient.invalidateQueries({ queryKey: ['loan-concessions', id] });
+        }}
+      />
       <WriteOffModal open={writeOffOpen} onClose={() => setWriteOffOpen(false)} loanId={loan.id} onSaved={invalidateLoan} />
       <AccrueInterestModal open={accrueOpen} onClose={() => setAccrueOpen(false)} loanId={loan.id} onSaved={() => queryClient.invalidateQueries({ queryKey: ['loan-overdraft-status', id] })} />
       <AddCollateralModal open={collateralOpen} onClose={() => setCollateralOpen(false)} loanId={loan.id} onSaved={() => queryClient.invalidateQueries({ queryKey: ['loan-collateral', id] })} />
@@ -288,7 +311,216 @@ export function LoanDetailPage() {
   );
 }
 
+function feeScheduleSummary(feeSchedule: Loan['fee_schedule']): string {
+  if (!feeSchedule || feeSchedule.length === 0) return 'No fees';
+  return feeSchedule
+    .map((f) => (f.type === 'flat' ? `${f.code ?? 'Fee'}: ${formatGhs(f.amountPesewas)}` : `${f.code ?? 'Fee'}: ${formatBps(f.rateBps)} of principal`))
+    .join(', ');
+}
+
+/**
+ * Standard (product) terms vs this loan's actual current terms, plus its
+ * full concession history — kept as a clearly separate comparison rather
+ * than only showing the loan's already-blended current rate, per the
+ * "visible... with a clear standard vs negotiated comparison, not
+ * silently blended in" requirement.
+ */
+function TermsCard({
+  loan,
+  product,
+  concessions,
+  isLoading,
+}: {
+  loan: Loan;
+  product: LoanProduct | undefined;
+  concessions: LoanConcession[];
+  isLoading: boolean;
+}) {
+  const hasConcessions = concessions.length > 0;
+  const currentDiffersFromStandard = product && Number(loan.annual_interest_rate_bps) !== Number(product.annual_interest_rate_bps);
+
+  const concessionColumns: Column<LoanConcession>[] = [
+    { key: 'date', header: 'Requested', render: (c) => formatDate(c.created_at) },
+    { key: 'reason', header: 'Reason', render: (c) => <span className="capitalize">{c.reason_code.replace(/_/g, ' ')}</span> },
+    { key: 'rate', header: 'Standard → negotiated rate', render: (c) => `${formatBps(c.standard_annual_interest_rate_bps)} → ${formatBps(c.negotiated_annual_interest_rate_bps)}` },
+    {
+      key: 'spread',
+      header: 'Standard → negotiated spread',
+      render: (c) => (c.standard_spread_bps !== null ? `${formatBps(c.standard_spread_bps)} → ${formatBps(c.negotiated_spread_bps)}` : '—'),
+    },
+    {
+      key: 'term',
+      header: 'Standard → negotiated term',
+      render: (c) => (c.standard_term_months !== c.negotiated_term_months ? `${c.standard_term_months} → ${c.negotiated_term_months} mo` : '—'),
+    },
+    { key: 'status', header: 'Status', render: (c) => <StatusBadge status={c.status} /> },
+  ];
+
+  return (
+    <Card title="Terms & concessions">
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        <KpiCard label="Current rate (p.a.)" value={formatBps(loan.annual_interest_rate_bps)} />
+        <KpiCard label="Interest method" value={loan.interest_method === 'flat' ? 'Flat' : 'Reducing balance'} />
+        <KpiCard label="Term" value={`${loan.term_months} months`} />
+        <KpiCard label="Fees" value={feeScheduleSummary(loan.fee_schedule)} />
+      </div>
+
+      {product && (
+        <div className="mt-3 rounded-md border border-border bg-surface-alt p-3">
+          <p className="text-[12.5px] font-medium text-text-primary">Product standard terms ({product.code})</p>
+          <p className="mt-1 text-[12.5px] text-text-secondary">
+            {formatBps(product.annual_interest_rate_bps)} p.a.
+            {product.rate_type === 'floating' && ` (floating: reference + ${formatBps(product.spread_bps)} spread, resets ${product.reset_frequency})`}
+            {' · '}
+            {product.min_term_months}–{product.max_term_months} months allowed
+          </p>
+          {currentDiffersFromStandard && (
+            <p className="mt-1 text-[12.5px] font-medium text-warning-text-strong">
+              This loan's current rate differs from the product's standard rate — see the concession that granted it below, not a
+              silent override.
+            </p>
+          )}
+        </div>
+      )}
+
+      {hasConcessions && (
+        <div className="mt-3">
+          <DataTable columns={concessionColumns} rows={concessions} getRowKey={(c) => c.id} isLoading={isLoading} emptyTitle="No concessions" />
+        </div>
+      )}
+    </Card>
+  );
+}
+
 // --- Action modals ---------------------------------------------------------
+
+function ConcessionModal({
+  open,
+  onClose,
+  loanId,
+  loan,
+  product,
+  onSaved,
+}: {
+  open: boolean;
+  onClose: () => void;
+  loanId: string;
+  loan: Loan;
+  product: LoanProduct | undefined;
+  onSaved: () => void;
+}) {
+  const [reasonCode, setReasonCode] = useState<'loyal_customer' | 'competitive_match' | 'hardship' | 'other'>('loyal_customer');
+  const [reasonNotes, setReasonNotes] = useState('');
+  const [negotiatedRate, setNegotiatedRate] = useState('');
+  const [negotiatedSpread, setNegotiatedSpread] = useState('');
+  const [negotiatedTerm, setNegotiatedTerm] = useState('');
+  const [error, setError] = useState<string | null>(null);
+  const [result, setResult] = useState<{ needsApproval: boolean } | null>(null);
+
+  const isFloating = product?.rate_type === 'floating';
+
+  function reset() {
+    setReasonCode('loyal_customer');
+    setReasonNotes('');
+    setNegotiatedRate('');
+    setNegotiatedSpread('');
+    setNegotiatedTerm('');
+    setError(null);
+    setResult(null);
+  }
+
+  const mutation = useMutation({
+    mutationFn: () =>
+      api.post<{ needsApproval: boolean }>(`/loans/${loanId}/concessions`, {
+        negotiatedAnnualInterestRateBps: !isFloating && negotiatedRate ? parsePercentToBps(negotiatedRate) : undefined,
+        negotiatedSpreadBps: isFloating && negotiatedSpread ? parsePercentToBps(negotiatedSpread) : undefined,
+        negotiatedTermMonths: negotiatedTerm ? Number(negotiatedTerm) : undefined,
+        reasonCode,
+        reasonNotes: reasonNotes || undefined,
+      }),
+    onSuccess: (data) => {
+      onSaved();
+      setResult(data);
+    },
+    onError: (err) => setError(err instanceof ApiError ? err.message : 'Unable to submit concession'),
+  });
+
+  return (
+    <Modal
+      open={open}
+      onClose={() => {
+        onClose();
+        reset();
+      }}
+      title="Propose a concession"
+      footer={
+        result ? (
+          <Button variant="secondary" size="sm" onClick={() => { onClose(); reset(); }}>
+            Done
+          </Button>
+        ) : (
+          <>
+            <Button variant="secondary" size="sm" onClick={onClose}>
+              Cancel
+            </Button>
+            <Button
+              variant="primary"
+              size="sm"
+              disabled={mutation.isPending || !reasonCode || (!negotiatedRate && !negotiatedSpread && !negotiatedTerm)}
+              onClick={() => mutation.mutate()}
+            >
+              Submit
+            </Button>
+          </>
+        )
+      }
+    >
+      {result ? (
+        <p className="text-[13px] text-text-secondary">
+          {result.needsApproval
+            ? "Submitted for branch manager approval — this loan can't disburse until it's decided."
+            : "Applied immediately — within this product's approval-free threshold, so no second sign-off was needed."}
+        </p>
+      ) : (
+        <div className="flex flex-col gap-3">
+          <p className="text-[13px] text-text-secondary">
+            Standard terms: {formatBps(product?.annual_interest_rate_bps)} p.a.
+            {isFloating && ` (spread ${formatBps(product?.spread_bps)})`}, {loan.term_months} months. A concession beyond this
+            product's approval-free threshold routes to a branch manager before the loan can disburse.
+          </p>
+          <FormField label="Reason">
+            {(id) => (
+              <select id={id} value={reasonCode} onChange={(e) => setReasonCode(e.target.value as typeof reasonCode)} className={selectClasses}>
+                <option value="loyal_customer">Loyal customer</option>
+                <option value="competitive_match">Competitive match</option>
+                <option value="hardship">Hardship</option>
+                <option value="other">Other</option>
+              </select>
+            )}
+          </FormField>
+          <FormField label="Reason notes">{(id) => <textarea id={id} rows={2} value={reasonNotes} onChange={(e) => setReasonNotes(e.target.value)} className={textareaClasses} />}</FormField>
+          {isFloating ? (
+            <FormField label="Negotiated spread (%)" hint={`Standard spread is ${formatBps(product?.spread_bps)} — only the spread is negotiable, never the reference rate.`}>
+              {(id) => <input id={id} type="number" step="0.01" value={negotiatedSpread} onChange={(e) => setNegotiatedSpread(e.target.value)} className={inputClasses} />}
+            </FormField>
+          ) : (
+            <FormField label="Negotiated rate (%)" hint={`Standard rate is ${formatBps(product?.annual_interest_rate_bps)}.`}>
+              {(id) => <input id={id} type="number" step="0.01" value={negotiatedRate} onChange={(e) => setNegotiatedRate(e.target.value)} className={inputClasses} />}
+            </FormField>
+          )}
+          <FormField label="Negotiated term (months)" hint={`Leave blank to keep the current term (${loan.term_months} months).`}>
+            {(id) => <input id={id} type="number" value={negotiatedTerm} onChange={(e) => setNegotiatedTerm(e.target.value)} className={inputClasses} />}
+          </FormField>
+          {error && (
+            <p role="alert" className="text-[13px] text-danger">
+              {error}
+            </p>
+          )}
+        </div>
+      )}
+    </Modal>
+  );
+}
 
 function AppraiseModal({ open, onClose, loanId, onSaved }: { open: boolean; onClose: () => void; loanId: string; onSaved: () => void }) {
   const [recommendation, setRecommendation] = useState<'recommend' | 'decline'>('recommend');

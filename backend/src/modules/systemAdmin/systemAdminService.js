@@ -115,6 +115,21 @@ async function runStandingOrderExecutionJob(pool, { actingAs, asOfDate = todayIs
   return standingOrderService.executeDueOrders(pool, { asOfDate, executedBy: actingAs });
 }
 
+/**
+ * loanService.resetFloatingRateProducts needs a branchId to stamp its
+ * audit log entries with (policy rates/loan products aren't themselves
+ * branch-scoped — see policyRateService.js's own comment on the same
+ * convention), which no other job wrapper here has needed to resolve
+ * before: the acting user's own home branch, same as every other
+ * "global entity, audited anyway" mutation in this codebase (rbac.js's
+ * role/permission routes, policyRateService.updatePolicyRateValue).
+ */
+async function runLoanFloatingRateResetJob(pool, { actingAs, asOfDate = todayIso() }) {
+  const { rows } = await pool.query('SELECT home_branch_id FROM users WHERE id = $1', [actingAs]);
+  if (!rows[0]) throw new SystemAdminValidationError(`user ${actingAs} not found`);
+  return loanService.resetFloatingRateProducts(pool, { asOfDate, resetBy: actingAs, actorBranchId: rows[0].home_branch_id });
+}
+
 async function runAgentLocationPurgeJob(pool, { olderThanDays } = {}) {
   return agentService.purgeOldLocations(pool, { olderThanDays });
 }
@@ -197,6 +212,7 @@ async function runSusuCollectionDueRemindersJob(pool, { asOfDate = todayIso(), d
 
 const JOB_REGISTRY = {
   loan_overdraft_interest_accrual: runOverdraftInterestAccrualJob,
+  loan_floating_rate_reset: runLoanFloatingRateResetJob,
   investment_interest_accrual: runInvestmentInterestAccrualJob,
   cashier_day_close: runCashierDayCloseJob,
   standing_order_execution: runStandingOrderExecutionJob,

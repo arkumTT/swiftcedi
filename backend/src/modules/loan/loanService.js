@@ -4,6 +4,7 @@ const auditLog = require('../../shared/auditLog');
 const approvalWorkflow = require('../../shared/approvalWorkflow');
 const glPosting = require('../../shared/glPosting');
 const loanMath = require('./loanMath');
+const policyRateService = require('./policyRateService');
 const savingsService = require('../savings/savingsService');
 const calendarMath = require('../systemAdmin/calendarMath');
 const calendarService = require('../systemAdmin/calendarService');
@@ -40,13 +41,71 @@ const todayIso = () => new Date().toISOString().slice(0, 10);
 
 // --- Loan products ---------------------------------------------------------
 
+const REPAYMENT_FREQUENCIES_SUPPORTED = ['monthly'];
+
+/**
+ * Validates+resolves the fixed/floating rate fields shared by
+ * createLoanProduct and updateLoanProduct. Returns the effective
+ * annual_interest_rate_bps to store: the admin's own input for a FIXED
+ * product, or reference_rate.rate_bps + spread_bps (computed here, not
+ * accepted as freeform input) for a FLOATING one — see migration 054's
+ * comment for why annual_interest_rate_bps stays the single column every
+ * consumer already reads regardless of rate_type.
+ */
+async function resolveRateFields(pool, { rateType, annualInterestRateBps, referenceRateId, spreadBps, resetFrequency }) {
+  if (rateType !== 'fixed' && rateType !== 'floating') {
+    throw new LoanValidationError("rateType must be 'fixed' or 'floating'");
+  }
+  if (rateType === 'fixed') {
+    if (!Number.isInteger(annualInterestRateBps) || annualInterestRateBps < 0) {
+      throw new LoanValidationError('annualInterestRateBps must be a non-negative integer for a fixed-rate product');
+    }
+    return { effectiveAnnualInterestRateBps: annualInterestRateBps, referenceRateId: null, spreadBps: null, resetFrequency: null };
+  }
+  if (!referenceRateId || !Number.isInteger(spreadBps) || spreadBps < 0 || !resetFrequency) {
+    throw new LoanValidationError('referenceRateId, a non-negative integer spreadBps, and resetFrequency are required for a floating-rate product');
+  }
+  if (!['monthly', 'quarterly', 'annually'].includes(resetFrequency)) {
+    throw new LoanValidationError("resetFrequency must be 'monthly', 'quarterly', or 'annually'");
+  }
+  const referenceRate = await policyRateService.getPolicyRate(pool, referenceRateId);
+  const effectiveAnnualInterestRateBps = loanMath.computeFloatingEffectiveRateBps({
+    referenceRateBps: referenceRate.rate_bps,
+    spreadBps,
+  });
+  return { effectiveAnnualInterestRateBps, referenceRateId, spreadBps, resetFrequency };
+}
+
+function assertAllowedRepaymentFrequencies(allowedRepaymentFrequencies) {
+  const unsupported = allowedRepaymentFrequencies.filter((f) => !REPAYMENT_FREQUENCIES_SUPPORTED.includes(f));
+  if (unsupported.length > 0) {
+    // Deliberate scope boundary, not a bug: loanMath.js's schedule
+    // generator amortizes MONTHLY only (see its module comment). This
+    // field records real product intent without silently implying a
+    // repayment cadence this codebase doesn't actually amortize — see
+    // Decisions_Log.md.
+    throw new LoanValidationError(
+      `allowedRepaymentFrequencies only supports ${REPAYMENT_FREQUENCIES_SUPPORTED.join(', ')} today (got: ${unsupported.join(', ')}) — the loan schedule generator does not yet amortize on any other cadence`
+    );
+  }
+}
+
 async function createLoanProduct(pool, params) {
   const {
     name,
     code,
+    description = null,
     loanType,
     interestMethod,
+    rateType = 'fixed',
     annualInterestRateBps,
+    referenceRateId = null,
+    spreadBps = null,
+    resetFrequency = null,
+    minRateFloorBps = null,
+    minSpreadFloorBps = null,
+    concessionApprovalThresholdBps = 0,
+    allowedRepaymentFrequencies = ['monthly'],
     minTermMonths,
     maxTermMonths,
     minPrincipalPesewas,
@@ -60,22 +119,36 @@ async function createLoanProduct(pool, params) {
   if (!name || !code || !loanType || !interestMethod || !createdBy) {
     throw new LoanValidationError('name, code, loanType, interestMethod, and createdBy are required');
   }
+  assertAllowedRepaymentFrequencies(allowedRepaymentFrequencies);
+  const rate = await resolveRateFields(pool, { rateType, annualInterestRateBps, referenceRateId, spreadBps, resetFrequency });
+
   // Validate the fee schedule shape up front rather than discovering a bad
   // fee config at disbursement time, when money is moving.
   loanMath.computeFeesPesewas(feeSchedule, 100000);
 
   const { rows } = await pool.query(
     `INSERT INTO loan_products
-       (name, code, loan_type, interest_method, annual_interest_rate_bps, min_term_months, max_term_months,
-        min_principal_pesewas, max_principal_pesewas, fee_schedule, par_bucket_days, reason_codes, created_by)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+       (name, code, description, loan_type, interest_method, annual_interest_rate_bps, rate_type, reference_rate_id,
+        spread_bps, reset_frequency, min_rate_floor_bps, min_spread_floor_bps, concession_approval_threshold_bps,
+        allowed_repayment_frequencies, min_term_months, max_term_months, min_principal_pesewas, max_principal_pesewas,
+        fee_schedule, par_bucket_days, reason_codes, created_by)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
      RETURNING *`,
     [
       name,
       String(code).toUpperCase(),
+      description,
       loanType,
       interestMethod,
-      annualInterestRateBps,
+      rate.effectiveAnnualInterestRateBps,
+      rateType,
+      rate.referenceRateId,
+      rate.spreadBps,
+      rate.resetFrequency,
+      minRateFloorBps,
+      minSpreadFloorBps,
+      concessionApprovalThresholdBps,
+      allowedRepaymentFrequencies,
       minTermMonths,
       maxTermMonths,
       minPrincipalPesewas,
@@ -109,6 +182,111 @@ async function listLoanProducts(pool, { loanType, status } = {}) {
   const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
   const { rows } = await pool.query(`SELECT * FROM loan_products ${where} ORDER BY code`, params);
   return rows;
+}
+
+/**
+ * Edits a product's configuration. Safe to change ANY field, including
+ * rate/fees/limits, without retroactively touching a loan already
+ * applied for — every loan snapshots interest_method,
+ * annual_interest_rate_bps, term_months, and (since migration 055)
+ * fee_schedule onto its own row at application time, so an edit here
+ * only ever changes what a FUTURE application sees. That's what makes
+ * this a plain UPDATE rather than a new-version-per-edit table like
+ * complianceService's report templates: the "past disbursements don't
+ * silently change" guarantee already lives at the loan row, not the
+ * product row. Every change is still audited (see auditLog.record
+ * below) for exactly the same reason regulatory review needs it
+ * anywhere else in this codebase.
+ */
+async function updateLoanProduct(pool, { productId, updatedBy, actorBranchId, ...fields }) {
+  if (!updatedBy || !actorBranchId) {
+    throw new LoanValidationError('updatedBy and actorBranchId are required');
+  }
+  const before = await getLoanProduct(pool, productId);
+
+  const merged = {
+    name: fields.name ?? before.name,
+    description: fields.description !== undefined ? fields.description : before.description,
+    status: fields.status ?? before.status,
+    interestMethod: fields.interestMethod ?? before.interest_method,
+    rateType: fields.rateType ?? before.rate_type,
+    annualInterestRateBps: fields.annualInterestRateBps ?? before.annual_interest_rate_bps,
+    referenceRateId: fields.referenceRateId !== undefined ? fields.referenceRateId : before.reference_rate_id,
+    spreadBps: fields.spreadBps !== undefined ? fields.spreadBps : before.spread_bps,
+    resetFrequency: fields.resetFrequency !== undefined ? fields.resetFrequency : before.reset_frequency,
+    minRateFloorBps: fields.minRateFloorBps !== undefined ? fields.minRateFloorBps : before.min_rate_floor_bps,
+    minSpreadFloorBps: fields.minSpreadFloorBps !== undefined ? fields.minSpreadFloorBps : before.min_spread_floor_bps,
+    concessionApprovalThresholdBps: fields.concessionApprovalThresholdBps ?? before.concession_approval_threshold_bps,
+    allowedRepaymentFrequencies: fields.allowedRepaymentFrequencies ?? before.allowed_repayment_frequencies,
+    minTermMonths: fields.minTermMonths ?? before.min_term_months,
+    maxTermMonths: fields.maxTermMonths ?? before.max_term_months,
+    minPrincipalPesewas: fields.minPrincipalPesewas ?? before.min_principal_pesewas,
+    maxPrincipalPesewas: fields.maxPrincipalPesewas ?? before.max_principal_pesewas,
+    feeSchedule: fields.feeSchedule ?? before.fee_schedule,
+    parBucketDays: fields.parBucketDays ?? before.par_bucket_days,
+    reasonCodes: fields.reasonCodes ?? before.reason_codes,
+  };
+
+  if (!['active', 'inactive'].includes(merged.status)) {
+    throw new LoanValidationError("status must be 'active' or 'inactive'");
+  }
+  assertAllowedRepaymentFrequencies(merged.allowedRepaymentFrequencies);
+  const rate = await resolveRateFields(pool, {
+    rateType: merged.rateType,
+    annualInterestRateBps: merged.annualInterestRateBps,
+    referenceRateId: merged.referenceRateId,
+    spreadBps: merged.spreadBps,
+    resetFrequency: merged.resetFrequency,
+  });
+  loanMath.computeFeesPesewas(merged.feeSchedule, 100000);
+
+  const { rows } = await pool.query(
+    `UPDATE loan_products SET
+       name = $1, description = $2, status = $3, interest_method = $4, annual_interest_rate_bps = $5,
+       rate_type = $6, reference_rate_id = $7, spread_bps = $8, reset_frequency = $9,
+       min_rate_floor_bps = $10, min_spread_floor_bps = $11, concession_approval_threshold_bps = $12,
+       allowed_repayment_frequencies = $13, min_term_months = $14, max_term_months = $15,
+       min_principal_pesewas = $16, max_principal_pesewas = $17, fee_schedule = $18,
+       par_bucket_days = $19, reason_codes = $20, updated_at = now()
+     WHERE id = $21
+     RETURNING *`,
+    [
+      merged.name,
+      merged.description,
+      merged.status,
+      merged.interestMethod,
+      rate.effectiveAnnualInterestRateBps,
+      merged.rateType,
+      rate.referenceRateId,
+      rate.spreadBps,
+      rate.resetFrequency,
+      merged.minRateFloorBps,
+      merged.minSpreadFloorBps,
+      merged.concessionApprovalThresholdBps,
+      merged.allowedRepaymentFrequencies,
+      merged.minTermMonths,
+      merged.maxTermMonths,
+      merged.minPrincipalPesewas,
+      merged.maxPrincipalPesewas,
+      JSON.stringify(merged.feeSchedule),
+      merged.parBucketDays,
+      merged.reasonCodes,
+      productId,
+    ]
+  );
+  const after = rows[0];
+
+  await auditLog.record(pool, {
+    userId: updatedBy,
+    branchId: actorBranchId,
+    action: 'loan.product_updated',
+    entityType: 'loan_product',
+    entityId: productId,
+    beforeState: before,
+    afterState: after,
+  });
+
+  return after;
 }
 
 /**
@@ -160,6 +338,82 @@ function assertWithinProductLimits(product, principalPesewas, termMonths) {
       `termMonths ${termMonths} is outside product limits (${product.min_term_months}-${product.max_term_months})`
     );
   }
+}
+
+const RESET_PERIOD_MONTHS = { monthly: 1, quarterly: 3, annually: 12 };
+
+/**
+ * Recomputes each due FLOATING product's LISTING rate
+ * (reference_rate.rate_bps + spread_bps) — i.e. what a NEW application
+ * inherits going forward. Deliberately does NOT retroactively re-price
+ * already-disbursed loans under that product: a loan's rate is
+ * snapshotted once at application (same guarantee fixed-rate loans have,
+ * see migration 023's comment), so an outstanding floating loan's own
+ * rate/schedule never moves after disbursement in this pass. Actually
+ * re-pricing live loans mid-term — which is what "floating" ultimately
+ * implies in a fuller build — is a materially bigger, money-moving
+ * decision (it changes what a customer owes going forward) that wasn't
+ * confirmed as in scope; flagged in Decisions_Log.md rather than built
+ * silently.
+ *
+ * A product is "due" if it's never been reset, or if asOfDate has
+ * crossed its reset_frequency boundary since last_reset_at. This is the
+ * thin wrapper Module 12's job registry calls
+ * (systemAdminService.runLoanFloatingRateResetJob) — see that module's
+ * own "every job is a thin wrapper" rule.
+ */
+async function resetFloatingRateProducts(pool, { asOfDate = todayIso(), resetBy, actorBranchId }) {
+  if (!resetBy || !actorBranchId) {
+    throw new LoanValidationError('resetBy and actorBranchId are required');
+  }
+
+  const { rows: floatingProducts } = await pool.query(
+    `SELECT * FROM loan_products WHERE rate_type = 'floating' AND status = 'active'`
+  );
+
+  const results = [];
+  for (const product of floatingProducts) {
+    try {
+      const nextDueDate = product.last_reset_at
+        ? loanMath.addMonthsToDateString(
+            product.last_reset_at instanceof Date ? product.last_reset_at.toISOString().slice(0, 10) : product.last_reset_at,
+            RESET_PERIOD_MONTHS[product.reset_frequency]
+          )
+        : asOfDate;
+      if (asOfDate < nextDueDate) {
+        continue; // not due yet
+      }
+
+      const referenceRate = await policyRateService.getPolicyRate(pool, product.reference_rate_id);
+      const newRateBps = loanMath.computeFloatingEffectiveRateBps({
+        referenceRateBps: referenceRate.rate_bps,
+        spreadBps: product.spread_bps,
+      });
+
+      await pool.query(
+        `UPDATE loan_products SET annual_interest_rate_bps = $1, last_reset_at = $2, updated_at = now() WHERE id = $3`,
+        [newRateBps, asOfDate, product.id]
+      );
+
+      if (newRateBps !== product.annual_interest_rate_bps) {
+        await auditLog.record(pool, {
+          userId: resetBy,
+          branchId: actorBranchId,
+          action: 'loan.product_rate_reset',
+          entityType: 'loan_product',
+          entityId: product.id,
+          beforeState: { annualInterestRateBps: product.annual_interest_rate_bps },
+          afterState: { annualInterestRateBps: newRateBps, resetDate: asOfDate },
+        });
+      }
+
+      results.push({ productId: Number(product.id), ok: true, oldRateBps: product.annual_interest_rate_bps, newRateBps });
+    } catch (err) {
+      results.push({ productId: Number(product.id), ok: false, error: err.message });
+    }
+  }
+
+  return { processedCount: results.length, changedCount: results.filter((r) => r.ok && r.newRateBps !== r.oldRateBps).length, results };
 }
 
 // --- Loan application ------------------------------------------------------
@@ -307,8 +561,9 @@ async function applyForLoan(pool, params) {
   const { rows } = await pool.query(
     `INSERT INTO loans
        (loan_type, customer_id, branch_id, product_id, principal_pesewas, term_months,
-        interest_method, annual_interest_rate_bps, reason_code, purpose_notes, overdraft_savings_account_id, applied_by)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        interest_method, annual_interest_rate_bps, fee_schedule, reason_code, purpose_notes,
+        overdraft_savings_account_id, applied_by)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
      RETURNING *`,
     [
       product.loan_type,
@@ -319,6 +574,10 @@ async function applyForLoan(pool, params) {
       termMonths,
       product.interest_method,
       product.annual_interest_rate_bps,
+      // Snapshotted here (not read live at disbursement) for the same
+      // reason interest_method/annual_interest_rate_bps already are —
+      // see migration 055_loans_fee_schedule_snapshot.sql.
+      JSON.stringify(product.fee_schedule),
       reasonCode,
       purposeNotes,
       overdraftSavingsAccountId,
@@ -487,6 +746,22 @@ async function assertApprovedForDisbursement(client, loanId) {
   if (approvalRows.length === 0) {
     throw new LoanConflictError(`loan ${loanId} has no approved maker-checker approval on record`);
   }
+
+  // "Any concession above a threshold requires a second approval before
+  // the loan can be disbursed" — enforced here, at the one gate function
+  // both ordinary disbursement and overdraft activation already share,
+  // rather than adding a second check site. A concession's own approval
+  // is otherwise independent of the loan's loan.approve workflow (either
+  // can be requested/decided before or after the other).
+  const { rows: pendingConcessionRows } = await client.query(
+    `SELECT lc.id FROM loan_concessions lc
+       JOIN approval_requests ar ON ar.id = lc.approval_request_id
+      WHERE lc.loan_id = $1 AND ar.status = 'pending'`,
+    [loanId]
+  );
+  if (pendingConcessionRows.length > 0) {
+    throw new LoanConflictError(`loan ${loanId} has a concession awaiting approval and cannot be disbursed yet`);
+  }
   return loan;
 }
 
@@ -586,8 +861,12 @@ async function disburseLoan(pool, { loanId, disbursedBy, disbursementDate = toda
 
     const loan = await assertApprovedForDisbursement(client, loanId);
 
-    const product = await getLoanProduct(client, loan.product_id);
-    feesPesewas = loanMath.computeFeesPesewas(product.fee_schedule, Number(loan.principal_pesewas));
+    // Fees come from the LOAN's own snapshot, not the live product — a
+    // product's fee_schedule can be edited after this loan applied (see
+    // updateLoanProduct), and that must never silently change what this
+    // loan is actually charged at disbursement. See migration
+    // 055_loans_fee_schedule_snapshot.sql.
+    feesPesewas = loanMath.computeFeesPesewas(loan.fee_schedule, Number(loan.principal_pesewas));
     if (feesPesewas >= Number(loan.principal_pesewas)) {
       throw new LoanValidationError(
         `computed fees (${feesPesewas}) must be less than the principal (${loan.principal_pesewas})`
@@ -1159,6 +1438,261 @@ async function applyRestructureOnApproval(approvalRequest, db) {
   });
 }
 
+// --- Concessions -------------------------------------------------------------
+
+const LOAN_STATUSES_ELIGIBLE_FOR_CONCESSION = ['applied', 'appraised', 'pending_approval', 'approved'];
+
+/**
+ * Proposes a negotiated rate/spread, term, and/or fee schedule against a
+ * loan's PRODUCT standard terms. "Standard" here always means the
+ * product's CURRENT configuration (loan_products.annual_interest_rate_bps
+ * /spread_bps), not whatever the loan itself currently has — if an
+ * earlier concession already discounted this loan, a new request is
+ * still evaluated against what a customer would get today under
+ * standard terms, not against the already-discounted value, so the
+ * floor/threshold bounds mean the same thing on every request regardless
+ * of history. Term/fee "standard" values are the loan's own current
+ * values instead (there's no single product-wide standard term/fee
+ * config the way there is for rate — only a min/max range, already
+ * enforced elsewhere), used purely to detect whether they changed at
+ * all for the needsApproval decision.
+ *
+ * Rate/spread ARE bound-checked (loanMath.evaluateConcessionBounds,
+ * against the product's min_rate_floor_bps/min_spread_floor_bps) —
+ * reject outright, no approval route at all, if breached. Term is
+ * bound-checked against the product's own min/max term (same limits an
+ * ordinary application already respects). Fees are only checked for the
+ * disbursement-time invariant (total fees < principal) — waiving a fee
+ * has no separate floor of its own, but ANY fee or term change forces
+ * needsApproval regardless of the rate delta (loanMath's rule), since
+ * neither is quantifiable as a single bps discount the way rate is.
+ */
+async function requestConcession(pool, {
+  loanId,
+  negotiatedAnnualInterestRateBps = null,
+  negotiatedSpreadBps = null,
+  negotiatedTermMonths = null,
+  negotiatedFeeSchedule = null,
+  reasonCode,
+  reasonNotes = null,
+  requestedBy,
+}) {
+  if (!reasonCode || !requestedBy) {
+    throw new LoanValidationError('reasonCode and requestedBy are required');
+  }
+  if (!['loyal_customer', 'competitive_match', 'hardship', 'other'].includes(reasonCode)) {
+    throw new LoanValidationError("reasonCode must be one of 'loyal_customer', 'competitive_match', 'hardship', 'other'");
+  }
+
+  const loan = await getLoan(pool, loanId);
+  if (!LOAN_STATUSES_ELIGIBLE_FOR_CONCESSION.includes(loan.status)) {
+    throw new LoanConflictError(
+      `loan ${loanId} cannot take a concession in its current status (${loan.status}) — must be applied, appraised, pending_approval, or approved`
+    );
+  }
+
+  const { rows: pendingRows } = await pool.query(
+    `SELECT lc.id FROM loan_concessions lc
+       JOIN approval_requests ar ON ar.id = lc.approval_request_id
+      WHERE lc.loan_id = $1 AND ar.status = 'pending'`,
+    [loanId]
+  );
+  if (pendingRows.length > 0) {
+    throw new LoanConflictError(`loan ${loanId} already has a concession awaiting approval`);
+  }
+
+  const product = await getLoanProduct(pool, loan.product_id);
+
+  const termChanged = negotiatedTermMonths !== null && negotiatedTermMonths !== loan.term_months;
+  if (termChanged && (negotiatedTermMonths < product.min_term_months || negotiatedTermMonths > product.max_term_months)) {
+    throw new LoanValidationError(
+      `negotiatedTermMonths ${negotiatedTermMonths} is outside product limits (${product.min_term_months}-${product.max_term_months})`
+    );
+  }
+
+  const feesChanged = negotiatedFeeSchedule !== null && JSON.stringify(negotiatedFeeSchedule) !== JSON.stringify(loan.fee_schedule);
+  if (feesChanged) {
+    const feesPesewas = loanMath.computeFeesPesewas(negotiatedFeeSchedule, Number(loan.principal_pesewas));
+    if (feesPesewas >= Number(loan.principal_pesewas)) {
+      throw new LoanValidationError(`negotiated fees (${feesPesewas}) must be less than the principal (${loan.principal_pesewas})`);
+    }
+  }
+
+  let standardAnnualInterestRateBps = product.annual_interest_rate_bps;
+  let standardSpreadBps = null;
+  let resolvedNegotiatedAnnualInterestRateBps = negotiatedAnnualInterestRateBps;
+
+  const rateOrSpreadProposed = product.rate_type === 'fixed' ? negotiatedAnnualInterestRateBps !== null : negotiatedSpreadBps !== null;
+
+  let bounds = { permitted: true, withinFloor: true, appliedFloorBps: null, deltaBps: 0, needsApproval: false };
+  if (rateOrSpreadProposed) {
+    if (product.rate_type === 'floating') {
+      if (negotiatedSpreadBps === null) {
+        throw new LoanValidationError('negotiatedSpreadBps is required to negotiate rate on a floating-rate product (not negotiatedAnnualInterestRateBps)');
+      }
+      standardSpreadBps = product.spread_bps;
+      const referenceRate = await policyRateService.getPolicyRate(pool, product.reference_rate_id);
+      resolvedNegotiatedAnnualInterestRateBps = loanMath.computeFloatingEffectiveRateBps({
+        referenceRateBps: referenceRate.rate_bps,
+        spreadBps: negotiatedSpreadBps,
+      });
+      bounds = loanMath.evaluateConcessionBounds({
+        rateType: 'floating',
+        standardAnnualInterestRateBps,
+        negotiatedAnnualInterestRateBps: resolvedNegotiatedAnnualInterestRateBps,
+        standardSpreadBps,
+        negotiatedSpreadBps,
+        minSpreadFloorBps: product.min_spread_floor_bps,
+        concessionApprovalThresholdBps: product.concession_approval_threshold_bps,
+        termChanged,
+        feesChanged,
+      });
+    } else {
+      if (negotiatedAnnualInterestRateBps === null) {
+        throw new LoanValidationError('negotiatedAnnualInterestRateBps is required to negotiate rate on a fixed-rate product');
+      }
+      bounds = loanMath.evaluateConcessionBounds({
+        rateType: 'fixed',
+        standardAnnualInterestRateBps,
+        negotiatedAnnualInterestRateBps,
+        minRateFloorBps: product.min_rate_floor_bps,
+        concessionApprovalThresholdBps: product.concession_approval_threshold_bps,
+        termChanged,
+        feesChanged,
+      });
+    }
+    if (!bounds.permitted) {
+      throw new LoanConflictError(
+        bounds.appliedFloorBps === null
+          ? `loan_product ${product.code} does not permit concessions (no floor configured)`
+          : `negotiated ${product.rate_type === 'floating' ? 'spread' : 'rate'} breaches this product's floor of ${bounds.appliedFloorBps}bps`
+      );
+    }
+  } else {
+    resolvedNegotiatedAnnualInterestRateBps = loan.annual_interest_rate_bps;
+    // Rate/spread weren't touched, but term/fees might have been — that
+    // alone can still require approval per loanMath's rule.
+    bounds = { permitted: true, withinFloor: true, appliedFloorBps: null, deltaBps: 0, needsApproval: termChanged || feesChanged };
+    if (!termChanged && !feesChanged) {
+      throw new LoanValidationError('at least one of negotiatedAnnualInterestRateBps/negotiatedSpreadBps, negotiatedTermMonths, or negotiatedFeeSchedule must be provided');
+    }
+  }
+
+  const finalTermMonths = termChanged ? negotiatedTermMonths : loan.term_months;
+  const finalFeeSchedule = feesChanged ? negotiatedFeeSchedule : loan.fee_schedule;
+
+  let approvalRequest = null;
+  if (bounds.needsApproval) {
+    approvalRequest = await approvalWorkflow.requestApproval(pool, {
+      actionType: 'loan.grant_concession',
+      entityType: 'loan',
+      entityId: loanId,
+      branchId: loan.branch_id,
+      requestedBy,
+      amountPesewas: Number(loan.principal_pesewas),
+      payload: {
+        annualInterestRateBps: resolvedNegotiatedAnnualInterestRateBps,
+        termMonths: finalTermMonths,
+        feeSchedule: finalFeeSchedule,
+      },
+    });
+  }
+
+  const { rows } = await pool.query(
+    `INSERT INTO loan_concessions
+       (loan_id, requested_by, reason_code, reason_notes,
+        standard_annual_interest_rate_bps, negotiated_annual_interest_rate_bps,
+        standard_spread_bps, negotiated_spread_bps, applied_floor_bps,
+        standard_term_months, negotiated_term_months,
+        standard_fee_schedule, negotiated_fee_schedule, approval_request_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+     RETURNING *`,
+    [
+      loanId,
+      requestedBy,
+      reasonCode,
+      reasonNotes,
+      standardAnnualInterestRateBps,
+      resolvedNegotiatedAnnualInterestRateBps,
+      standardSpreadBps,
+      negotiatedSpreadBps,
+      bounds.appliedFloorBps,
+      loan.term_months,
+      finalTermMonths,
+      JSON.stringify(loan.fee_schedule),
+      JSON.stringify(finalFeeSchedule),
+      approvalRequest ? approvalRequest.id : null,
+    ]
+  );
+  const concession = rows[0];
+
+  if (!bounds.needsApproval) {
+    // Within the product's grace window — applies immediately, same
+    // "auto-pay below threshold" shape as cashierService.requestCashBack.
+    await pool.query(
+      `UPDATE loans SET annual_interest_rate_bps = $1, term_months = $2, fee_schedule = $3, updated_at = now() WHERE id = $4`,
+      [resolvedNegotiatedAnnualInterestRateBps, finalTermMonths, JSON.stringify(finalFeeSchedule), loanId]
+    );
+    await auditLog.record(pool, {
+      userId: requestedBy,
+      branchId: loan.branch_id,
+      action: 'loan.concession_auto_applied',
+      entityType: 'loan',
+      entityId: loanId,
+      beforeState: { annualInterestRateBps: loan.annual_interest_rate_bps, termMonths: loan.term_months },
+      afterState: { annualInterestRateBps: resolvedNegotiatedAnnualInterestRateBps, termMonths: finalTermMonths },
+    });
+  }
+
+  return { ...concession, approvalRequest, needsApproval: bounds.needsApproval };
+}
+
+/** Registered as the 'loan.grant_concession' execution handler — applies the negotiated terms onto the loan once a human approves. */
+async function applyConcessionOnApproval(approvalRequest, db) {
+  const loanId = Number(approvalRequest.entity_id);
+  const { rows: loanRows } = await db.query('SELECT * FROM loans WHERE id = $1 FOR UPDATE', [loanId]);
+  const loan = loanRows[0];
+  if (!loan) throw new LoanNotFoundError(`loan ${loanId} not found`);
+
+  const { annualInterestRateBps, termMonths, feeSchedule } = approvalRequest.payload;
+
+  const { rows } = await db.query(
+    `UPDATE loans SET annual_interest_rate_bps = $1, term_months = $2, fee_schedule = $3, updated_at = now() WHERE id = $4 RETURNING *`,
+    [annualInterestRateBps, termMonths, JSON.stringify(feeSchedule), loanId]
+  );
+
+  await auditLog.record(db, {
+    userId: approvalRequest.decided_by,
+    branchId: loan.branch_id,
+    action: 'loan.concession_approved',
+    entityType: 'loan',
+    entityId: loanId,
+    beforeState: { annualInterestRateBps: loan.annual_interest_rate_bps, termMonths: loan.term_months },
+    afterState: { annualInterestRateBps: rows[0].annual_interest_rate_bps, termMonths: rows[0].term_months },
+  });
+}
+
+/**
+ * Lists a loan's concessions with the effective status joined in from
+ * approval_requests (see migration 056's comment: there is no status
+ * column on loan_concessions itself, to avoid ever going stale on a
+ * rejected request). A NULL approval_request_id means it fell within the
+ * product's grace window and applied immediately.
+ */
+async function listConcessions(pool, { loanId }) {
+  const { rows } = await pool.query(
+    `SELECT lc.*,
+            COALESCE(ar.status, 'approved') AS status,
+            ar.decided_by, ar.decided_at, ar.decision_reason
+       FROM loan_concessions lc
+       LEFT JOIN approval_requests ar ON ar.id = lc.approval_request_id
+      WHERE lc.loan_id = $1
+      ORDER BY lc.created_at DESC`,
+    [loanId]
+  );
+  return rows;
+}
+
 // --- Write-off ---------------------------------------------------------------
 
 /**
@@ -1426,10 +1960,12 @@ async function getArrearsReport(pool, { branchId = null, asOfDate = todayIso() }
 function registerLoanExecutionHandlers() {
   approvalWorkflow.registerExecutionHandler('loan.approve', applyLoanApprovalDecision);
   approvalWorkflow.registerExecutionHandler('loan.restructure', applyRestructureOnApproval);
+  approvalWorkflow.registerExecutionHandler('loan.grant_concession', applyConcessionOnApproval);
 }
 
 module.exports = {
   createLoanProduct,
+  updateLoanProduct,
   getLoanProduct,
   listLoanProducts,
   calculateLoan,
@@ -1450,6 +1986,10 @@ module.exports = {
   listRepayments,
   requestRestructure,
   applyRestructureOnApproval,
+  requestConcession,
+  applyConcessionOnApproval,
+  listConcessions,
+  resetFloatingRateProducts,
   writeOffLoan,
   addCollateral,
   verifyCollateral,

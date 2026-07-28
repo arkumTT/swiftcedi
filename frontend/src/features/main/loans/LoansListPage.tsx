@@ -14,8 +14,8 @@ import { Button } from '../../../components/Button';
 import { Modal } from '../../../components/Modal';
 import { KpiCard } from '../../../components/KpiCard';
 import { FormField, inputClasses, selectClasses } from '../../../components/FormField';
-import { formatDate, formatGhs, formatBps, parseGhsInput } from '../../../lib/format';
-import type { Loan, LoanProduct, ArrearsReport, LoanCalculatorResult } from '../../../types/api';
+import { formatDate, formatGhs, formatBps, parseGhsInput, parsePercentToBps } from '../../../lib/format';
+import type { Loan, LoanProduct, PolicyRate, ArrearsReport, LoanCalculatorResult } from '../../../types/api';
 
 const LOAN_STATUSES = ['applied', 'appraised', 'pending_approval', 'approved', 'rejected', 'disbursed', 'closed', 'written_off'];
 
@@ -110,6 +110,8 @@ export function LoansListPage() {
       <LoanCalculatorCard products={productsQuery.data ?? []} />
 
       {hasPermission('loan.view_reports') && <ArrearsReportCard crossBranch={crossBranch} branches={branches ?? []} defaultBranchId={crossBranch ? '' : user!.homeBranchId} />}
+
+      {hasPermission('loan.manage_policy_rates') && <PolicyRatesCard />}
 
       <LoanProductsCard products={productsQuery.data ?? []} isLoading={productsQuery.isLoading} canManage={hasPermission('loan.manage_products')} />
 
@@ -397,9 +399,106 @@ function ArrearsReportCard({
   );
 }
 
+function PolicyRatesCard() {
+  const queryClient = useQueryClient();
+  const [createOpen, setCreateOpen] = useState(false);
+  const ratesQuery = useQuery({ queryKey: ['policy-rates'], queryFn: () => api.get<PolicyRate[]>('/loans/policy-rates') });
+
+  return (
+    <Card
+      title="Policy (reference) rates"
+      actions={
+        <Button variant="secondary" size="sm" onClick={() => setCreateOpen(true)}>
+          <Plus size={14} /> New policy rate
+        </Button>
+      }
+      padded={false}
+    >
+      <p className="px-4 pt-3 text-[12.5px] text-text-secondary">
+        What floating-rate loan products link to — a product's rate is this value plus its own spread, recomputed whenever this
+        changes and on the product's own reset cadence.
+      </p>
+      <DataTable
+        columns={[
+          { key: 'code', header: 'Code', render: (r) => r.code },
+          { key: 'name', header: 'Name', render: (r) => r.name },
+          { key: 'rate', header: 'Current rate', render: (r) => formatBps(r.rate_bps) },
+          { key: 'status', header: 'Status', render: (r) => <StatusBadge status={r.status} /> },
+        ]}
+        rows={ratesQuery.data ?? []}
+        getRowKey={(r) => r.id}
+        isLoading={ratesQuery.isLoading}
+        emptyTitle="No policy rates configured yet"
+      />
+      <CreatePolicyRateModal
+        open={createOpen}
+        onClose={() => setCreateOpen(false)}
+        onCreated={() => queryClient.invalidateQueries({ queryKey: ['policy-rates'] })}
+      />
+    </Card>
+  );
+}
+
+function CreatePolicyRateModal({ open, onClose, onCreated }: { open: boolean; onClose: () => void; onCreated: () => void }) {
+  const [code, setCode] = useState('');
+  const [name, setName] = useState('');
+  const [rate, setRate] = useState('');
+  const [error, setError] = useState<string | null>(null);
+
+  function reset() {
+    setCode('');
+    setName('');
+    setRate('');
+    setError(null);
+  }
+
+  const mutation = useMutation({
+    mutationFn: () => api.post('/loans/policy-rates', { code, name, rateBps: parsePercentToBps(rate) }),
+    onSuccess: () => {
+      onCreated();
+      onClose();
+      reset();
+    },
+    onError: (err) => setError(err instanceof ApiError ? err.message : 'Unable to create policy rate'),
+  });
+
+  return (
+    <Modal
+      open={open}
+      onClose={() => {
+        onClose();
+        reset();
+      }}
+      title="New policy rate"
+      footer={
+        <>
+          <Button variant="secondary" size="sm" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button variant="primary" size="sm" disabled={mutation.isPending} onClick={() => mutation.mutate()}>
+            Create
+          </Button>
+        </>
+      }
+    >
+      <div className="flex flex-col gap-3">
+        <FormField label="Code">{(id) => <input id={id} value={code} onChange={(e) => setCode(e.target.value.toUpperCase())} className={inputClasses} />}</FormField>
+        <FormField label="Name">{(id) => <input id={id} value={name} onChange={(e) => setName(e.target.value)} className={inputClasses} />}</FormField>
+        <FormField label="Rate (%)">{(id) => <input id={id} type="number" step="0.01" value={rate} onChange={(e) => setRate(e.target.value)} className={inputClasses} />}</FormField>
+        {error && (
+          <p role="alert" className="text-[13px] text-danger">
+            {error}
+          </p>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
 function LoanProductsCard({ products, isLoading, canManage }: { products: LoanProduct[]; isLoading: boolean; canManage: boolean }) {
   const queryClient = useQueryClient();
   const [createOpen, setCreateOpen] = useState(false);
+  const [editProduct, setEditProduct] = useState<LoanProduct | null>(null);
 
   return (
     <Card
@@ -418,7 +517,18 @@ function LoanProductsCard({ products, isLoading, canManage }: { products: LoanPr
           { key: 'code', header: 'Code', render: (p) => p.code },
           { key: 'name', header: 'Name', render: (p) => p.name },
           { key: 'type', header: 'Type', render: (p) => <span className="capitalize">{p.loan_type}</span> },
-          { key: 'rate', header: 'Rate (p.a.)', render: (p) => formatBps(p.annual_interest_rate_bps) },
+          {
+            key: 'rate',
+            header: 'Rate (p.a.)',
+            render: (p) =>
+              p.rate_type === 'floating' ? (
+                <span title={`reference + ${formatBps(p.spread_bps)} spread, resets ${p.reset_frequency}`}>
+                  {formatBps(p.annual_interest_rate_bps)} <span className="text-text-muted">(floating)</span>
+                </span>
+              ) : (
+                formatBps(p.annual_interest_rate_bps)
+              ),
+          },
           { key: 'term', header: 'Term range', render: (p) => `${p.min_term_months}–${p.max_term_months} mo` },
           { key: 'principal', header: 'Principal range', render: (p) => `${formatGhs(p.min_principal_pesewas)} – ${formatGhs(p.max_principal_pesewas)}` },
           { key: 'status', header: 'Status', render: (p) => <StatusBadge status={p.status} /> },
@@ -426,6 +536,7 @@ function LoanProductsCard({ products, isLoading, canManage }: { products: LoanPr
         rows={products}
         getRowKey={(p) => p.id}
         isLoading={isLoading}
+        onRowClick={canManage ? (p) => setEditProduct(p) : undefined}
         emptyTitle="No loan products configured yet"
       />
       <CreateLoanProductModal
@@ -433,16 +544,130 @@ function LoanProductsCard({ products, isLoading, canManage }: { products: LoanPr
         onClose={() => setCreateOpen(false)}
         onCreated={() => queryClient.invalidateQueries({ queryKey: ['loan-products'] })}
       />
+      <EditLoanProductModal
+        product={editProduct}
+        onClose={() => setEditProduct(null)}
+        onSaved={() => queryClient.invalidateQueries({ queryKey: ['loan-products'] })}
+      />
     </Card>
   );
 }
 
+/** Shared fixed/floating rate + concession-bound fields used by both create and edit — kept as one block since the two modals otherwise diverge (create starts blank, edit starts prefilled and PATCHes). */
+function RateAndConcessionFields({
+  rateType,
+  setRateType,
+  annualRate,
+  setAnnualRate,
+  referenceRateId,
+  setReferenceRateId,
+  spread,
+  setSpread,
+  resetFrequency,
+  setResetFrequency,
+  rateFloor,
+  setRateFloor,
+  spreadFloor,
+  setSpreadFloor,
+  concessionThreshold,
+  setConcessionThreshold,
+  policyRates,
+}: {
+  rateType: 'fixed' | 'floating';
+  setRateType: (v: 'fixed' | 'floating') => void;
+  annualRate: string;
+  setAnnualRate: (v: string) => void;
+  referenceRateId: string;
+  setReferenceRateId: (v: string) => void;
+  spread: string;
+  setSpread: (v: string) => void;
+  resetFrequency: 'monthly' | 'quarterly' | 'annually';
+  setResetFrequency: (v: 'monthly' | 'quarterly' | 'annually') => void;
+  rateFloor: string;
+  setRateFloor: (v: string) => void;
+  spreadFloor: string;
+  setSpreadFloor: (v: string) => void;
+  concessionThreshold: string;
+  setConcessionThreshold: (v: string) => void;
+  policyRates: PolicyRate[];
+}) {
+  return (
+    <>
+      <FormField label="Rate type">
+        {(id) => (
+          <select id={id} value={rateType} onChange={(e) => setRateType(e.target.value as typeof rateType)} className={selectClasses}>
+            <option value="fixed">Fixed</option>
+            <option value="floating">Floating</option>
+          </select>
+        )}
+      </FormField>
+      {rateType === 'fixed' ? (
+        <>
+          <FormField label="Annual interest rate (%)">
+            {(id) => <input id={id} type="number" step="0.01" value={annualRate} onChange={(e) => setAnnualRate(e.target.value)} className={inputClasses} />}
+          </FormField>
+          <FormField label="Concession floor — rate can never be negotiated below (%)" hint="Leave blank to not allow any concessions on this product.">
+            {(id) => <input id={id} type="number" step="0.01" value={rateFloor} onChange={(e) => setRateFloor(e.target.value)} className={inputClasses} />}
+          </FormField>
+        </>
+      ) : (
+        <>
+          <FormField label="Reference (policy) rate">
+            {(id) => (
+              <select id={id} value={referenceRateId} onChange={(e) => setReferenceRateId(e.target.value)} className={selectClasses}>
+                <option value="">Select a policy rate…</option>
+                {policyRates.map((r) => (
+                  <option key={r.id} value={r.id}>
+                    {r.name} ({formatBps(r.rate_bps)})
+                  </option>
+                ))}
+              </select>
+            )}
+          </FormField>
+          <div className="grid grid-cols-2 gap-3">
+            <FormField label="Spread / margin (%)">
+              {(id) => <input id={id} type="number" step="0.01" value={spread} onChange={(e) => setSpread(e.target.value)} className={inputClasses} />}
+            </FormField>
+            <FormField label="Reset frequency">
+              {(id) => (
+                <select id={id} value={resetFrequency} onChange={(e) => setResetFrequency(e.target.value as typeof resetFrequency)} className={selectClasses}>
+                  <option value="monthly">Monthly</option>
+                  <option value="quarterly">Quarterly</option>
+                  <option value="annually">Annually</option>
+                </select>
+              )}
+            </FormField>
+          </div>
+          <FormField label="Concession floor — spread can never be negotiated below (%)" hint="Leave blank to not allow any concessions on this product. The reference rate itself is never negotiable, only the spread.">
+            {(id) => <input id={id} type="number" step="0.01" value={spreadFloor} onChange={(e) => setSpreadFloor(e.target.value)} className={inputClasses} />}
+          </FormField>
+        </>
+      )}
+      <FormField
+        label="Concession approval threshold (%)"
+        hint="A concession discounting the rate/spread by more than this many percentage points — or changing term or fees at all — needs branch manager sign-off. Within this window it applies immediately."
+      >
+        {(id) => <input id={id} type="number" step="0.01" value={concessionThreshold} onChange={(e) => setConcessionThreshold(e.target.value)} className={inputClasses} />}
+      </FormField>
+    </>
+  );
+}
+
 function CreateLoanProductModal({ open, onClose, onCreated }: { open: boolean; onClose: () => void; onCreated: () => void }) {
+  const policyRatesQuery = useQuery({ queryKey: ['policy-rates'], queryFn: () => api.get<PolicyRate[]>('/loans/policy-rates'), enabled: open });
   const [name, setName] = useState('');
   const [code, setCode] = useState('');
+  const [description, setDescription] = useState('');
   const [loanType, setLoanType] = useState<'individual' | 'group' | 'overdraft'>('individual');
   const [interestMethod, setInterestMethod] = useState<'flat' | 'reducing_balance'>('reducing_balance');
+  const [rateType, setRateType] = useState<'fixed' | 'floating'>('fixed');
   const [annualRate, setAnnualRate] = useState('');
+  const [referenceRateId, setReferenceRateId] = useState('');
+  const [spread, setSpread] = useState('');
+  const [resetFrequency, setResetFrequency] = useState<'monthly' | 'quarterly' | 'annually'>('monthly');
+  const [rateFloor, setRateFloor] = useState('');
+  const [spreadFloor, setSpreadFloor] = useState('');
+  const [concessionThreshold, setConcessionThreshold] = useState('0');
   const [minTerm, setMinTerm] = useState('');
   const [maxTerm, setMaxTerm] = useState('');
   const [minPrincipal, setMinPrincipal] = useState('');
@@ -452,9 +677,17 @@ function CreateLoanProductModal({ open, onClose, onCreated }: { open: boolean; o
   function reset() {
     setName('');
     setCode('');
+    setDescription('');
     setLoanType('individual');
     setInterestMethod('reducing_balance');
+    setRateType('fixed');
     setAnnualRate('');
+    setReferenceRateId('');
+    setSpread('');
+    setResetFrequency('monthly');
+    setRateFloor('');
+    setSpreadFloor('');
+    setConcessionThreshold('0');
     setMinTerm('');
     setMaxTerm('');
     setMinPrincipal('');
@@ -467,9 +700,17 @@ function CreateLoanProductModal({ open, onClose, onCreated }: { open: boolean; o
       api.post('/loans/products', {
         name,
         code,
+        description: description || null,
         loanType,
         interestMethod,
-        annualInterestRateBps: Math.round(Number(annualRate) * 100),
+        rateType,
+        annualInterestRateBps: rateType === 'fixed' ? parsePercentToBps(annualRate) : undefined,
+        referenceRateId: rateType === 'floating' ? referenceRateId : undefined,
+        spreadBps: rateType === 'floating' ? parsePercentToBps(spread) : undefined,
+        resetFrequency: rateType === 'floating' ? resetFrequency : undefined,
+        minRateFloorBps: rateType === 'fixed' && rateFloor ? parsePercentToBps(rateFloor) : null,
+        minSpreadFloorBps: rateType === 'floating' && spreadFloor ? parsePercentToBps(spreadFloor) : null,
+        concessionApprovalThresholdBps: parsePercentToBps(concessionThreshold),
         minTermMonths: Number(minTerm),
         maxTermMonths: Number(maxTerm),
         minPrincipalPesewas: parseGhsInput(minPrincipal),
@@ -505,6 +746,9 @@ function CreateLoanProductModal({ open, onClose, onCreated }: { open: boolean; o
       <div className="flex flex-col gap-3">
         <FormField label="Name">{(id) => <input id={id} value={name} onChange={(e) => setName(e.target.value)} className={inputClasses} />}</FormField>
         <FormField label="Code">{(id) => <input id={id} value={code} onChange={(e) => setCode(e.target.value.toUpperCase())} className={inputClasses} />}</FormField>
+        <FormField label="Description">
+          {(id) => <textarea id={id} rows={2} value={description} onChange={(e) => setDescription(e.target.value)} className={inputClasses} />}
+        </FormField>
         <FormField label="Loan type">
           {(id) => (
             <select id={id} value={loanType} onChange={(e) => setLoanType(e.target.value as typeof loanType)} className={selectClasses}>
@@ -522,9 +766,25 @@ function CreateLoanProductModal({ open, onClose, onCreated }: { open: boolean; o
             </select>
           )}
         </FormField>
-        <FormField label="Annual interest rate (%)">
-          {(id) => <input id={id} type="number" step="0.01" value={annualRate} onChange={(e) => setAnnualRate(e.target.value)} className={inputClasses} />}
-        </FormField>
+        <RateAndConcessionFields
+          rateType={rateType}
+          setRateType={setRateType}
+          annualRate={annualRate}
+          setAnnualRate={setAnnualRate}
+          referenceRateId={referenceRateId}
+          setReferenceRateId={setReferenceRateId}
+          spread={spread}
+          setSpread={setSpread}
+          resetFrequency={resetFrequency}
+          setResetFrequency={setResetFrequency}
+          rateFloor={rateFloor}
+          setRateFloor={setRateFloor}
+          spreadFloor={spreadFloor}
+          setSpreadFloor={setSpreadFloor}
+          concessionThreshold={concessionThreshold}
+          setConcessionThreshold={setConcessionThreshold}
+          policyRates={policyRatesQuery.data ?? []}
+        />
         <div className="grid grid-cols-2 gap-3">
           <FormField label="Min term (months)">{(id) => <input id={id} type="number" value={minTerm} onChange={(e) => setMinTerm(e.target.value)} className={inputClasses} />}</FormField>
           <FormField label="Max term (months)">{(id) => <input id={id} type="number" value={maxTerm} onChange={(e) => setMaxTerm(e.target.value)} className={inputClasses} />}</FormField>
@@ -539,6 +799,122 @@ function CreateLoanProductModal({ open, onClose, onCreated }: { open: boolean; o
           </p>
         )}
       </div>
+    </Modal>
+  );
+}
+
+function EditLoanProductModal({ product, onClose, onSaved }: { product: LoanProduct | null; onClose: () => void; onSaved: () => void }) {
+  const policyRatesQuery = useQuery({ queryKey: ['policy-rates'], queryFn: () => api.get<PolicyRate[]>('/loans/policy-rates'), enabled: !!product });
+  const [status, setStatus] = useState<'active' | 'inactive'>('active');
+  const [description, setDescription] = useState('');
+  const [rateType, setRateType] = useState<'fixed' | 'floating'>('fixed');
+  const [annualRate, setAnnualRate] = useState('');
+  const [referenceRateId, setReferenceRateId] = useState('');
+  const [spread, setSpread] = useState('');
+  const [resetFrequency, setResetFrequency] = useState<'monthly' | 'quarterly' | 'annually'>('monthly');
+  const [rateFloor, setRateFloor] = useState('');
+  const [spreadFloor, setSpreadFloor] = useState('');
+  const [concessionThreshold, setConcessionThreshold] = useState('0');
+  const [error, setError] = useState<string | null>(null);
+
+  // Reset local state to the product's current values whenever a different
+  // (or no) product is opened for editing — this modal is mounted once and
+  // reused, not remounted per-row.
+  const [loadedProductId, setLoadedProductId] = useState<string | null>(null);
+  if (product && product.id !== loadedProductId) {
+    setLoadedProductId(product.id);
+    setStatus(product.status);
+    setDescription(product.description ?? '');
+    setRateType(product.rate_type);
+    setAnnualRate(product.rate_type === 'fixed' ? (product.annual_interest_rate_bps / 100).toString() : '');
+    setReferenceRateId(product.reference_rate_id ?? '');
+    setSpread(product.spread_bps !== null ? (product.spread_bps / 100).toString() : '');
+    setResetFrequency(product.reset_frequency ?? 'monthly');
+    setRateFloor(product.min_rate_floor_bps !== null ? (product.min_rate_floor_bps / 100).toString() : '');
+    setSpreadFloor(product.min_spread_floor_bps !== null ? (product.min_spread_floor_bps / 100).toString() : '');
+    setConcessionThreshold((product.concession_approval_threshold_bps / 100).toString());
+  }
+
+  const mutation = useMutation({
+    mutationFn: () =>
+      api.patch(`/loans/products/${product!.id}`, {
+        status,
+        description: description || null,
+        rateType,
+        annualInterestRateBps: rateType === 'fixed' ? parsePercentToBps(annualRate) : undefined,
+        referenceRateId: rateType === 'floating' ? referenceRateId : undefined,
+        spreadBps: rateType === 'floating' ? parsePercentToBps(spread) : undefined,
+        resetFrequency: rateType === 'floating' ? resetFrequency : undefined,
+        minRateFloorBps: rateType === 'fixed' && rateFloor ? parsePercentToBps(rateFloor) : null,
+        minSpreadFloorBps: rateType === 'floating' && spreadFloor ? parsePercentToBps(spreadFloor) : null,
+        concessionApprovalThresholdBps: parsePercentToBps(concessionThreshold),
+      }),
+    onSuccess: () => {
+      onSaved();
+      onClose();
+    },
+    onError: (err) => setError(err instanceof ApiError ? err.message : 'Unable to update loan product'),
+  });
+
+  return (
+    <Modal
+      open={!!product}
+      onClose={onClose}
+      title={product ? `Edit ${product.code}` : 'Edit product'}
+      footer={
+        <>
+          <Button variant="secondary" size="sm" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button variant="primary" size="sm" disabled={mutation.isPending} onClick={() => mutation.mutate()}>
+            Save changes
+          </Button>
+        </>
+      }
+    >
+      {product && (
+        <div className="flex flex-col gap-3">
+          <p className="text-[12.5px] text-text-secondary">
+            Editing terms here only affects future applications — loans already applied for keep their own snapshotted rate,
+            term, and fees regardless of what changes here.
+          </p>
+          <FormField label="Status">
+            {(id) => (
+              <select id={id} value={status} onChange={(e) => setStatus(e.target.value as typeof status)} className={selectClasses}>
+                <option value="active">Active</option>
+                <option value="inactive">Inactive</option>
+              </select>
+            )}
+          </FormField>
+          <FormField label="Description">
+            {(id) => <textarea id={id} rows={2} value={description} onChange={(e) => setDescription(e.target.value)} className={inputClasses} />}
+          </FormField>
+          <RateAndConcessionFields
+            rateType={rateType}
+            setRateType={setRateType}
+            annualRate={annualRate}
+            setAnnualRate={setAnnualRate}
+            referenceRateId={referenceRateId}
+            setReferenceRateId={setReferenceRateId}
+            spread={spread}
+            setSpread={setSpread}
+            resetFrequency={resetFrequency}
+            setResetFrequency={setResetFrequency}
+            rateFloor={rateFloor}
+            setRateFloor={setRateFloor}
+            spreadFloor={spreadFloor}
+            setSpreadFloor={setSpreadFloor}
+            concessionThreshold={concessionThreshold}
+            setConcessionThreshold={setConcessionThreshold}
+            policyRates={policyRatesQuery.data ?? []}
+          />
+          {error && (
+            <p role="alert" className="text-[13px] text-danger">
+              {error}
+            </p>
+          )}
+        </div>
+      )}
     </Modal>
   );
 }

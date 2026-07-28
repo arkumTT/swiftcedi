@@ -310,6 +310,9 @@ export interface Loan {
   product_id: string;
   principal_pesewas: number;
   term_months: number;
+  interest_method: 'flat' | 'reducing_balance';
+  annual_interest_rate_bps: number;
+  fee_schedule: { code?: string; type: 'flat' | 'percent_of_principal'; amountPesewas?: number; rateBps?: number }[];
   status: 'applied' | 'appraised' | 'pending_approval' | 'approved' | 'rejected' | 'disbursed' | 'closed' | 'written_off';
   disbursed_at: string | null;
   created_at: string;
@@ -498,9 +501,19 @@ export interface LoanProduct {
   id: string;
   name: string;
   code: string;
+  description: string | null;
   loan_type: 'individual' | 'group' | 'overdraft';
   interest_method: 'flat' | 'reducing_balance';
+  rate_type: 'fixed' | 'floating';
   annual_interest_rate_bps: number;
+  reference_rate_id: string | null;
+  spread_bps: number | null;
+  reset_frequency: 'monthly' | 'quarterly' | 'annually' | null;
+  last_reset_at: string | null;
+  min_rate_floor_bps: number | null;
+  min_spread_floor_bps: number | null;
+  concession_approval_threshold_bps: number;
+  allowed_repayment_frequencies: string[];
   min_term_months: number;
   max_term_months: number;
   min_principal_pesewas: number;
@@ -509,6 +522,49 @@ export interface LoanProduct {
   par_bucket_days: number[];
   reason_codes: string[];
   status: 'active' | 'inactive';
+}
+
+export interface PolicyRate {
+  id: string;
+  code: string;
+  name: string;
+  rate_bps: number;
+  status: 'active' | 'inactive';
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PolicyRateChange {
+  id: string;
+  policy_rate_id: string;
+  old_rate_bps: number;
+  new_rate_bps: number;
+  effective_date: string;
+  changed_by: string;
+  created_at: string;
+}
+
+export interface LoanConcession {
+  id: string;
+  loan_id: string;
+  requested_by: string;
+  reason_code: 'loyal_customer' | 'competitive_match' | 'hardship' | 'other';
+  reason_notes: string | null;
+  standard_annual_interest_rate_bps: number;
+  negotiated_annual_interest_rate_bps: number;
+  standard_spread_bps: number | null;
+  negotiated_spread_bps: number | null;
+  applied_floor_bps: number | null;
+  standard_term_months: number;
+  negotiated_term_months: number;
+  standard_fee_schedule: { code?: string; type: 'flat' | 'percent_of_principal'; amountPesewas?: number; rateBps?: number }[];
+  negotiated_fee_schedule: { code?: string; type: 'flat' | 'percent_of_principal'; amountPesewas?: number; rateBps?: number }[];
+  approval_request_id: string | null;
+  status: 'pending' | 'approved' | 'rejected';
+  decided_by: string | null;
+  decided_at: string | null;
+  decision_reason: string | null;
+  created_at: string;
 }
 
 export interface LoanAppraisal {

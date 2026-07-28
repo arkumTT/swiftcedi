@@ -5,6 +5,7 @@ const { requireAuth } = require('../middleware/auth');
 const { requirePermission, canAccessBranch } = require('../middleware/requirePermission');
 const { asyncHandler } = require('../utils/asyncHandler');
 const loanService = require('../modules/loan/loanService');
+const policyRateService = require('../modules/loan/policyRateService');
 
 // Route order: fixed-prefix paths (/products, /calculator, /reports/...)
 // are registered before the /:id catch-all — see Decisions_Log.md's route
@@ -39,6 +40,91 @@ function loansRouter(pool) {
     auth,
     asyncHandler(async (req, res) => {
       res.json(await loanService.getLoanProduct(pool, req.params.productId));
+    })
+  );
+
+  router.patch(
+    '/products/:productId',
+    auth,
+    requirePermission('loan.manage_products'),
+    asyncHandler(async (req, res) => {
+      const product = await loanService.updateLoanProduct(pool, {
+        productId: req.params.productId,
+        ...req.body,
+        updatedBy: req.user.id,
+        actorBranchId: req.user.homeBranchId,
+      });
+      res.json(product);
+    })
+  );
+
+  // --- Policy (reference) rates — what FLOATING products link to --------
+
+  router.get(
+    '/policy-rates',
+    auth,
+    asyncHandler(async (req, res) => {
+      const { status } = req.query;
+      res.json(await policyRateService.listPolicyRates(pool, { status }));
+    })
+  );
+
+  router.post(
+    '/policy-rates',
+    auth,
+    requirePermission('loan.manage_policy_rates'),
+    asyncHandler(async (req, res) => {
+      const policyRate = await policyRateService.createPolicyRate(pool, { ...req.body, createdBy: req.user.id });
+      res.status(201).json(policyRate);
+    })
+  );
+
+  router.get(
+    '/policy-rates/:policyRateId',
+    auth,
+    asyncHandler(async (req, res) => {
+      res.json(await policyRateService.getPolicyRate(pool, req.params.policyRateId));
+    })
+  );
+
+  router.patch(
+    '/policy-rates/:policyRateId',
+    auth,
+    requirePermission('loan.manage_policy_rates'),
+    asyncHandler(async (req, res) => {
+      const { rateBps, effectiveDate } = req.body || {};
+      const policyRate = await policyRateService.updatePolicyRateValue(pool, {
+        policyRateId: req.params.policyRateId,
+        rateBps,
+        effectiveDate,
+        changedBy: req.user.id,
+        actorBranchId: req.user.homeBranchId,
+      });
+      res.json(policyRate);
+    })
+  );
+
+  router.patch(
+    '/policy-rates/:policyRateId/status',
+    auth,
+    requirePermission('loan.manage_policy_rates'),
+    asyncHandler(async (req, res) => {
+      const { status } = req.body || {};
+      const policyRate = await policyRateService.setPolicyRateStatus(pool, {
+        policyRateId: req.params.policyRateId,
+        status,
+        changedBy: req.user.id,
+        actorBranchId: req.user.homeBranchId,
+      });
+      res.json(policyRate);
+    })
+  );
+
+  router.get(
+    '/policy-rates/:policyRateId/history',
+    auth,
+    asyncHandler(async (req, res) => {
+      res.json(await policyRateService.listPolicyRateHistory(pool, { policyRateId: req.params.policyRateId }));
     })
   );
 
@@ -240,6 +326,39 @@ function loansRouter(pool) {
         requestedBy: req.user.id,
       });
       res.status(202).json(restructure);
+    })
+  );
+
+  router.get(
+    '/:id/concessions',
+    auth,
+    asyncHandler(async (req, res) => {
+      res.json(await loanService.listConcessions(pool, { loanId: req.params.id }));
+    })
+  );
+
+  router.post(
+    '/:id/concessions',
+    auth,
+    requirePermission('loan.grant_concession'),
+    asyncHandler(async (req, res) => {
+      const { negotiatedAnnualInterestRateBps, negotiatedSpreadBps, negotiatedTermMonths, negotiatedFeeSchedule, reasonCode, reasonNotes } =
+        req.body || {};
+      const result = await loanService.requestConcession(pool, {
+        loanId: req.params.id,
+        negotiatedAnnualInterestRateBps,
+        negotiatedSpreadBps,
+        negotiatedTermMonths,
+        negotiatedFeeSchedule,
+        reasonCode,
+        reasonNotes,
+        requestedBy: req.user.id,
+      });
+      // 202 when it's still pending a second approval (nothing has taken
+      // effect yet), 201 when it applied immediately within the grace
+      // window — same "don't imply completion for a queued request"
+      // discipline as loan.restructure/loan.approve.
+      res.status(result.needsApproval ? 202 : 201).json(result);
     })
   );
 

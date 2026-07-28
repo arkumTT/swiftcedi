@@ -8,6 +8,8 @@ const {
   bucketArrearsDays,
   computeFeesPesewas,
   computeOverdraftInterestPesewas,
+  computeFloatingEffectiveRateBps,
+  evaluateConcessionBounds,
 } = require('../../src/modules/loan/loanMath');
 
 describe('addMonthsToDateString (pure)', () => {
@@ -295,5 +297,126 @@ describe('computeOverdraftInterestPesewas (pure)', () => {
     expect(() =>
       computeOverdraftInterestPesewas({ drawnBalancePesewas: 1000000, annualInterestRateBps: 2400, days: 0 })
     ).toThrow(/days/);
+  });
+});
+
+describe('computeFloatingEffectiveRateBps (pure)', () => {
+  test('reference rate plus spread', () => {
+    expect(computeFloatingEffectiveRateBps({ referenceRateBps: 2900, spreadBps: 500 })).toBe(3400);
+  });
+
+  test('zero spread just mirrors the reference rate', () => {
+    expect(computeFloatingEffectiveRateBps({ referenceRateBps: 2900, spreadBps: 0 })).toBe(2900);
+  });
+
+  test('rejects a negative reference rate', () => {
+    expect(() => computeFloatingEffectiveRateBps({ referenceRateBps: -1, spreadBps: 500 })).toThrow(/referenceRateBps/);
+  });
+
+  test('rejects a negative spread', () => {
+    expect(() => computeFloatingEffectiveRateBps({ referenceRateBps: 2900, spreadBps: -1 })).toThrow(/spreadBps/);
+  });
+});
+
+describe('evaluateConcessionBounds (pure)', () => {
+  test('a fixed-product concession within the floor and within the grace threshold auto-applies', () => {
+    const result = evaluateConcessionBounds({
+      rateType: 'fixed',
+      standardAnnualInterestRateBps: 2400,
+      negotiatedAnnualInterestRateBps: 2350, // 50bps discount
+      minRateFloorBps: 2000,
+      concessionApprovalThresholdBps: 100,
+    });
+    expect(result).toEqual({ permitted: true, withinFloor: true, appliedFloorBps: 2000, deltaBps: 50, needsApproval: false });
+  });
+
+  test('a fixed-product concession beyond the grace threshold needs approval', () => {
+    const result = evaluateConcessionBounds({
+      rateType: 'fixed',
+      standardAnnualInterestRateBps: 2400,
+      negotiatedAnnualInterestRateBps: 2100, // 300bps discount
+      minRateFloorBps: 2000,
+      concessionApprovalThresholdBps: 100,
+    });
+    expect(result.permitted).toBe(true);
+    expect(result.needsApproval).toBe(true);
+    expect(result.deltaBps).toBe(300);
+  });
+
+  test('a fixed-product concession breaching the floor is not permitted, regardless of threshold', () => {
+    const result = evaluateConcessionBounds({
+      rateType: 'fixed',
+      standardAnnualInterestRateBps: 2400,
+      negotiatedAnnualInterestRateBps: 1900, // below the 2000bps floor
+      minRateFloorBps: 2000,
+      concessionApprovalThresholdBps: 1000,
+    });
+    expect(result.permitted).toBe(false);
+    expect(result.withinFloor).toBe(false);
+    expect(result.needsApproval).toBe(false);
+  });
+
+  test('a negotiated rate above standard is a markup, never permitted', () => {
+    const result = evaluateConcessionBounds({
+      rateType: 'fixed',
+      standardAnnualInterestRateBps: 2400,
+      negotiatedAnnualInterestRateBps: 2500,
+      minRateFloorBps: 2000,
+      concessionApprovalThresholdBps: 100,
+    });
+    expect(result.permitted).toBe(false);
+  });
+
+  test('no floor configured on the product means concessions are not permitted at all', () => {
+    const result = evaluateConcessionBounds({
+      rateType: 'fixed',
+      standardAnnualInterestRateBps: 2400,
+      negotiatedAnnualInterestRateBps: 2350,
+      minRateFloorBps: null,
+      concessionApprovalThresholdBps: 100,
+    });
+    expect(result.permitted).toBe(false);
+    expect(result.appliedFloorBps).toBeNull();
+  });
+
+  test('a floating-product concession is evaluated on the spread, not the blended rate', () => {
+    const result = evaluateConcessionBounds({
+      rateType: 'floating',
+      standardAnnualInterestRateBps: 3400, // blended rate, irrelevant to the bound check
+      negotiatedAnnualInterestRateBps: 3300,
+      standardSpreadBps: 500,
+      negotiatedSpreadBps: 400,
+      minSpreadFloorBps: 300,
+      concessionApprovalThresholdBps: 50,
+    });
+    expect(result.permitted).toBe(true);
+    expect(result.appliedFloorBps).toBe(300);
+    expect(result.deltaBps).toBe(100);
+    expect(result.needsApproval).toBe(true);
+  });
+
+  test('a term or fee change forces approval even for a zero-bps rate concession', () => {
+    const result = evaluateConcessionBounds({
+      rateType: 'fixed',
+      standardAnnualInterestRateBps: 2400,
+      negotiatedAnnualInterestRateBps: 2400,
+      minRateFloorBps: 2000,
+      concessionApprovalThresholdBps: 100,
+      termChanged: true,
+    });
+    expect(result.permitted).toBe(true);
+    expect(result.deltaBps).toBe(0);
+    expect(result.needsApproval).toBe(true);
+  });
+
+  test('rejects an unknown rateType', () => {
+    expect(() =>
+      evaluateConcessionBounds({
+        rateType: 'weird',
+        standardAnnualInterestRateBps: 2400,
+        negotiatedAnnualInterestRateBps: 2400,
+        concessionApprovalThresholdBps: 0,
+      })
+    ).toThrow(/rateType/);
   });
 });

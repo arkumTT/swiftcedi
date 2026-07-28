@@ -15,6 +15,7 @@ const { execFileSync } = require('child_process');
 const path = require('path');
 
 const loanService = require('../../src/modules/loan/loanService');
+const policyRateService = require('../../src/modules/loan/policyRateService');
 const savingsService = require('../../src/modules/savings/savingsService');
 const branchService = require('../../src/modules/branch/branchService');
 const customerService = require('../../src/modules/customer/customerService');
@@ -29,8 +30,10 @@ describeIfDb('Module 3: loan management', () => {
   let branchId;
   let glAccounts;
   let ownerRoleId;
+  let branchManagerRoleId;
   let maker;
   let checker;
+  let branchManagerChecker;
 
   beforeAll(async () => {
     execFileSync('node', [path.join(__dirname, '../../src/db/migrate.js'), '--test'], {
@@ -97,9 +100,12 @@ describeIfDb('Module 3: loan management', () => {
       'loan_guarantors',
       'loan_collateral',
       'loan_restructures',
+      'loan_concessions',
       'loan_schedules',
       'loans',
       'loan_products',
+      'policy_rate_changes',
+      'policy_rates',
       'account_closures',
       'credit_bureau_lookups',
       'customer_documents',
@@ -142,9 +148,30 @@ describeIfDb('Module 3: loan management', () => {
 
     const { rows: roleRows } = await pool.query("SELECT id FROM roles WHERE name = 'owner'");
     ownerRoleId = roleRows[0].id;
+    const { rows: bmRoleRows } = await pool.query("SELECT id FROM roles WHERE name = 'branch_manager'");
+    branchManagerRoleId = bmRoleRows[0].id;
 
     maker = await createTestUser('loan-maker@test.local');
     checker = await createTestUser('loan-checker@test.local');
+    // Migration 057 pins branch_manager as the required approver for
+    // 'loan.grant_concession' — a plain owner-role checker (like `checker`
+    // above) does NOT satisfy that role check, so concession tests need
+    // their own decider actually holding that role.
+    branchManagerChecker = await createTestUser('loan-bm-checker@test.local', branchManagerRoleId);
+
+    // approval_thresholds is cleared by every integration suite's own
+    // cleanup (including this one, above), so migration 057's seeded row
+    // for 'loan.grant_concession' does not reliably survive a full
+    // `npx jest` run across files — this suite owns re-seeding it, the
+    // same convention cashierModule.test.js/savingsModule.test.js follow
+    // for their own threshold-gated actions.
+    await pool.query(
+      `INSERT INTO approval_thresholds (action_type, amount_threshold_pesewas, required_approver_role_id)
+       VALUES ('loan.grant_concession', 0, $1)
+       ON CONFLICT (action_type, (COALESCE(branch_id, 0)))
+       DO UPDATE SET required_approver_role_id = EXCLUDED.required_approver_role_id`,
+      [branchManagerRoleId]
+    );
 
     const branch = await branchService.createBranch(pool, { code: 'LON-01', name: 'Loan Test Branch', createdBy: maker });
     branchId = branch.id;
@@ -156,11 +183,11 @@ describeIfDb('Module 3: loan management', () => {
     await pool.end();
   });
 
-  async function createTestUser(email) {
+  async function createTestUser(email, roleId = ownerRoleId) {
     const { rows } = await pool.query(
       `INSERT INTO users (full_name, email, password_hash, role_id, home_branch_id)
        VALUES ($1, $1, 'x', $2, (SELECT id FROM branches WHERE code = 'HQ')) RETURNING id`,
-      [email, ownerRoleId]
+      [email, roleId]
     );
     return rows[0].id;
   }
@@ -195,6 +222,34 @@ describeIfDb('Module 3: loan management', () => {
       feeSchedule: [],
       createdBy: maker,
       ...overrides,
+    });
+  }
+
+  let policyRateSeq = 0;
+  async function createPolicyRateFixture(rateBps = 2900) {
+    policyRateSeq += 1;
+    return policyRateService.createPolicyRate(pool, {
+      code: `POL${policyRateSeq}`,
+      name: `Policy Rate ${policyRateSeq}`,
+      rateBps,
+      createdBy: maker,
+    });
+  }
+
+  async function createFloatingProduct(overrides = {}) {
+    const { referenceRateId, spreadBps, ...rest } = overrides;
+    let resolvedReferenceRateId = referenceRateId;
+    if (!resolvedReferenceRateId) {
+      const policyRate = await createPolicyRateFixture();
+      resolvedReferenceRateId = policyRate.id;
+    }
+    return createProduct({
+      rateType: 'floating',
+      annualInterestRateBps: undefined,
+      referenceRateId: resolvedReferenceRateId,
+      spreadBps: spreadBps ?? 500,
+      resetFrequency: 'monthly',
+      ...rest,
     });
   }
 
@@ -1012,6 +1067,478 @@ describeIfDb('Module 3: loan management', () => {
       const finalAccount = await savingsService.getAccount(pool, account.id);
       expect(Number(finalAccount.balance_pesewas)).toBe(0);
       expect(Number(finalAccount.overdraft_limit_pesewas)).toBe(0);
+    });
+  });
+
+  describe('loan products: fixed/floating configuration and updates', () => {
+    test('creates a fixed-rate product with description, floor, and concession threshold', async () => {
+      const product = await createProduct({
+        description: 'Standard salary-backed personal loan',
+        minRateFloorBps: 1800,
+        concessionApprovalThresholdBps: 100,
+      });
+      expect(product.rate_type).toBe('fixed');
+      expect(product.description).toBe('Standard salary-backed personal loan');
+      expect(product.annual_interest_rate_bps).toBe(2400);
+      expect(product.min_rate_floor_bps).toBe(1800);
+      expect(product.reference_rate_id).toBeNull();
+      expect(product.allowed_repayment_frequencies).toEqual(['monthly']);
+    });
+
+    test('creates a floating-rate product whose rate is computed from the reference rate plus spread, not accepted directly', async () => {
+      const policyRate = await createPolicyRateFixture(2900);
+      const product = await createFloatingProduct({ referenceRateId: policyRate.id, spreadBps: 450 });
+      expect(product.rate_type).toBe('floating');
+      expect(product.reference_rate_id).toBe(policyRate.id);
+      expect(product.spread_bps).toBe(450);
+      expect(product.annual_interest_rate_bps).toBe(3350); // 2900 + 450
+    });
+
+    test('rejects a floating product missing reference/spread/reset fields', async () => {
+      await expect(createProduct({ rateType: 'floating', annualInterestRateBps: undefined })).rejects.toThrow(
+        loanService.LoanValidationError
+      );
+    });
+
+    test('rejects an allowedRepaymentFrequencies value other than monthly — the schedule generator does not amortize on any other cadence', async () => {
+      await expect(createProduct({ allowedRepaymentFrequencies: ['weekly'] })).rejects.toThrow(loanService.LoanValidationError);
+    });
+
+    test('updateLoanProduct edits an existing product and is audited, without touching an already-applied loan', async () => {
+      const product = await createProduct({ annualInterestRateBps: 2200, description: 'Original description' });
+      const customer = await createVerifiedCustomer('Product Update Borrower');
+      const loan = await loanService.applyForLoan(pool, {
+        customerId: customer.id,
+        productId: product.id,
+        principalPesewas: 50000,
+        termMonths: 6,
+        appliedBy: maker,
+      });
+      expect(loan.annual_interest_rate_bps).toBe(2200);
+
+      const updated = await loanService.updateLoanProduct(pool, {
+        productId: product.id,
+        annualInterestRateBps: 3000,
+        description: 'Updated description',
+        updatedBy: maker,
+        actorBranchId: branchId,
+      });
+      expect(updated.annual_interest_rate_bps).toBe(3000);
+      expect(updated.description).toBe('Updated description');
+
+      // The already-applied loan keeps its own snapshotted rate — the
+      // product edit never retroactively touches it.
+      const untouchedLoan = await loanService.getLoan(pool, loan.id);
+      expect(untouchedLoan.annual_interest_rate_bps).toBe(2200);
+
+      const { rows: auditRows } = await pool.query(
+        `SELECT * FROM audit_log WHERE entity_type = 'loan_product' AND entity_id = $1 AND action = 'loan.product_updated'`,
+        [product.id]
+      );
+      expect(auditRows).toHaveLength(1);
+    });
+
+    test('a product edit also does not change fees already snapshotted onto an applied loan at disbursement', async () => {
+      const product = await createProduct({
+        feeSchedule: [{ code: 'PROCESSING', type: 'flat', amountPesewas: 500 }],
+      });
+      const customer = await createVerifiedCustomer('Fee Snapshot Borrower');
+      const loan = await takeLoanToDisbursed({ product, customer, principalPesewas: 50000, termMonths: 6 });
+
+      // Product's fees change AFTER this loan already disbursed with the
+      // original 500-pesewas fee baked into its GL entry.
+      await loanService.updateLoanProduct(pool, {
+        productId: product.id,
+        feeSchedule: [{ code: 'PROCESSING', type: 'flat', amountPesewas: 5000 }],
+        updatedBy: maker,
+        actorBranchId: branchId,
+      });
+
+      const untouchedLoan = await loanService.getLoan(pool, loan.id);
+      expect(untouchedLoan.fee_schedule).toEqual([{ code: 'PROCESSING', type: 'flat', amountPesewas: 500 }]);
+    });
+  });
+
+  describe('policy rates and floating-rate reset', () => {
+    test('updatePolicyRateValue changes the rate, logs history, and audits the change', async () => {
+      const policyRate = await createPolicyRateFixture(2900);
+      const updated = await policyRateService.updatePolicyRateValue(pool, {
+        policyRateId: policyRate.id,
+        rateBps: 3100,
+        effectiveDate: '2026-02-01',
+        changedBy: maker,
+        actorBranchId: branchId,
+      });
+      expect(updated.rate_bps).toBe(3100);
+
+      const history = await policyRateService.listPolicyRateHistory(pool, { policyRateId: policyRate.id });
+      expect(history).toHaveLength(1);
+      expect(history[0].old_rate_bps).toBe(2900);
+      expect(history[0].new_rate_bps).toBe(3100);
+
+      const { rows: auditRows } = await pool.query(
+        `SELECT * FROM audit_log WHERE entity_type = 'policy_rate' AND entity_id = $1 AND action = 'loan.policy_rate_changed'`,
+        [policyRate.id]
+      );
+      expect(auditRows).toHaveLength(1);
+    });
+
+    test('resetFloatingRateProducts recalculates a due floating product\'s listing rate from the (possibly since-changed) reference rate', async () => {
+      const policyRate = await createPolicyRateFixture(2900);
+      const product = await createFloatingProduct({ referenceRateId: policyRate.id, spreadBps: 500 });
+      expect(product.annual_interest_rate_bps).toBe(3400); // 2900 + 500
+
+      await policyRateService.updatePolicyRateValue(pool, {
+        policyRateId: policyRate.id,
+        rateBps: 3200,
+        changedBy: maker,
+        actorBranchId: branchId,
+      });
+
+      // Never reset before -> due immediately regardless of asOfDate.
+      const result = await loanService.resetFloatingRateProducts(pool, { asOfDate: '2026-01-15', resetBy: maker, actorBranchId: branchId });
+      expect(result.changedCount).toBeGreaterThanOrEqual(1);
+
+      const resetProduct = await loanService.getLoanProduct(pool, product.id);
+      expect(resetProduct.annual_interest_rate_bps).toBe(3700); // 3200 + 500
+      expect(resetProduct.last_reset_at.toISOString().slice(0, 10)).toBe('2026-01-15');
+    });
+
+    test('a product already reset this period is skipped on a second run within the same monthly window', async () => {
+      const policyRate = await createPolicyRateFixture(2900);
+      const product = await createFloatingProduct({ referenceRateId: policyRate.id, spreadBps: 500, resetFrequency: 'monthly' });
+
+      await loanService.resetFloatingRateProducts(pool, { asOfDate: '2026-01-05', resetBy: maker, actorBranchId: branchId });
+      // Rate changes after the first reset, but the second run is still
+      // within the same monthly window (next due date is 2026-02-05).
+      await policyRateService.updatePolicyRateValue(pool, {
+        policyRateId: policyRate.id,
+        rateBps: 4000,
+        changedBy: maker,
+        actorBranchId: branchId,
+      });
+      await loanService.resetFloatingRateProducts(pool, { asOfDate: '2026-01-20', resetBy: maker, actorBranchId: branchId });
+
+      const stillDue = await loanService.getLoanProduct(pool, product.id);
+      expect(stillDue.annual_interest_rate_bps).toBe(3400); // unchanged — not due yet
+
+      // Once the monthly window has actually elapsed, it picks up the change.
+      const result = await loanService.resetFloatingRateProducts(pool, { asOfDate: '2026-02-06', resetBy: maker, actorBranchId: branchId });
+      const afterWindow = await loanService.getLoanProduct(pool, product.id);
+      expect(afterWindow.annual_interest_rate_bps).toBe(4500); // 4000 + 500
+      expect(result.results.some((r) => r.productId === Number(product.id) && r.ok)).toBe(true);
+    });
+
+    test('reset does NOT retroactively change an already-disbursed floating loan\'s own rate', async () => {
+      const policyRate = await createPolicyRateFixture(2900);
+      const product = await createFloatingProduct({ referenceRateId: policyRate.id, spreadBps: 500 });
+      const customer = await createVerifiedCustomer('Floating Disbursed Borrower');
+      const loan = await takeLoanToDisbursed({ product, customer, principalPesewas: 50000, termMonths: 6 });
+      expect(loan.annual_interest_rate_bps).toBe(3400);
+
+      await policyRateService.updatePolicyRateValue(pool, {
+        policyRateId: policyRate.id,
+        rateBps: 5000,
+        changedBy: maker,
+        actorBranchId: branchId,
+      });
+      await loanService.resetFloatingRateProducts(pool, { asOfDate: '2026-03-01', resetBy: maker, actorBranchId: branchId });
+
+      const resetProduct = await loanService.getLoanProduct(pool, product.id);
+      expect(resetProduct.annual_interest_rate_bps).toBe(5500); // the PRODUCT's listing rate did move
+
+      const untouchedLoan = await loanService.getLoan(pool, loan.id);
+      expect(untouchedLoan.annual_interest_rate_bps).toBe(3400); // this loan's own rate did not
+    });
+  });
+
+  describe('loan concessions: bound enforcement and the approval workflow', () => {
+    test('a concession below the floor is rejected outright, with no approval request created', async () => {
+      const product = await createProduct({ annualInterestRateBps: 2400, minRateFloorBps: 2000, concessionApprovalThresholdBps: 100 });
+      const customer = await createVerifiedCustomer('Floor Breach Borrower');
+      const loan = await loanService.applyForLoan(pool, {
+        customerId: customer.id,
+        productId: product.id,
+        principalPesewas: 50000,
+        termMonths: 6,
+        appliedBy: maker,
+      });
+
+      await expect(
+        loanService.requestConcession(pool, {
+          loanId: loan.id,
+          negotiatedAnnualInterestRateBps: 1900, // below the 2000bps floor
+          reasonCode: 'loyal_customer',
+          requestedBy: maker,
+        })
+      ).rejects.toThrow(loanService.LoanConflictError);
+
+      const { rows } = await pool.query('SELECT * FROM loan_concessions WHERE loan_id = $1', [loan.id]);
+      expect(rows).toHaveLength(0);
+    });
+
+    test('a product with no floor configured does not permit concessions at all', async () => {
+      const product = await createProduct({ annualInterestRateBps: 2400 }); // no minRateFloorBps
+      const customer = await createVerifiedCustomer('No Floor Borrower');
+      const loan = await loanService.applyForLoan(pool, {
+        customerId: customer.id,
+        productId: product.id,
+        principalPesewas: 50000,
+        termMonths: 6,
+        appliedBy: maker,
+      });
+
+      await expect(
+        loanService.requestConcession(pool, {
+          loanId: loan.id,
+          negotiatedAnnualInterestRateBps: 2300,
+          reasonCode: 'competitive_match',
+          requestedBy: maker,
+        })
+      ).rejects.toThrow(/does not permit concessions/);
+    });
+
+    test('a small concession within the grace threshold auto-applies immediately, with no approval request', async () => {
+      const product = await createProduct({ annualInterestRateBps: 2400, minRateFloorBps: 2000, concessionApprovalThresholdBps: 100 });
+      const customer = await createVerifiedCustomer('Auto Apply Borrower');
+      const loan = await loanService.applyForLoan(pool, {
+        customerId: customer.id,
+        productId: product.id,
+        principalPesewas: 50000,
+        termMonths: 6,
+        appliedBy: maker,
+      });
+
+      const result = await loanService.requestConcession(pool, {
+        loanId: loan.id,
+        negotiatedAnnualInterestRateBps: 2350, // 50bps discount, within the 100bps grace window
+        reasonCode: 'loyal_customer',
+        requestedBy: maker,
+      });
+      expect(result.needsApproval).toBe(false);
+      expect(result.approvalRequest).toBeNull();
+
+      const updatedLoan = await loanService.getLoan(pool, loan.id);
+      expect(updatedLoan.annual_interest_rate_bps).toBe(2350);
+
+      const concessions = await loanService.listConcessions(pool, { loanId: loan.id });
+      expect(concessions).toHaveLength(1);
+      expect(concessions[0].status).toBe('approved');
+      expect(concessions[0].standard_annual_interest_rate_bps).toBe(2400);
+      expect(concessions[0].negotiated_annual_interest_rate_bps).toBe(2350);
+    });
+
+    test('a concession beyond the grace threshold queues for maker-checker approval and does not apply until decided', async () => {
+      const product = await createProduct({ annualInterestRateBps: 2400, minRateFloorBps: 2000, concessionApprovalThresholdBps: 100 });
+      const customer = await createVerifiedCustomer('Needs Approval Borrower');
+      const loan = await loanService.applyForLoan(pool, {
+        customerId: customer.id,
+        productId: product.id,
+        principalPesewas: 50000,
+        termMonths: 6,
+        appliedBy: maker,
+      });
+
+      const result = await loanService.requestConcession(pool, {
+        loanId: loan.id,
+        negotiatedAnnualInterestRateBps: 2100, // 300bps discount, beyond the 100bps grace window
+        reasonCode: 'hardship',
+        reasonNotes: 'Customer lost primary income source',
+        requestedBy: maker,
+      });
+      expect(result.needsApproval).toBe(true);
+      expect(result.approvalRequest).not.toBeNull();
+      expect(result.approvalRequest.status).toBe('pending');
+
+      // Not applied yet.
+      const stillStandard = await loanService.getLoan(pool, loan.id);
+      expect(stillStandard.annual_interest_rate_bps).toBe(2400);
+
+      const concessions = await loanService.listConcessions(pool, { loanId: loan.id });
+      expect(concessions[0].status).toBe('pending');
+    });
+
+    test('the maker cannot decide their own concession request; a branch_manager can, and it applies on approval', async () => {
+      const product = await createProduct({ annualInterestRateBps: 2400, minRateFloorBps: 2000, concessionApprovalThresholdBps: 100 });
+      const customer = await createVerifiedCustomer('BM Decide Borrower');
+      const loan = await loanService.applyForLoan(pool, {
+        customerId: customer.id,
+        productId: product.id,
+        principalPesewas: 50000,
+        termMonths: 6,
+        appliedBy: maker,
+      });
+      const result = await loanService.requestConcession(pool, {
+        loanId: loan.id,
+        negotiatedAnnualInterestRateBps: 2100,
+        reasonCode: 'competitive_match',
+        requestedBy: maker,
+      });
+
+      await expect(decideAs(result.approvalRequest.id, maker)).rejects.toThrow(approvalWorkflow.MakerCheckerViolationError);
+      // The plain 'owner'-role checker does not hold the branch_manager
+      // role migration 057 pinned as this action's required approver.
+      await expect(decideAs(result.approvalRequest.id, checker)).rejects.toThrow(approvalWorkflow.MakerCheckerViolationError);
+
+      await decideAs(result.approvalRequest.id, branchManagerChecker);
+
+      const approvedLoan = await loanService.getLoan(pool, loan.id);
+      expect(approvedLoan.annual_interest_rate_bps).toBe(2100);
+
+      const concessions = await loanService.listConcessions(pool, { loanId: loan.id });
+      expect(concessions[0].status).toBe('approved');
+      expect(Number(concessions[0].decided_by)).toBe(Number(branchManagerChecker));
+    });
+
+    test('a rejected concession never applies, and disbursement is blocked while one is still pending', async () => {
+      const product = await createProduct({ annualInterestRateBps: 2400, minRateFloorBps: 2000, concessionApprovalThresholdBps: 100 });
+      const customer = await createVerifiedCustomer('Rejected Concession Borrower');
+      const loan = await loanService.applyForLoan(pool, {
+        customerId: customer.id,
+        productId: product.id,
+        principalPesewas: 50000,
+        termMonths: 6,
+        appliedBy: maker,
+      });
+      const result = await loanService.requestConcession(pool, {
+        loanId: loan.id,
+        negotiatedAnnualInterestRateBps: 2100,
+        reasonCode: 'hardship',
+        requestedBy: maker,
+      });
+
+      // Get the loan approved so disbursement would otherwise be reachable.
+      await loanService.submitAppraisal(pool, { loanId: loan.id, checklist: {}, recommendation: 'recommend', appraiserId: maker });
+      const loanApproval = await loanService.requestLoanApproval(pool, { loanId: loan.id, requestedBy: maker });
+      await decideAs(loanApproval.id, checker);
+
+      await expect(loanService.disburseLoan(pool, { loanId: loan.id, disbursedBy: maker })).rejects.toThrow(
+        /concession awaiting approval/
+      );
+
+      await decideAs(result.approvalRequest.id, branchManagerChecker, 'rejected');
+
+      const unchangedLoan = await loanService.getLoan(pool, loan.id);
+      expect(unchangedLoan.annual_interest_rate_bps).toBe(2400); // standard rate, never touched
+
+      const concessions = await loanService.listConcessions(pool, { loanId: loan.id });
+      expect(concessions[0].status).toBe('rejected');
+
+      // Now unblocked — disbursement proceeds at the standard rate.
+      const disbursed = await loanService.disburseLoan(pool, { loanId: loan.id, disbursedBy: maker });
+      expect(disbursed.status).toBe('disbursed');
+    });
+
+    test('a floating-product concession is negotiated on spread and the stored rate reflects the current reference rate', async () => {
+      const policyRate = await createPolicyRateFixture(2900);
+      const product = await createFloatingProduct({
+        referenceRateId: policyRate.id,
+        spreadBps: 500,
+        minSpreadFloorBps: 300,
+        concessionApprovalThresholdBps: 1000, // generous grace window, so this auto-applies
+      });
+      const customer = await createVerifiedCustomer('Floating Concession Borrower');
+      const loan = await loanService.applyForLoan(pool, {
+        customerId: customer.id,
+        productId: product.id,
+        principalPesewas: 50000,
+        termMonths: 6,
+        appliedBy: maker,
+      });
+
+      const result = await loanService.requestConcession(pool, {
+        loanId: loan.id,
+        negotiatedSpreadBps: 350,
+        reasonCode: 'competitive_match',
+        requestedBy: maker,
+      });
+      expect(result.needsApproval).toBe(false);
+      expect(result.negotiated_spread_bps).toBe(350);
+      expect(result.negotiated_annual_interest_rate_bps).toBe(3250); // 2900 + 350
+
+      const updatedLoan = await loanService.getLoan(pool, loan.id);
+      expect(updatedLoan.annual_interest_rate_bps).toBe(3250);
+    });
+
+    test('a floating-product concession below the spread floor is rejected', async () => {
+      const policyRate = await createPolicyRateFixture(2900);
+      const product = await createFloatingProduct({
+        referenceRateId: policyRate.id,
+        spreadBps: 500,
+        minSpreadFloorBps: 300,
+      });
+      const customer = await createVerifiedCustomer('Floating Floor Breach Borrower');
+      const loan = await loanService.applyForLoan(pool, {
+        customerId: customer.id,
+        productId: product.id,
+        principalPesewas: 50000,
+        termMonths: 6,
+        appliedBy: maker,
+      });
+
+      await expect(
+        loanService.requestConcession(pool, {
+          loanId: loan.id,
+          negotiatedSpreadBps: 200, // below the 300bps floor
+          reasonCode: 'hardship',
+          requestedBy: maker,
+        })
+      ).rejects.toThrow(loanService.LoanConflictError);
+    });
+
+    test('a term-only concession forces approval even at zero rate discount', async () => {
+      const product = await createProduct({
+        annualInterestRateBps: 2400,
+        minRateFloorBps: 2000,
+        concessionApprovalThresholdBps: 100,
+        minTermMonths: 1,
+        maxTermMonths: 24,
+      });
+      const customer = await createVerifiedCustomer('Term Concession Borrower');
+      const loan = await loanService.applyForLoan(pool, {
+        customerId: customer.id,
+        productId: product.id,
+        principalPesewas: 50000,
+        termMonths: 6,
+        appliedBy: maker,
+      });
+
+      const result = await loanService.requestConcession(pool, {
+        loanId: loan.id,
+        negotiatedTermMonths: 12,
+        reasonCode: 'other',
+        requestedBy: maker,
+      });
+      expect(result.needsApproval).toBe(true);
+      expect(result.standard_term_months).toBe(6);
+      expect(result.negotiated_term_months).toBe(12);
+    });
+
+    test('cannot request a second concession while one is still pending', async () => {
+      const product = await createProduct({ annualInterestRateBps: 2400, minRateFloorBps: 2000, concessionApprovalThresholdBps: 100 });
+      const customer = await createVerifiedCustomer('Double Concession Borrower');
+      const loan = await loanService.applyForLoan(pool, {
+        customerId: customer.id,
+        productId: product.id,
+        principalPesewas: 50000,
+        termMonths: 6,
+        appliedBy: maker,
+      });
+      await loanService.requestConcession(pool, {
+        loanId: loan.id,
+        negotiatedAnnualInterestRateBps: 2100,
+        reasonCode: 'hardship',
+        requestedBy: maker,
+      });
+
+      await expect(
+        loanService.requestConcession(pool, {
+          loanId: loan.id,
+          negotiatedAnnualInterestRateBps: 2200,
+          reasonCode: 'loyal_customer',
+          requestedBy: maker,
+        })
+      ).rejects.toThrow(/already has a concession awaiting approval/);
     });
   });
 });

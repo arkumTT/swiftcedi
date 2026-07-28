@@ -931,6 +931,196 @@ check for any `allows_overdraft` account.
   account without an active facility, so ordinary savings behavior is
   unchanged.
 
+### Loan products: fixed/floating rates & officer concessions — extension to Module 3
+
+_Added in a later session, after Module 3 and the frontend build were both
+already complete. Orientation (existing product/rate modeling, RBAC,
+approval workflow) was done and summarized before any code was written;
+the design decisions below were confirmed with a human before
+implementation, not assumed._
+
+**Schema** (migrations `053`–`058`, all additive — no destructive `ALTER`,
+no existing column dropped or narrowed):
+
+```
+policy_rates (code, name, rate_bps, status, created_by, ...)
+policy_rate_changes (policy_rate_id, old_rate_bps, new_rate_bps, effective_date, changed_by)
+  -- effective-dated history; a DIFFERENT kind of record than an audit_log
+  -- entry (what WAS the rate on a past date), kept alongside it not
+  -- instead of it.
+
+loan_products += description, rate_type ('fixed'|'floating'),
+  reference_rate_id, spread_bps, reset_frequency, last_reset_at,
+  min_rate_floor_bps, min_spread_floor_bps,
+  concession_approval_threshold_bps (NOT NULL DEFAULT 0 — any concession
+    at all requires approval unless explicitly configured otherwise),
+  allowed_repayment_frequencies (TEXT[], CHECK'd to only ever contain
+    'monthly' — see below)
+
+loans += fee_schedule (JSONB, snapshotted from the product at
+  applyForLoan time — fixes a real pre-existing gap, see below)
+
+loan_concessions (loan_id, requested_by, reason_code, reason_notes,
+  standard_*/negotiated_* pairs for rate, spread, term, fee_schedule,
+  applied_floor_bps, approval_request_id)
+  -- NO status/decided_by/decided_at columns of its own — same convention
+  -- loan_restructures already used; see below for why.
+```
+
+**`annual_interest_rate_bps` stays the ONE column every existing consumer
+reads, for both fixed and floating products.** A floating product's value
+is system-maintained (`reference_rate.rate_bps + spread_bps`), recomputed
+by `updateLoanProduct`/`createLoanProduct` and by the reset job below —
+never admin-edited directly while `rate_type = 'floating'`. This meant
+`applyForLoan`'s existing snapshot line (`product.annual_interest_rate_bps`)
+needed zero changes to correctly support floating products.
+
+**`allowed_repayment_frequencies` is genuinely declarative-only.**
+`loanMath.js`'s schedule generator is MONTHLY ONLY, a deliberate scope
+decision from Module 3's original build (see its own module comment). A
+CHECK constraint restricts the array to `{'monthly'}` so the field records
+real product intent (satisfying Feature 1's literal ask) without silently
+implying weekly/biweekly amortization actually works. Building real
+multi-frequency support is a separate, materially larger change to the
+core interest-schedule engine that was not undertaken here.
+
+**Real pre-existing bug found and fixed during orientation, unrelated to
+concessions but needed by them anyway**: `disburseLoan` read
+`product.fee_schedule` LIVE at disbursement time — `interest_method`/
+`annual_interest_rate_bps` were already snapshotted onto the loan at
+application (migration 023's own stated guarantee), but fees were not, so
+editing a product's fees between application and disbursement silently
+changed what a customer was actually charged. Fixed by snapshotting
+`fee_schedule` onto `loans` at `applyForLoan` (migration 055 backfills
+every pre-existing loan from its product so no row is left NULL), and
+`disburseLoan` now reads `loan.fee_schedule`, never the live product.
+
+**Concessions reuse `approval_requests`/`approvalWorkflow.js` exactly as
+built for Module 11 — no new state machine.** `requestConcession`'s shape
+mirrors `requestRestructure` (propose new terms + reason, one pending
+request per loan at a time) crossed with `cashierService.requestCashBack`'s
+threshold-gated auto-apply/route-to-approval branch. The one deliberate
+deviation: `isApprovalRequired()`/`approval_thresholds.amount_threshold_pesewas`
+is a currency-amount comparison everywhere else it's used (cash-back size,
+investment early-redemption amount) — a concession's "how big a discount"
+is naturally a basis-points delta, not a pesewas amount, so `needsApproval`
+is decided by `loanMath.evaluateConcessionBounds()` (a pure, unit-tested
+function) against the PRODUCT's own `concession_approval_threshold_bps`,
+not by `isApprovalRequired()`. `approval_requests`/`requestApproval`/
+`decide`/`registerExecutionHandler` are still used completely unmodified
+for the actual workflow machinery — only the *trigger condition* differs.
+
+**Bound enforcement** (`loanMath.evaluateConcessionBounds`, unit-tested in
+isolation): a FIXED product's negotiated RATE is checked against
+`min_rate_floor_bps`; a FLOATING product's negotiated SPREAD is checked
+against `min_spread_floor_bps` — an officer only ever negotiates the
+bank's own margin, never the reference rate itself. A `NULL` floor means
+concessions aren't permitted on that product at all (not "permitted with
+no limit"). A negotiated value above standard is a markup, never a
+concession, and is never permitted regardless of the floor. "Standard" for
+the rate/spread bound check is always the PRODUCT's *current* configured
+rate/spread (not the loan's own current value, which might already
+reflect an earlier concession) — a later concession request is evaluated
+against what a customer would get today under standard terms. Term and
+fee "standard" values, by contrast, are the loan's own current values
+(there's no single product-wide standard term/fee the way there is a
+standard rate — only a min/max range, already enforced elsewhere) — used
+only to detect whether they changed at all, since ANY term or fee change
+forces `needsApproval = true` regardless of the rate/spread delta (neither
+is quantifiable as a single bps discount the way rate is).
+
+**`loan_concessions` deliberately has no `status`/`decided_by`/
+`decided_at` columns of its own** — same convention `loan_restructures`
+already established (migration 024): the decision lives on
+`approval_requests`, joined via `approval_request_id`, never duplicated.
+This matters more here than it did for restructure, because
+`approvalWorkflow.decide()`'s registered execution handler **only ever
+fires on approval, never rejection** — a column here trying to mirror
+`approval_requests.status` would be left permanently wrong on a rejected
+concession. `loanService.listConcessions` always reads the effective
+status via `COALESCE(approval_requests.status, 'approved')` (NULL
+`approval_request_id` means it fell within the grace window and applied
+immediately, so it's unconditionally `'approved'`).
+
+**Once a concession is granted (auto-applied within the grace window, or
+approved by a human), it patches `loans.annual_interest_rate_bps`/
+`term_months`/`fee_schedule` directly** — the same row-mutation approach
+`applyRestructureOnApproval` already uses, keeping `loan_concessions`
+purely as the standard-vs-negotiated audit record, never itself read at
+disbursement time.
+
+**Disbursement gate**: `assertApprovedForDisbursement` (the one function
+both ordinary disbursement and overdraft activation already shared) now
+also rejects if the loan has a concession still `pending` — reusing the
+exact join pattern (`JOIN approval_requests ... WHERE status = 'pending'`)
+`requestRestructure`'s "no two pending restructures" check already used.
+A concession's own approval is otherwise independent of the loan's
+`loan.approve` workflow — either can be requested/decided before or after
+the other; the loan just can't reach disbursement with one still open.
+
+**RBAC: reused `branch_manager` as the concession approver, no new role**
+(a human-confirmed decision — the alternative, adding a `credit_manager`
+role, was flagged as materially bigger RBAC scope and explicitly not
+taken). This required actually granting `branch_manager` the
+`approval.decide` permission, which it had never held before — before
+this change, `approval.decide` was owner/system_admin only (migration
+008), meaning a `loan.approve` or `loan.restructure` request could
+structurally only ever be decided by an owner/system_admin. **Flagged side
+effect**: branch_manager can now also decide those pre-existing
+action_types, not just concessions, since `approval.decide` is a single
+blanket route-level permission — which action_type a specific role may
+decide is governed entirely by `approval_thresholds.required_approver_role_id`,
+and no threshold row existed for `loan.approve`/`loan.restructure` before
+this change either (meaning they had no enforced required-role at all,
+just whoever held the blanket permission). This reads as a genuine
+usability fix for `branch_manager`'s existing "full access scoped to home
+branch" role description, not scope creep, but is called out explicitly
+since it wasn't the literal ask. A default `approval_thresholds` row
+pinning `branch_manager` for `loan.grant_concession` ships in migration
+057 (`amount_threshold_pesewas` is unused for this action_type, set to 0,
+since `needsApproval` is decided by the bps-delta logic above, not this
+threshold's amount field).
+
+**Reset job — deliberately does NOT retroactively re-price already-
+disbursed floating loans.** `resetFloatingRateProducts` (wired into
+Module 12's existing job registry as `loan_floating_rate_reset`, a thin
+wrapper the same shape as every other registered job — Module 12 owns
+scheduling, not the business logic) recomputes a due FLOATING PRODUCT's
+*listing* rate (`reference_rate.rate_bps + spread_bps`), i.e. what a NEW
+application inherits going forward. A loan's own rate is snapshotted once
+at application (the same guarantee fixed-rate loans have) and is never
+touched by a reset. Actually re-pricing outstanding floating loans
+mid-term — regenerating their remaining schedule at a new rate, changing
+what a customer owes going forward — is a materially bigger, genuinely
+money-moving decision that was not confirmed as in scope for this pass;
+flagged here rather than built silently. Consistent with the rest of
+Module 12, there is no live-firing cron — the reset only runs via
+`triggerJob`, exactly like every other scheduled job in this codebase.
+
+**Testing note**: `approval_thresholds` is cleared by every integration
+suite's own `beforeAll` cleanup (already true before this change, for
+cashback/investment-redemption thresholds too), so a migration-seeded row
+does not reliably survive a full `npx jest` run across files — every
+suite that needs a specific threshold seeds its own, and
+`loanModule.test.js`'s new concession tests do the same
+(`ON CONFLICT ... DO UPDATE`, since the row may or may not already exist
+depending on run order). Also: adding any new table with a FK to `users`
+requires adding it to every OTHER integration suite's own cleanup list too
+(all ~11 of them list every FK-dependent table so their own `DELETE FROM
+users` doesn't fail) — `loan_concessions`/`policy_rate_changes`/
+`policy_rates` were added to all of them, not just `loanModule.test.js`'s.
+
+**Explicitly out of scope, not built**: Bank of Ghana floating-rate
+disclosure notifications on reset (no notification delivery
+infrastructure exists anywhere in this codebase yet — same gap already
+noted for reminders/job failures in Module 12's own entry); a
+`credit_manager` role; retroactive re-pricing of disbursed floating
+loans (see above); negotiating a fee-schedule override through the
+officer-facing UI (the backend accepts `negotiatedFeeSchedule` and the
+bound-enforcement logic already treats any fee change as
+approval-required, but no form control was built for it — Feature 2's
+own wording only asked for "a negotiated rate/term with a reason").
+
 ### Savings / susu / standing orders — `backend/src/modules/savings/` (Module 4)
 
 `savingsMath.js` is pure (no db) and separately unit-tested, same split as

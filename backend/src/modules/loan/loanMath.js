@@ -200,6 +200,100 @@ function computeOverdraftInterestPesewas({ drawnBalancePesewas, annualInterestRa
   return Math.round((drawnBalancePesewas * annualInterestRateBps * days) / (365 * 10000));
 }
 
+/**
+ * A floating product's effective nominal annual rate: the linked
+ * reference (policy) rate plus the product's own spread/margin. The one
+ * formula used both when a product's listing rate is (re)computed
+ * (loanService.resetFloatingRateProducts) and when a floating concession
+ * needs to know what its negotiated spread actually resolves to.
+ */
+function computeFloatingEffectiveRateBps({ referenceRateBps, spreadBps }) {
+  if (!Number.isInteger(referenceRateBps) || referenceRateBps < 0) {
+    throw new Error('referenceRateBps must be a non-negative integer');
+  }
+  if (!Number.isInteger(spreadBps) || spreadBps < 0) {
+    throw new Error('spreadBps must be a non-negative integer');
+  }
+  return referenceRateBps + spreadBps;
+}
+
+/**
+ * Pure decision function for a proposed loan concession — does not
+ * enforce anything itself; loanService turns the result into either a
+ * rejection, an immediate application, or a maker-checker approval
+ * request. Kept separate from that side-effecting logic so the actual
+ * bound/threshold arithmetic (the part most worth getting exactly right)
+ * is directly unit-testable in isolation, same reasoning as every other
+ * function in this file.
+ *
+ * For a FIXED product, compare the negotiated RATE against the product's
+ * min_rate_floor_bps. For a FLOATING product, compare the negotiated
+ * SPREAD against min_spread_floor_bps instead — an officer only ever
+ * negotiates the bank's own margin, never the reference rate itself, so
+ * floating concessions are evaluated on spread, not the blended rate.
+ *
+ * A concession is always a discount relative to standard — a negotiated
+ * value above standard is never "permitted" (that's a markup, not a
+ * concession) regardless of where the floor sits.
+ *
+ * @returns {{ permitted: boolean, withinFloor: boolean, appliedFloorBps: number|null, deltaBps: number, needsApproval: boolean }}
+ *   `deltaBps` is the size of the discount (standard - negotiated, so a
+ *   larger positive number is a bigger discount). `needsApproval` is
+ *   true whenever the concession is permitted but the discount exceeds
+ *   the product's concessionApprovalThresholdBps grace window, OR the
+ *   term or fee schedule was also changed (those aren't bounded the same
+ *   way a rate/spread is, so any change to them routes to approval by
+ *   default rather than trying to quantify how "big" a fee waiver is).
+ */
+function evaluateConcessionBounds({
+  rateType,
+  standardAnnualInterestRateBps,
+  negotiatedAnnualInterestRateBps,
+  standardSpreadBps = null,
+  negotiatedSpreadBps = null,
+  minRateFloorBps = null,
+  minSpreadFloorBps = null,
+  concessionApprovalThresholdBps,
+  termChanged = false,
+  feesChanged = false,
+}) {
+  if (rateType !== 'fixed' && rateType !== 'floating') {
+    throw new Error(`unknown rateType '${rateType}'`);
+  }
+  if (!Number.isInteger(concessionApprovalThresholdBps) || concessionApprovalThresholdBps < 0) {
+    throw new Error('concessionApprovalThresholdBps must be a non-negative integer');
+  }
+
+  const floorBps = rateType === 'fixed' ? minRateFloorBps : minSpreadFloorBps;
+  const standardValueBps = rateType === 'fixed' ? standardAnnualInterestRateBps : standardSpreadBps;
+  const negotiatedValueBps = rateType === 'fixed' ? negotiatedAnnualInterestRateBps : negotiatedSpreadBps;
+
+  if (!Number.isInteger(standardValueBps) || !Number.isInteger(negotiatedValueBps)) {
+    throw new Error(
+      rateType === 'fixed'
+        ? 'standardAnnualInterestRateBps and negotiatedAnnualInterestRateBps must be integers'
+        : 'standardSpreadBps and negotiatedSpreadBps must be integers'
+    );
+  }
+
+  // No floor configured on the product at all means concessions aren't
+  // permitted on it, full stop — not "permitted with no limit".
+  if (floorBps === null || floorBps === undefined) {
+    return { permitted: false, withinFloor: false, appliedFloorBps: null, deltaBps: 0, needsApproval: false };
+  }
+
+  const deltaBps = standardValueBps - negotiatedValueBps;
+  if (deltaBps < 0) {
+    // A negotiated value above standard is a markup, never a concession.
+    return { permitted: false, withinFloor: false, appliedFloorBps: floorBps, deltaBps, needsApproval: false };
+  }
+
+  const withinFloor = negotiatedValueBps >= floorBps;
+  const needsApproval = withinFloor && (deltaBps > concessionApprovalThresholdBps || termChanged || feesChanged);
+
+  return { permitted: withinFloor, withinFloor, appliedFloorBps: floorBps, deltaBps, needsApproval };
+}
+
 module.exports = {
   addMonthsToDateString,
   generateLoanSchedule,
@@ -208,4 +302,6 @@ module.exports = {
   bucketArrearsDays,
   computeFeesPesewas,
   computeOverdraftInterestPesewas,
+  computeFloatingEffectiveRateBps,
+  evaluateConcessionBounds,
 };
