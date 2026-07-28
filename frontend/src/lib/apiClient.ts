@@ -1,4 +1,4 @@
-const API_BASE_URL = 'https://tender-endurance-production-d784.up.railway.app' //|| import.meta.env.VITE_API_BASE_URL || '/api';
+const API_BASE_URL = 'http://localhost:4000' //|| import.meta.env.VITE_API_BASE_URL || '/api';
 const TOKEN_STORAGE_KEY = 'swiftcedi.token';
 
 export class ApiError extends Error {
@@ -29,7 +29,7 @@ function buildUrl(path: string, query?: Record<string, QueryValue>): string {
       }
     }
   }
-  return url.pathname + url.search;
+  return url.toString();
 }
 
 async function request<T>(

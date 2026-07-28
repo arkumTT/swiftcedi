@@ -20,7 +20,7 @@ const { hashPassword } = require('../utils/password');
 
 async function run() {
   const email = process.env.SEED_ADMIN_EMAIL || 'admin@swiftcedi.local';
-  const password = process.env.SEED_ADMIN_PASSWORD;
+  const password = process.env.SEED_ADMIN_PASSWORD || 'test@1234';
   if (!password) {
     console.log('SEED_ADMIN_PASSWORD not set — skipping admin seed.');
     return;

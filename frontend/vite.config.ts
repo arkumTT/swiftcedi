@@ -7,14 +7,14 @@ import tailwindcss from '@tailwindcss/vite';
 // middleware (see backend/src/app.js) exists for non-proxied deployments
 // (a static build served from a different origin than the API).
 export default defineConfig({
-  plugins: [react(), tailwindcss()],
-  server: {
-    proxy: {
-      '/api': {
-        target: process.env.VITE_API_PROXY_TARGET || 'http://localhost:4000',
-        changeOrigin: true,
-        rewrite: (path) => path.replace(/^\/api/, ''),
-      },
-    },
-  },
+  plugins: [react(), tailwindcss()]
+  // server: {
+  //   proxy: {
+  //     '/api': {
+  //       target: process.env.API_BASE_URL || 'http://localhost:4000',
+  //       changeOrigin: true,
+  //       rewrite: (path) => path.replace(/^\/api/, ''),
+  //     },
+  //   },
+  // },
 });
