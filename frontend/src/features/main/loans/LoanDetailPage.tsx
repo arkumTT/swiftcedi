@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { ArrowLeft, ClipboardCheck, Send, Banknote, HandCoins, Repeat, Ban, Plus, Percent } from 'lucide-react';
+import { ArrowLeft, ClipboardCheck, Send, Banknote, HandCoins, Repeat, Ban, Plus, Percent, Check, X } from 'lucide-react';
 import { useAuth } from '../../../auth/AuthContext';
 import { api, ApiError } from '../../../lib/apiClient';
 import { useBranches } from '../../../lib/adminHooks';
@@ -23,11 +23,17 @@ import type {
   LoanCollateral,
   LoanGuarantor,
   LoanConcession,
+  ApprovalRequest,
   OverdraftStatus,
   Customer,
 } from '../../../types/api';
 
 const CONCESSION_ELIGIBLE_STATUSES = ['applied', 'appraised', 'pending_approval', 'approved'];
+// A loan is "open for servicing" the moment it's disbursed, but its
+// status then oscillates between 'paying'/'missed_payment' as
+// installments come due (see Decisions_Log.md) — every action that used
+// to gate on the literal 'disbursed' status now checks this set instead.
+const ACTIVE_LOAN_STATUSES = ['disbursed', 'paying', 'missed_payment'];
 
 export function LoanDetailPage() {
   const { id } = useParams<{ id: string }>();
@@ -37,6 +43,7 @@ export function LoanDetailPage() {
   const { data: branches } = useBranches();
 
   const [appraiseOpen, setAppraiseOpen] = useState(false);
+  const [rejectOpen, setRejectOpen] = useState(false);
   const [disburseOpen, setDisburseOpen] = useState(false);
   const [repaymentOpen, setRepaymentOpen] = useState(false);
   const [restructureOpen, setRestructureOpen] = useState(false);
@@ -76,10 +83,27 @@ export function LoanDetailPage() {
     queryFn: () => api.get<OverdraftStatus>(`/loans/${id}/overdraft-status`),
     enabled: Boolean(id) && loan?.loan_type === 'overdraft' && loan?.status !== 'applied' && loan?.status !== 'appraised' && loan?.status !== 'pending_approval' && loan?.status !== 'rejected',
   });
+  // Only fetched when the viewer actually holds approval.decide — someone
+  // without it would get a 403 from GET /approvals, and has no Approve/
+  // Reject buttons to show anyway.
+  const pendingApprovalQuery = useQuery({
+    queryKey: ['loan-pending-approval', id],
+    queryFn: () => api.get<ApprovalRequest[]>('/approvals', { entityType: 'loan', entityId: id, actionType: 'loan.approve', status: 'pending' }),
+    enabled: Boolean(id) && loan?.status === 'pending_approval' && hasPermission('approval.decide'),
+  });
+  const pendingApproval = pendingApprovalQuery.data?.[0] ?? null;
 
   const requestApprovalMutation = useMutation({
     mutationFn: () => api.post(`/loans/${id}/approval-requests`),
     onSuccess: invalidateLoan,
+  });
+  const decideApprovalMutation = useMutation({
+    mutationFn: ({ decision, reason }: { decision: 'approved' | 'rejected'; reason?: string }) =>
+      api.post(`/approvals/${pendingApproval!.id}/decide`, { decision, reason }),
+    onSuccess: () => {
+      invalidateLoan();
+      queryClient.invalidateQueries({ queryKey: ['loan-pending-approval', id] });
+    },
   });
   const verifyCollateralMutation = useMutation({
     mutationFn: ({ collateralId, verificationStatus }: { collateralId: string; verificationStatus: string }) =>
@@ -163,17 +187,32 @@ export function LoanDetailPage() {
                 <Send size={14} /> Request approval
               </Button>
             )}
+            {loan.status === 'pending_approval' && hasPermission('approval.decide') && pendingApproval && (
+              <>
+                <Button
+                  variant="primary"
+                  size="sm"
+                  disabled={decideApprovalMutation.isPending}
+                  onClick={() => decideApprovalMutation.mutate({ decision: 'approved' })}
+                >
+                  <Check size={14} /> Approve
+                </Button>
+                <Button variant="danger" size="sm" onClick={() => setRejectOpen(true)}>
+                  <X size={14} /> Reject
+                </Button>
+              </>
+            )}
             {hasPermission('loan.disburse') && loan.status === 'approved' && (
               <Button variant="primary" size="sm" onClick={() => setDisburseOpen(true)}>
                 <Banknote size={14} /> Disburse
               </Button>
             )}
-            {hasPermission('loan.post_repayment') && loan.status === 'disbursed' && (
+            {hasPermission('loan.post_repayment') && ACTIVE_LOAN_STATUSES.includes(loan.status) && (
               <Button variant="secondary" size="sm" onClick={() => setRepaymentOpen(true)}>
                 <HandCoins size={14} /> Record repayment
               </Button>
             )}
-            {hasPermission('loan.restructure') && loan.status === 'disbursed' && !isOverdraft && (
+            {hasPermission('loan.restructure') && ACTIVE_LOAN_STATUSES.includes(loan.status) && !isOverdraft && (
               <Button variant="secondary" size="sm" onClick={() => setRestructureOpen(true)}>
                 <Repeat size={14} /> Restructure
               </Button>
@@ -183,7 +222,7 @@ export function LoanDetailPage() {
                 <Percent size={14} /> Propose concession
               </Button>
             )}
-            {hasPermission('loan.write_off') && loan.status === 'disbursed' && (
+            {hasPermission('loan.write_off') && ACTIVE_LOAN_STATUSES.includes(loan.status) && (
               <Button variant="danger" size="sm" onClick={() => setWriteOffOpen(true)}>
                 <Ban size={14} /> Write off
               </Button>
@@ -289,6 +328,17 @@ export function LoanDetailPage() {
       </Card>
 
       <AppraiseModal open={appraiseOpen} onClose={() => setAppraiseOpen(false)} loanId={loan.id} onSaved={() => { invalidateLoan(); queryClient.invalidateQueries({ queryKey: ['loan-appraisals', id] }); }} />
+      <RejectLoanModal
+        open={rejectOpen}
+        onClose={() => setRejectOpen(false)}
+        onConfirm={(reason) =>
+          decideApprovalMutation.mutate(
+            { decision: 'rejected', reason },
+            { onSuccess: () => setRejectOpen(false) }
+          )
+        }
+        isPending={decideApprovalMutation.isPending}
+      />
       <DisburseModal open={disburseOpen} onClose={() => setDisburseOpen(false)} loanId={loan.id} onSaved={invalidateLoan} />
       <RepaymentModal open={repaymentOpen} onClose={() => setRepaymentOpen(false)} loanId={loan.id} onSaved={() => { invalidateLoan(); queryClient.invalidateQueries({ queryKey: ['loan-schedule', id] }); queryClient.invalidateQueries({ queryKey: ['loan-repayments', id] }); }} />
       <RestructureModal open={restructureOpen} onClose={() => setRestructureOpen(false)} loanId={loan.id} onSaved={invalidateLoan} />
@@ -518,6 +568,38 @@ function ConcessionModal({
           )}
         </div>
       )}
+    </Modal>
+  );
+}
+
+/** Item 6: rejecting a loan.approve request always records a comment — the audit trail (approver, timestamp, decision_reason) already lives on approval_requests via the shared approvalWorkflow service. */
+function RejectLoanModal({ open, onClose, onConfirm, isPending }: { open: boolean; onClose: () => void; onConfirm: (reason: string) => void; isPending: boolean }) {
+  const [reason, setReason] = useState('');
+
+  return (
+    <Modal
+      open={open}
+      onClose={() => {
+        onClose();
+        setReason('');
+      }}
+      title="Reject loan"
+      footer={
+        <>
+          <Button variant="secondary" size="sm" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button variant="danger" size="sm" disabled={!reason || isPending} onClick={() => onConfirm(reason)}>
+            Reject loan
+          </Button>
+        </>
+      }
+    >
+      <div className="flex flex-col gap-3">
+        <FormField label="Reason" hint="Recorded against the approval request for audit.">
+          {(id) => <textarea id={id} value={reason} onChange={(e) => setReason(e.target.value)} className={textareaClasses} rows={3} />}
+        </FormField>
+      </div>
     </Modal>
   );
 }

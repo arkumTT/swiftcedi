@@ -20,8 +20,8 @@ function approvalsRouter(pool) {
     auth,
     requirePermission('approval.decide'),
     asyncHandler(async (req, res) => {
-      const { status, actionType, entityType, branchId } = req.query;
-      res.json(await approvalWorkflow.listApprovals(pool, { status, actionType, entityType, branchId }));
+      const { status, actionType, entityType, entityId, branchId } = req.query;
+      res.json(await approvalWorkflow.listApprovals(pool, { status, actionType, entityType, entityId, branchId }));
     })
   );
 

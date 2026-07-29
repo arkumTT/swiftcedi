@@ -267,7 +267,7 @@ async function decide(db, { approvalId, decidedBy, decision, reason = null, exec
  * own approval-trail view) — there was previously no way to list
  * `approval_requests` at all, only request/decide single rows by id.
  */
-async function listApprovals(db, { status, actionType, entityType, branchId } = {}) {
+async function listApprovals(db, { status, actionType, entityType, entityId, branchId } = {}) {
   const clauses = [];
   const params = [];
   const add = (col, val) => {
@@ -278,6 +278,9 @@ async function listApprovals(db, { status, actionType, entityType, branchId } = 
   add('status', status);
   add('action_type', actionType);
   add('entity_type', entityType);
+  add('entity_id', entityId === undefined || entityId === null ? entityId : String(entityId));
+  // (entity_id is stored as text, so a numeric loanId must be stringified
+  // before comparison — everything else here is already the right type)
   add('branch_id', branchId);
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
   const { rows } = await db.query(

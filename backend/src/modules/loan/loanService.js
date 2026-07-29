@@ -707,10 +707,59 @@ async function waiveDefaultCharge(pool, { loanId, scheduleId, waivedBy, reason }
   return rows[0];
 }
 
+/**
+ * Attaches per-loan repayment aggregates the Loans & Credit table needs
+ * (item 4): totalPaidPesewas (everything collected across principal +
+ * interest + fees), balancePesewas (outstanding principal), and
+ * expectedPesewas (what should have been paid by today per the schedule
+ * — sum of installments due on/before today — a PAR-style comparison
+ * against totalPaidPesewas). A separate query rather than joined into the
+ * main SELECT so refreshLoanStatus's own `UPDATE loans ... RETURNING *`
+ * (which only ever touches the loans table) can't silently drop these
+ * columns off a just-recomputed row. Overdraft facilities have no
+ * schedule at all, so they fall back to balance = principal (the
+ * approved limit) and 0 paid/expected — a savings-account-side "drawn
+ * balance" concept doesn't apply here.
+ */
+async function attachLoanAggregates(pool, loans) {
+  if (loans.length === 0) return loans;
+  const ids = loans.map((l) => Number(l.id));
+  const { rows } = await pool.query(
+    `SELECT l.id AS loan_id,
+            COUNT(s.id) AS schedule_row_count,
+            COALESCE(SUM(s.principal_paid_pesewas + s.interest_paid_pesewas + s.fees_paid_pesewas), 0) AS total_paid_pesewas,
+            COALESCE(SUM(s.principal_due_pesewas - s.principal_paid_pesewas), 0) AS outstanding_principal_pesewas,
+            COALESCE(SUM(CASE WHEN s.due_date <= CURRENT_DATE
+                              THEN s.principal_due_pesewas + s.interest_due_pesewas + s.fees_due_pesewas
+                              ELSE 0 END), 0) AS expected_pesewas
+       FROM loans l
+       LEFT JOIN loan_schedules s ON s.loan_id = l.id AND s.schedule_version = l.current_schedule_version
+      WHERE l.id = ANY($1)
+      GROUP BY l.id`,
+    [ids]
+  );
+  const byId = new Map(rows.map((r) => [Number(r.loan_id), r]));
+  return loans.map((loan) => {
+    const agg = byId.get(Number(loan.id));
+    // No schedule rows at all (not yet disbursed, or an overdraft, which
+    // never gets one) -> nothing paid/expected yet, and the full
+    // principal (or approved limit) is the outstanding balance.
+    const hasSchedule = agg && Number(agg.schedule_row_count) > 0;
+    return {
+      ...loan,
+      total_paid_pesewas: hasSchedule ? Number(agg.total_paid_pesewas) : 0,
+      balance_pesewas: hasSchedule ? Number(agg.outstanding_principal_pesewas) : Number(loan.principal_pesewas),
+      expected_pesewas: hasSchedule ? Number(agg.expected_pesewas) : 0,
+    };
+  });
+}
+
 async function getLoan(pool, loanId) {
   const { rows } = await pool.query('SELECT * FROM loans WHERE id = $1', [loanId]);
   if (!rows[0]) throw new LoanNotFoundError(`loan ${loanId} not found`);
-  return refreshLoanStatus(pool, rows[0]);
+  const loan = await refreshLoanStatus(pool, rows[0]);
+  const [withAggregates] = await attachLoanAggregates(pool, [loan]);
+  return withAggregates;
 }
 
 async function listLoans(pool, { branchId, customerId, status, productId } = {}) {
@@ -732,7 +781,8 @@ async function listLoans(pool, { branchId, customerId, status, productId } = {})
   // therefore show that new status even though it was selected by its
   // OLD status matching the `status` filter above; the same live-compute
   // tradeoff getArrearsReport already accepts.
-  return Promise.all(rows.map((loan) => refreshLoanStatus(pool, loan)));
+  const refreshed = await Promise.all(rows.map((loan) => refreshLoanStatus(pool, loan)));
+  return attachLoanAggregates(pool, refreshed);
 }
 
 /**
