@@ -98,12 +98,16 @@ async function requestApproval(db, params) {
   } = params;
 
   const threshold = await getApplicableThreshold(db, { actionType, branchId });
-  const requiredApproverRoleId = threshold ? threshold.required_approver_role_id : null;
+  const requiredApproverRoleIds = threshold
+    ? threshold.required_approver_role_ids
+      || (threshold.required_approver_role_id ? [threshold.required_approver_role_id] : null)
+    : null;
+  const requiredApproverRoleId = requiredApproverRoleIds ? requiredApproverRoleIds[0] : null;
 
   const { rows } = await db.query(
     `INSERT INTO approval_requests
-       (action_type, entity_type, entity_id, branch_id, amount_pesewas, payload, requested_by, required_approver_role_id, status)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')
+       (action_type, entity_type, entity_id, branch_id, amount_pesewas, payload, requested_by, required_approver_role_id, required_approver_role_ids, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending')
      RETURNING *`,
     [
       actionType,
@@ -114,6 +118,7 @@ async function requestApproval(db, params) {
       payload === null ? null : JSON.stringify(payload),
       requestedBy,
       requiredApproverRoleId,
+      requiredApproverRoleIds,
     ]
   );
 
@@ -172,12 +177,18 @@ async function decide(db, { approvalId, decidedBy, decision, reason = null, exec
     throw new MakerCheckerViolationError('the requesting user cannot approve or reject their own request');
   }
 
-  if (existing.required_approver_role_id) {
+  // Prefer the multi-role array; fall back to the singular column for rows
+  // written before migration 059 that were never backfilled (shouldn't
+  // happen post-migration, but keeps old data readable).
+  const requiredRoleIds = existing.required_approver_role_ids
+    || (existing.required_approver_role_id ? [existing.required_approver_role_id] : null);
+  if (requiredRoleIds && requiredRoleIds.length > 0) {
     const { rows: userRows } = await db.query('SELECT role_id FROM users WHERE id = $1', [decidedBy]);
     const approver = userRows[0];
-    if (!approver || Number(approver.role_id) !== Number(existing.required_approver_role_id)) {
+    const approverRoleId = approver ? Number(approver.role_id) : null;
+    if (!approverRoleId || !requiredRoleIds.map(Number).includes(approverRoleId)) {
       throw new MakerCheckerViolationError(
-        `user ${decidedBy} does not hold the role required to decide approval_request ${approvalId}`
+        `user ${decidedBy} does not hold a role required to decide approval_request ${approvalId}`
       );
     }
   }

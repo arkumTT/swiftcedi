@@ -40,9 +40,10 @@ function approvalsRouter(pool) {
         where = 'WHERE branch_id = $1';
       }
       const { rows } = await pool.query(
-        `SELECT t.*, r.name AS required_approver_role_name
+        `SELECT t.*,
+                (SELECT array_agg(r.name ORDER BY r.name)
+                   FROM roles r WHERE r.id = ANY(t.required_approver_role_ids)) AS required_approver_role_names
            FROM approval_thresholds t
-           JOIN roles r ON r.id = t.required_approver_role_id
            ${where}
           ORDER BY t.action_type, t.branch_id NULLS FIRST`,
         params
@@ -51,30 +52,47 @@ function approvalsRouter(pool) {
     })
   );
 
+  // Accepts either `requiredApproverRoleIds` (array, preferred — a tier may
+  // require ANY ONE of several roles, e.g. branch_manager OR loan_officer)
+  // or the older singular `requiredApproverRoleId`, which is wrapped into a
+  // one-element array for backward compatibility.
+  function resolveRequiredRoleIds(body) {
+    if (Array.isArray(body.requiredApproverRoleIds) && body.requiredApproverRoleIds.length > 0) {
+      return body.requiredApproverRoleIds;
+    }
+    if (body.requiredApproverRoleId) {
+      return [body.requiredApproverRoleId];
+    }
+    return null;
+  }
+
   router.post(
     '/thresholds',
     auth,
     requirePermission('approval.manage_thresholds'),
     asyncHandler(async (req, res) => {
-      const { actionType, branchId = null, amountThresholdPesewas, requiredApproverRoleId } = req.body || {};
-      if (!actionType || amountThresholdPesewas === undefined || !requiredApproverRoleId) {
+      const { actionType, branchId = null, amountThresholdPesewas } = req.body || {};
+      const requiredApproverRoleIds = resolveRequiredRoleIds(req.body || {});
+      if (!actionType || amountThresholdPesewas === undefined || !requiredApproverRoleIds) {
         return res
           .status(400)
-          .json({ error: 'actionType, amountThresholdPesewas, and requiredApproverRoleId are required' });
+          .json({ error: 'actionType, amountThresholdPesewas, and requiredApproverRoleIds are required' });
       }
       // One row per (action_type, branch_id) — an existing row for the same
       // pair is updated in place rather than erroring, since "set the
       // threshold for X" is the natural admin mental model, not "create a
       // new threshold row."
       const { rows } = await pool.query(
-        `INSERT INTO approval_thresholds (action_type, branch_id, amount_threshold_pesewas, required_approver_role_id)
-         VALUES ($1, $2, $3, $4)
+        `INSERT INTO approval_thresholds
+           (action_type, branch_id, amount_threshold_pesewas, required_approver_role_id, required_approver_role_ids)
+         VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (action_type, COALESCE(branch_id, 0))
          DO UPDATE SET amount_threshold_pesewas = EXCLUDED.amount_threshold_pesewas,
                        required_approver_role_id = EXCLUDED.required_approver_role_id,
+                       required_approver_role_ids = EXCLUDED.required_approver_role_ids,
                        updated_at = now()
          RETURNING *`,
-        [actionType, branchId, amountThresholdPesewas, requiredApproverRoleId]
+        [actionType, branchId, amountThresholdPesewas, requiredApproverRoleIds[0], requiredApproverRoleIds]
       );
       await auditLog.record(pool, {
         userId: req.user.id,
@@ -93,7 +111,8 @@ function approvalsRouter(pool) {
     auth,
     requirePermission('approval.manage_thresholds'),
     asyncHandler(async (req, res) => {
-      const { amountThresholdPesewas, requiredApproverRoleId } = req.body || {};
+      const { amountThresholdPesewas } = req.body || {};
+      const requiredApproverRoleIds = resolveRequiredRoleIds(req.body || {});
       const { rows: beforeRows } = await pool.query('SELECT * FROM approval_thresholds WHERE id = $1', [
         req.params.id,
       ]);
@@ -103,10 +122,16 @@ function approvalsRouter(pool) {
         `UPDATE approval_thresholds
             SET amount_threshold_pesewas = COALESCE($1, amount_threshold_pesewas),
                 required_approver_role_id = COALESCE($2, required_approver_role_id),
+                required_approver_role_ids = COALESCE($3, required_approver_role_ids),
                 updated_at = now()
-          WHERE id = $3
+          WHERE id = $4
           RETURNING *`,
-        [amountThresholdPesewas, requiredApproverRoleId, req.params.id]
+        [
+          amountThresholdPesewas,
+          requiredApproverRoleIds ? requiredApproverRoleIds[0] : null,
+          requiredApproverRoleIds,
+          req.params.id,
+        ]
       );
       await auditLog.record(pool, {
         userId: req.user.id,

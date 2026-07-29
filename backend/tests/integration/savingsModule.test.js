@@ -337,9 +337,10 @@ describeIfDb('Module 4: savings, susu & standing orders', () => {
     const { account } = await openFundedAccount(100000, { withdrawalApprovalThresholdPesewas: 90000 });
     const { rows: roleRows } = await pool.query("SELECT id FROM roles WHERE name = 'branch_manager'");
     await pool.query(
-      `INSERT INTO approval_thresholds (action_type, branch_id, amount_threshold_pesewas, required_approver_role_id)
-       VALUES ('savings.withdraw', $1, 5000, $2)`,
-      [branchId, roleRows[0].id]
+      `INSERT INTO approval_thresholds
+         (action_type, branch_id, amount_threshold_pesewas, required_approver_role_id, required_approver_role_ids)
+       VALUES ('savings.withdraw', $1, 5000, $2, $3)`,
+      [branchId, roleRows[0].id, [roleRows[0].id]]
     );
 
     // 10000 is under the product's 90000 but over the branch override of 5000.

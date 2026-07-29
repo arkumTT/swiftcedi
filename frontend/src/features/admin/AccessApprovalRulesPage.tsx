@@ -15,7 +15,7 @@ interface ThresholdRow {
   action_type: string;
   branch_id: string | null;
   amount_threshold_pesewas: string;
-  required_approver_role_name: string;
+  required_approver_role_names: string[] | null;
 }
 
 export function AccessApprovalRulesPage() {
@@ -35,7 +35,15 @@ export function AccessApprovalRulesPage() {
     { key: 'action', header: 'Action type', render: (t) => <span className="font-mono text-[12.5px]">{t.action_type}</span> },
     { key: 'branch', header: 'Scope', render: (t) => branchName(t.branch_id) },
     { key: 'threshold', header: 'Threshold', align: 'right', render: (t) => <span className="tabular-nums">{formatGhs(t.amount_threshold_pesewas)}</span> },
-    { key: 'approver', header: 'Required approver role', render: (t) => <span className="capitalize">{t.required_approver_role_name.replace(/_/g, ' ')}</span> },
+    {
+      key: 'approver',
+      header: 'Required approver role(s)',
+      render: (t) => (
+        <span className="capitalize">
+          {(t.required_approver_role_names ?? []).map((n) => n.replace(/_/g, ' ')).join(', ') || '—'}
+        </span>
+      ),
+    },
   ];
 
   return (
@@ -88,8 +96,11 @@ function ThresholdModal({
   const [actionType, setActionType] = useState('');
   const [branchId, setBranchId] = useState('');
   const [amount, setAmount] = useState('');
-  const [roleId, setRoleId] = useState('');
+  const [roleIds, setRoleIds] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
+
+  const toggleRole = (id: string) =>
+    setRoleIds((prev) => (prev.includes(id) ? prev.filter((r) => r !== id) : [...prev, id]));
 
   const mutation = useMutation({
     mutationFn: () =>
@@ -97,7 +108,7 @@ function ThresholdModal({
         actionType,
         branchId: branchId || null,
         amountThresholdPesewas: Math.round(Number(amount) * 100),
-        requiredApproverRoleId: roleId,
+        requiredApproverRoleIds: roleIds,
       }),
     onSuccess: () => {
       onSaved();
@@ -105,7 +116,7 @@ function ThresholdModal({
       setActionType('');
       setBranchId('');
       setAmount('');
-      setRoleId('');
+      setRoleIds([]);
       setError(null);
     },
     onError: (err) => setError(err instanceof ApiError ? err.message : 'Unable to save threshold'),
@@ -146,16 +157,20 @@ function ThresholdModal({
         <FormField label="Amount threshold (GHS)">
           {(id) => <input id={id} type="number" min="0" value={amount} onChange={(e) => setAmount(e.target.value)} className={inputClasses} />}
         </FormField>
-        <FormField label="Required approver role">
+        <FormField label="Required approver role(s)" hint="Any one of the selected roles may decide a request against this threshold.">
           {(id) => (
-            <select id={id} value={roleId} onChange={(e) => setRoleId(e.target.value)} className={selectClasses}>
-              <option value="">Select a role…</option>
+            <div id={id} className="flex flex-col gap-1.5 rounded-md border border-border p-2">
               {roles.map((r) => (
-                <option key={r.id} value={r.id}>
+                <label key={r.id} className="flex items-center gap-2 text-[13px] capitalize">
+                  <input
+                    type="checkbox"
+                    checked={roleIds.includes(r.id)}
+                    onChange={() => toggleRole(r.id)}
+                  />
                   {r.name.replace(/_/g, ' ')}
-                </option>
+                </label>
               ))}
-            </select>
+            </div>
           )}
         </FormField>
         {error && (

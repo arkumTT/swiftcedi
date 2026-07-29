@@ -166,11 +166,12 @@ describeIfDb('Module 3: loan management', () => {
     // same convention cashierModule.test.js/savingsModule.test.js follow
     // for their own threshold-gated actions.
     await pool.query(
-      `INSERT INTO approval_thresholds (action_type, amount_threshold_pesewas, required_approver_role_id)
-       VALUES ('loan.grant_concession', 0, $1)
+      `INSERT INTO approval_thresholds (action_type, amount_threshold_pesewas, required_approver_role_id, required_approver_role_ids)
+       VALUES ('loan.grant_concession', 0, $1, $2)
        ON CONFLICT (action_type, (COALESCE(branch_id, 0)))
-       DO UPDATE SET required_approver_role_id = EXCLUDED.required_approver_role_id`,
-      [branchManagerRoleId]
+       DO UPDATE SET required_approver_role_id = EXCLUDED.required_approver_role_id,
+                     required_approver_role_ids = EXCLUDED.required_approver_role_ids`,
+      [branchManagerRoleId, [branchManagerRoleId]]
     );
 
     const branch = await branchService.createBranch(pool, { code: 'LON-01', name: 'Loan Test Branch', createdBy: maker });

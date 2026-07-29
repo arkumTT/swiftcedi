@@ -60,6 +60,28 @@ describe('requestApproval', () => {
     const insertParams = db.query.mock.calls[1][1];
     expect(insertParams).toContain(2); // required_approver_role_id passed through from threshold
   });
+
+  test('stamps required_approver_role_ids (plural) from a multi-role threshold', async () => {
+    const threshold = { required_approver_role_ids: [2, 4], amount_threshold_pesewas: 100000 };
+    const created = { id: 5, status: 'pending' };
+    const db = makeSequentialDb([
+      { rows: [threshold] }, // getApplicableThreshold
+      { rows: [created] }, // INSERT approval_requests
+      { rows: [{ id: 1 }] }, // audit log insert
+    ]);
+
+    await requestApproval(db, {
+      actionType: 'loan.approve',
+      entityType: 'loan',
+      branchId: 1,
+      requestedBy: 7,
+      amountPesewas: 20_000_000,
+    });
+
+    const insertParams = db.query.mock.calls[1][1];
+    expect(insertParams).toContain(2); // required_approver_role_id backfilled as role_ids[0]
+    expect(insertParams).toContainEqual([2, 4]); // required_approver_role_ids passed through
+  });
 });
 
 describe('decide', () => {
@@ -115,6 +137,48 @@ describe('decide', () => {
       { rows: [{ role_id: 3 }] }, // SELECT role_id FROM users (wrong role)
     ]);
     await expect(decide(db, { approvalId: 1, decidedBy: 2, decision: 'approved' })).rejects.toThrow(
+      MakerCheckerViolationError
+    );
+  });
+
+  test('multi-role: decider holding any one of the required roles may decide', async () => {
+    const existing = {
+      id: 1,
+      requested_by: 7,
+      status: 'pending',
+      required_approver_role_id: 2,
+      required_approver_role_ids: [2, 5],
+      action_type: 'loan.approve',
+      branch_id: 1,
+    };
+    const updated = { ...existing, status: 'approved', decided_by: 8 };
+    const db = makeSequentialDb([
+      { rows: [existing] }, // SELECT ... FOR UPDATE
+      { rows: [{ role_id: 5 }] }, // SELECT role_id FROM users (second allowed role)
+      { rows: [updated] }, // UPDATE ... RETURNING
+      { rows: [{ id: 99 }] }, // audit log insert
+    ]);
+
+    const result = await decide(db, { approvalId: 1, decidedBy: 8, decision: 'approved' });
+    expect(result).toBe(updated);
+  });
+
+  test('multi-role: decider holding none of the required roles is rejected', async () => {
+    const existing = {
+      id: 1,
+      requested_by: 7,
+      status: 'pending',
+      required_approver_role_id: 2,
+      required_approver_role_ids: [2, 5],
+      action_type: 'loan.approve',
+      branch_id: 1,
+    };
+    const db = makeSequentialDb([
+      { rows: [existing] }, // SELECT ... FOR UPDATE
+      { rows: [{ role_id: 9 }] }, // SELECT role_id FROM users (not in the required set)
+    ]);
+
+    await expect(decide(db, { approvalId: 1, decidedBy: 8, decision: 'approved' })).rejects.toThrow(
       MakerCheckerViolationError
     );
   });

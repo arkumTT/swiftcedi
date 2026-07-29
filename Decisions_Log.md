@@ -457,6 +457,26 @@ registerExecutionHandler(actionType, handler(approvalRequest, db) -> Promise<voi
 - If `required_approver_role_id` is set on the request (from a matching
   `approval_thresholds` row), `decide` also verifies the deciding user
   actually holds that role.
+- **Multi-role thresholds (migration 059, loan module amendment).**
+  `approval_thresholds` and `approval_requests` both gained
+  `required_approver_role_ids BIGINT[]` (additive; backfilled from the
+  existing singular column). A threshold's tier can now require **any one**
+  of several roles to decide, not just one — needed because the loan
+  approval gate (`loan.approve`) is tiered by amount with two roles per
+  tier (see "Loan module amendment" below). `decide()` checks array
+  membership (`requiredRoleIds.includes(approverRoleId)`), falling back to
+  the singular `required_approver_role_id` wrapped in a one-element array
+  for any pre-migration-059 row that was never backfilled. The singular
+  column is still written on every `requestApproval()`/threshold-CRUD call
+  (as `role_ids[0]`) for backward compatibility — do not remove it.
+  `routes/approvals.js`'s threshold CRUD accepts `requiredApproverRoleIds`
+  (array, preferred) or the older singular `requiredApproverRoleId`
+  (wrapped into a one-element array); `GET /approvals/thresholds` returns
+  `required_approver_role_names` (array, via `array_agg`) instead of the
+  old singular `required_approver_role_name`. `AccessApprovalRulesPage.tsx`
+  uses a checkbox list, not a single `<select>`, to set a threshold's roles.
+  Every module that calls `requestApproval()`/`decide()` picked this up for
+  free — no other module's code changed.
 
 ### GL posting interface — `backend/src/shared/glPosting.js`
 
