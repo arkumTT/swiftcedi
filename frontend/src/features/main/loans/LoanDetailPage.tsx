@@ -142,10 +142,23 @@ export function LoanDetailPage() {
   const collateralColumns: Column<LoanCollateral>[] = [
     { key: 'description', header: 'Description', render: (c) => c.description },
     { key: 'value', header: 'Estimated value', render: (c) => formatGhs(c.estimated_value_pesewas), align: 'right' },
+    {
+      key: 'document',
+      header: 'Document',
+      render: (c) =>
+        c.document_url ? (
+          <a href={c.document_url} target="_blank" rel="noreferrer" className="text-primary underline">
+            View
+          </a>
+        ) : (
+          '—'
+        ),
+    },
     { key: 'status', header: 'Verification', render: (c) => <StatusBadge status={c.verification_status} /> },
   ];
   const guarantorColumns: Column<LoanGuarantor>[] = [
     { key: 'name', header: 'Name', render: (g) => g.guarantor_name ?? `Customer #${g.customer_id}` },
+    { key: 'relationship', header: 'Relationship', render: (g) => <span className="capitalize">{g.relationship ?? '—'}</span> },
     { key: 'phone', header: 'Phone', render: (g) => g.guarantor_phone ?? '—' },
     { key: 'amount', header: 'Guaranteed amount', render: (g) => formatGhs(g.guaranteed_amount_pesewas), align: 'right' },
     { key: 'status', header: 'Verification', render: (g) => <StatusBadge status={g.verification_status} /> },
@@ -173,7 +186,7 @@ export function LoanDetailPage() {
               · {branchName} · Loan Offer: {productQuery.data?.name ?? `#${loan.product_id}`}
             </p>
             <p className="text-[13px] text-text-secondary">
-              {formatGhs(loan.principal_pesewas)} principal · {loan.term_months} months · disbursed {formatDate(loan.disbursed_at)}
+              {formatGhs(loan.principal_pesewas)} principal · {loan.term_months} {loan.duration_unit} · disbursed {formatDate(loan.disbursed_at)}
             </p>
           </div>
           <div className="flex flex-wrap justify-end gap-1.5">
@@ -411,7 +424,7 @@ function TermsCard({
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
         <KpiCard label="Current rate (p.a.)" value={formatBps(loan.annual_interest_rate_bps)} />
         <KpiCard label="Interest method" value={loan.interest_method === 'flat' ? 'Flat' : 'Reducing balance'} />
-        <KpiCard label="Term" value={`${loan.term_months} months`} />
+        <KpiCard label="Term" value={`${loan.term_months} ${loan.duration_unit}`} />
         <KpiCard label="Fees" value={feeScheduleSummary(loan.fee_schedule)} />
       </div>
 
@@ -422,7 +435,7 @@ function TermsCard({
             {formatBps(product.annual_interest_rate_bps)} p.a.
             {product.rate_type === 'floating' && ` (floating: reference + ${formatBps(product.spread_bps)} spread, resets ${product.reset_frequency})`}
             {' · '}
-            {product.min_term_months}–{product.max_term_months} months allowed
+            {product.min_term_months}–{product.max_term_months} {product.duration_unit} allowed
           </p>
           {currentDiffersFromStandard && (
             <p className="mt-1 text-[12.5px] font-medium text-warning-text-strong">
@@ -911,15 +924,22 @@ function AccrueInterestModal({ open, onClose, loanId, onSaved }: { open: boolean
 function AddCollateralModal({ open, onClose, loanId, onSaved }: { open: boolean; onClose: () => void; loanId: string; onSaved: () => void }) {
   const [description, setDescription] = useState('');
   const [estimatedValue, setEstimatedValue] = useState('');
+  const [documentUrl, setDocumentUrl] = useState('');
   const [error, setError] = useState<string | null>(null);
 
   const mutation = useMutation({
-    mutationFn: () => api.post(`/loans/${loanId}/collateral`, { description, estimatedValuePesewas: estimatedValue ? parseGhsInput(estimatedValue) : undefined }),
+    mutationFn: () =>
+      api.post(`/loans/${loanId}/collateral`, {
+        description,
+        estimatedValuePesewas: estimatedValue ? parseGhsInput(estimatedValue) : undefined,
+        documentUrl: documentUrl || undefined,
+      }),
     onSuccess: () => {
       onSaved();
       onClose();
       setDescription('');
       setEstimatedValue('');
+      setDocumentUrl('');
     },
     onError: (err) => setError(err instanceof ApiError ? err.message : 'Unable to add collateral'),
   });
@@ -943,6 +963,9 @@ function AddCollateralModal({ open, onClose, loanId, onSaved }: { open: boolean;
       <div className="flex flex-col gap-3">
         <FormField label="Description">{(id) => <input id={id} value={description} onChange={(e) => setDescription(e.target.value)} className={inputClasses} />}</FormField>
         <FormField label="Estimated value (GH₵)">{(id) => <input id={id} type="number" step="0.01" value={estimatedValue} onChange={(e) => setEstimatedValue(e.target.value)} className={inputClasses} />}</FormField>
+        <FormField label="Document URL" hint="Link to a scanned image/PDF of the collateral documentation (e.g. a title deed or receipt) — no file upload yet, paste a link.">
+          {(id) => <input id={id} type="url" value={documentUrl} onChange={(e) => setDocumentUrl(e.target.value)} className={inputClasses} placeholder="https://…" />}
+        </FormField>
         {error && (
           <p role="alert" className="text-[13px] text-danger">
             {error}
@@ -953,11 +976,14 @@ function AddCollateralModal({ open, onClose, loanId, onSaved }: { open: boolean;
   );
 }
 
+const GUARANTOR_RELATIONSHIPS = ['spouse', 'sibling', 'parent', 'friend', 'business partner', 'colleague', 'other'];
+
 function AddGuarantorModal({ open, onClose, loanId, onSaved }: { open: boolean; onClose: () => void; loanId: string; onSaved: () => void }) {
   const [customerId, setCustomerId] = useState('');
   const [guarantorName, setGuarantorName] = useState('');
   const [guarantorPhone, setGuarantorPhone] = useState('');
   const [guaranteedAmount, setGuaranteedAmount] = useState('');
+  const [relationship, setRelationship] = useState('');
   const [error, setError] = useState<string | null>(null);
 
   const mutation = useMutation({
@@ -967,6 +993,7 @@ function AddGuarantorModal({ open, onClose, loanId, onSaved }: { open: boolean; 
         guarantorName: guarantorName || undefined,
         guarantorPhone: guarantorPhone || undefined,
         guaranteedAmountPesewas: guaranteedAmount ? parseGhsInput(guaranteedAmount) : undefined,
+        relationship: relationship || undefined,
       }),
     onSuccess: () => {
       onSaved();
@@ -975,6 +1002,7 @@ function AddGuarantorModal({ open, onClose, loanId, onSaved }: { open: boolean; 
       setGuarantorName('');
       setGuarantorPhone('');
       setGuaranteedAmount('');
+      setRelationship('');
     },
     onError: (err) => setError(err instanceof ApiError ? err.message : 'Unable to add guarantor'),
   });
@@ -1000,6 +1028,18 @@ function AddGuarantorModal({ open, onClose, loanId, onSaved }: { open: boolean; 
         <FormField label="Customer ID (optional)">{(id) => <input id={id} type="number" value={customerId} onChange={(e) => setCustomerId(e.target.value)} className={inputClasses} />}</FormField>
         <FormField label="Guarantor name (if not a customer)">{(id) => <input id={id} value={guarantorName} onChange={(e) => setGuarantorName(e.target.value)} className={inputClasses} />}</FormField>
         <FormField label="Phone">{(id) => <input id={id} value={guarantorPhone} onChange={(e) => setGuarantorPhone(e.target.value)} className={inputClasses} />}</FormField>
+        <FormField label="Relationship to guarantor">
+          {(id) => (
+            <select id={id} value={relationship} onChange={(e) => setRelationship(e.target.value)} className={selectClasses}>
+              <option value="">Select…</option>
+              {GUARANTOR_RELATIONSHIPS.map((r) => (
+                <option key={r} value={r} className="capitalize">
+                  {r}
+                </option>
+              ))}
+            </select>
+          )}
+        </FormField>
         <FormField label="Guaranteed amount (GH₵)">{(id) => <input id={id} type="number" step="0.01" value={guaranteedAmount} onChange={(e) => setGuaranteedAmount(e.target.value)} className={inputClasses} />}</FormField>
         {error && (
           <p role="alert" className="text-[13px] text-danger">

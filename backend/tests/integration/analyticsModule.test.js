@@ -30,8 +30,10 @@ describeIfDb('Module 9: analytics & owner dashboard', () => {
   let branchId;
   let ownerRoleId;
   let loanOfficerRoleId;
+  let branchManagerRoleId;
   let maker;
   let checker;
+  let branchManagerChecker;
 
   beforeAll(async () => {
     execFileSync('node', [path.join(__dirname, '../../src/db/migrate.js'), '--test'], {
@@ -142,9 +144,15 @@ describeIfDb('Module 9: analytics & owner dashboard', () => {
     ownerRoleId = ownerRows[0].id;
     const { rows: officerRoleRows } = await pool.query("SELECT id FROM roles WHERE name = 'loan_officer'");
     loanOfficerRoleId = officerRoleRows[0].id;
+    const { rows: bmRoleRows } = await pool.query("SELECT id FROM roles WHERE name = 'branch_manager'");
+    branchManagerRoleId = bmRoleRows[0].id;
 
     maker = await createTestUser('analytics-maker@test.local', ownerRoleId);
     checker = await createTestUser('analytics-checker@test.local', ownerRoleId);
+    // Migration 066: loan.approve below GHS 100,000 requires branch_manager/
+    // loan_officer, not the plain owner-role `checker` — every loan here
+    // disbursed via takeLoanToDisbursed() is well under that threshold.
+    branchManagerChecker = await createTestUser('analytics-bm-checker@test.local', branchManagerRoleId);
 
     const branch = await branchService.createBranch(pool, { code: 'ANL-01', name: 'Analytics Test Branch', createdBy: maker });
     branchId = branch.id;
@@ -242,7 +250,9 @@ describeIfDb('Module 9: analytics & owner dashboard', () => {
       appraiserId: maker,
     });
     const approval = await loanService.requestLoanApproval(pool, { loanId: loan.id, requestedBy: maker });
-    await decideAs(approval.id, checker);
+    // Migration 066: loan.approve below GHS 100,000 requires branch_manager/
+    // loan_officer, not the plain owner-role `checker`.
+    await decideAs(approval.id, branchManagerChecker);
     return loanService.disburseLoan(pool, { loanId: loan.id, disbursedBy: maker, disbursementDate });
   }
 

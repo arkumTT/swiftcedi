@@ -265,21 +265,40 @@ function CreateLoanModal({
   const [productId, setProductId] = useState('');
   const [principal, setPrincipal] = useState('');
   const [termMonths, setTermMonths] = useState('');
+  const [repaymentFrequency, setRepaymentFrequency] = useState<'daily' | 'weekly' | 'biweekly' | 'monthly'>('monthly');
   const [reasonCode, setReasonCode] = useState('');
   const [purposeNotes, setPurposeNotes] = useState('');
   const [error, setError] = useState<string | null>(null);
 
   const selectedProduct = products.find((p) => p.id === productId);
 
+  // Keep the chosen frequency valid whenever the offer changes underneath it.
+  if (selectedProduct && selectedProduct.allowed_repayment_frequencies.length > 0 && !selectedProduct.allowed_repayment_frequencies.includes(repaymentFrequency)) {
+    setRepaymentFrequency(selectedProduct.allowed_repayment_frequencies[0]);
+  }
+
   function reset() {
     setCustomerId('');
     setProductId('');
     setPrincipal('');
     setTermMonths('');
+    setRepaymentFrequency('monthly');
     setReasonCode('');
     setPurposeNotes('');
     setError(null);
   }
+
+  const previewQuery = useQuery({
+    queryKey: ['loan-application-preview', productId, principal, termMonths, repaymentFrequency],
+    queryFn: () =>
+      api.post<LoanCalculatorResult>('/loans/calculator', {
+        productId,
+        principalPesewas: parseGhsInput(principal),
+        termMonths: Number(termMonths),
+        repaymentFrequency,
+      }),
+    enabled: Boolean(productId && principal && termMonths),
+  });
 
   const mutation = useMutation({
     mutationFn: () =>
@@ -288,6 +307,7 @@ function CreateLoanModal({
         productId,
         principalPesewas: parseGhsInput(principal),
         termMonths: Number(termMonths),
+        repaymentFrequency,
         reasonCode: reasonCode || undefined,
         purposeNotes: purposeNotes || undefined,
       }),
@@ -341,11 +361,53 @@ function CreateLoanModal({
           {(id) => <input id={id} type="number" step="0.01" value={principal} onChange={(e) => setPrincipal(e.target.value)} className={inputClasses} />}
         </FormField>
         <FormField
-          label="Term (months)"
-          hint={selectedProduct ? `Range: ${selectedProduct.min_term_months} – ${selectedProduct.max_term_months} months` : undefined}
+          label={`Duration${selectedProduct ? ` (${selectedProduct.duration_unit})` : ''}`}
+          hint={selectedProduct ? `Range: ${selectedProduct.min_term_months} – ${selectedProduct.max_term_months} ${selectedProduct.duration_unit}` : undefined}
         >
           {(id) => <input id={id} type="number" value={termMonths} onChange={(e) => setTermMonths(e.target.value)} className={inputClasses} />}
         </FormField>
+        <FormField label="Repayment frequency" hint="Item 3a: this determines the schedule generated below — daily, weekly, bi-weekly, or monthly.">
+          {(id) => (
+            <select id={id} value={repaymentFrequency} onChange={(e) => setRepaymentFrequency(e.target.value as typeof repaymentFrequency)} className={selectClasses}>
+              {REPAYMENT_FREQUENCY_OPTIONS.filter((f) => !selectedProduct || selectedProduct.allowed_repayment_frequencies.includes(f.value)).map((f) => (
+                <option key={f.value} value={f.value}>
+                  {f.label}
+                </option>
+              ))}
+            </select>
+          )}
+        </FormField>
+        {previewQuery.data && (
+          <div className="rounded-md border border-border p-3">
+            <p className="mb-2 text-[12.5px] font-medium text-text-primary">Repayment schedule preview</p>
+            <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+              <KpiCard label="Fees" value={formatGhs(previewQuery.data.feesPesewas)} />
+              <KpiCard label="Net disbursed" value={formatGhs(previewQuery.data.netDisbursedPesewas)} />
+              <KpiCard label="Total interest" value={formatGhs(previewQuery.data.totalInterestPesewas)} />
+              <KpiCard label="Total repayable" value={formatGhs(previewQuery.data.totalRepayablePesewas)} />
+            </div>
+            <div className="mt-3 max-h-48 overflow-y-auto overflow-x-auto">
+              <table className="w-full border-collapse text-sm">
+                <thead>
+                  <tr className="border-b border-border text-[11.5px] font-semibold tracking-wide text-text-secondary uppercase">
+                    <th className="px-2 py-1.5 text-left">#</th>
+                    <th className="px-2 py-1.5 text-left">Due date</th>
+                    <th className="px-2 py-1.5 text-right">Amount</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {previewQuery.data.schedule.map((row) => (
+                    <tr key={row.installmentNumber} className="border-b border-border last:border-b-0">
+                      <td className="px-2 py-1.5">{row.installmentNumber}</td>
+                      <td className="px-2 py-1.5">{formatDate(row.dueDate)}</td>
+                      <td className="px-2 py-1.5 text-right">{formatGhs(row.principalDuePesewas + row.interestDuePesewas)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
         <FormField label="Reason code">
           {(id) =>
             selectedProduct && selectedProduct.reason_codes.length > 0 ? (
@@ -386,6 +448,7 @@ function CreateLoanModal({
  * reflects the new status without any client-side status logic here.
  */
 function ManageRepaymentsModal({ loan, onClose, onChanged }: { loan: Loan | null; onClose: () => void; onChanged: () => void }) {
+  const { hasPermission } = useAuth();
   const queryClient = useQueryClient();
   const [amount, setAmount] = useState('');
   const [error, setError] = useState<string | null>(null);
@@ -489,7 +552,7 @@ function ManageRepaymentsModal({ loan, onClose, onChanged }: { loan: Loan | null
                       <StatusBadge status={row.status} />
                     </td>
                     <td className="px-3 py-2">
-                      {row.default_charge_applied && row.fees_due_pesewas > row.fees_paid_pesewas && (
+                      {row.default_charge_applied && row.fees_due_pesewas > row.fees_paid_pesewas && hasPermission('loan.waive_charges') && (
                         <>
                           {waivingScheduleId === row.id ? (
                             <div className="flex items-center gap-1.5">
@@ -527,6 +590,7 @@ function LoanCalculatorCard({ products }: { products: LoanProduct[] }) {
   const [principal, setPrincipal] = useState('');
   const [termMonths, setTermMonths] = useState('');
   const [error, setError] = useState<string | null>(null);
+  const selectedProduct = products.find((p) => p.id === productId);
 
   const mutation = useMutation({
     mutationFn: () =>
@@ -557,7 +621,7 @@ function LoanCalculatorCard({ products }: { products: LoanProduct[] }) {
         <FormField label="Principal (GH₵)">
           {(id) => <input id={id} type="number" step="0.01" value={principal} onChange={(e) => setPrincipal(e.target.value)} className={inputClasses} />}
         </FormField>
-        <FormField label="Term (months)">
+        <FormField label={`Duration${selectedProduct ? ` (${selectedProduct.duration_unit})` : ''}`}>
           {(id) => <input id={id} type="number" value={termMonths} onChange={(e) => setTermMonths(e.target.value)} className={inputClasses} />}
         </FormField>
         <div className="flex items-end">
@@ -798,7 +862,7 @@ function LoanProductsCard({ products, isLoading, canManage }: { products: LoanPr
                 formatBps(p.annual_interest_rate_bps)
               ),
           },
-          { key: 'term', header: 'Term range', render: (p) => `${p.min_term_months}–${p.max_term_months} mo` },
+          { key: 'term', header: 'Term range', render: (p) => `${p.min_term_months}–${p.max_term_months} ${p.duration_unit}` },
           { key: 'principal', header: 'Principal range', render: (p) => `${formatGhs(p.min_principal_pesewas)} – ${formatGhs(p.max_principal_pesewas)}` },
           { key: 'status', header: 'Status', render: (p) => <StatusBadge status={p.status} /> },
         ]}
