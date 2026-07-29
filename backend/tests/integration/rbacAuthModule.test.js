@@ -325,11 +325,15 @@ describeIfDb('RBAC/auth HTTP routes (Module 11 additions)', () => {
 
   test('GET /approvals requires approval.decide', async () => {
     const passwordHash = await hashPassword('TestPassword123!');
-    const { rows: loanOfficerRoleRows } = await pool.query("SELECT id FROM roles WHERE name = 'loan_officer'");
+    // cashier, not loan_officer: loan_officer now holds approval.decide
+    // (it's the lower tier's required role for loan.approve — see
+    // Decisions_Log.md), so it no longer demonstrates "lacks the
+    // permission" the way it did before that amendment.
+    const { rows: cashierRoleRows } = await pool.query("SELECT id FROM roles WHERE name = 'cashier'");
     await pool.query(
       `INSERT INTO users (full_name, email, password_hash, role_id, home_branch_id)
        VALUES ($1, $2, $3, $4, $5)`,
-      ['No Decide Permission', 'no-decide@test.local', passwordHash, loanOfficerRoleRows[0].id, hqBranchId]
+      ['No Decide Permission', 'no-decide@test.local', passwordHash, cashierRoleRows[0].id, hqBranchId]
     );
     const loginRes = await request(app)
       .post('/auth/login')
@@ -338,7 +342,7 @@ describeIfDb('RBAC/auth HTTP routes (Module 11 additions)', () => {
     expect(res.status).toBe(403);
   });
 
-  test('GET/POST/PATCH /approvals/thresholds round-trips a threshold, upserts on the same action/branch pair, and validates required fields', async () => {
+  test('GET/POST/PATCH /approvals/thresholds round-trips a threshold, upserts on the same action/branch/amount tier, creates a new tier on a different amount, and validates required fields', async () => {
     const missingFields = await request(app)
       .post('/approvals/thresholds')
       .set('Authorization', `Bearer ${adminToken}`)
@@ -352,12 +356,24 @@ describeIfDb('RBAC/auth HTTP routes (Module 11 additions)', () => {
     expect(created.status).toBe(201);
     expect(Number(created.body.amount_threshold_pesewas)).toBe(100000);
 
+    // Same action_type/branch/amount tier -> updates the existing row in place.
     const upserted = await request(app)
       .post('/approvals/thresholds')
       .set('Authorization', `Bearer ${adminToken}`)
-      .send({ actionType: 'test.threshold', amountThresholdPesewas: 250000, requiredApproverRoleId: ownerRoleId });
+      .send({ actionType: 'test.threshold', amountThresholdPesewas: 100000, requiredApproverRoleId: ownerRoleId });
     expect(Number(upserted.body.id)).toBe(Number(created.body.id));
-    expect(Number(upserted.body.amount_threshold_pesewas)).toBe(250000);
+    expect(Number(upserted.body.amount_threshold_pesewas)).toBe(100000);
+
+    // A DIFFERENT amount for the same action_type/branch is a new TIER
+    // (see migration 066), not an update of the existing row — this is
+    // what makes loan.approve's amount-tiered lower/upper split possible.
+    const secondTier = await request(app)
+      .post('/approvals/thresholds')
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ actionType: 'test.threshold', amountThresholdPesewas: 250000, requiredApproverRoleId: ownerRoleId });
+    expect(secondTier.status).toBe(201);
+    expect(Number(secondTier.body.id)).not.toBe(Number(created.body.id));
+    expect(Number(secondTier.body.amount_threshold_pesewas)).toBe(250000);
 
     const list = await request(app)
       .get('/approvals/thresholds')

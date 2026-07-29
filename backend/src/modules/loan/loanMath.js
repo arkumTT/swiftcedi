@@ -79,7 +79,89 @@ function generateReducingBalanceSchedule({ principalPesewas, termMonths, annualI
   return rows;
 }
 
-function generateLoanSchedule({ principalPesewas, termMonths, annualInterestRateBps, interestMethod, startDate }) {
+/** Adds `days` to a 'YYYY-MM-DD' date string. */
+function addDaysToDateString(dateStr, days) {
+  const d = new Date(`${dateStr}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+// Non-monthly cadences are approximated in whole days (a 30-day month,
+// 7-day week) rather than tracked against a real calendar, the same kind
+// of deliberate simplification this codebase already makes elsewhere
+// (overdraft interest uses a 365-day year, not actual days-in-year) —
+// see loan_products migration 060's comment for the offer-facing side of
+// this. The MONTHLY path above is unaffected and still uses real
+// calendar months via addMonthsToDateString.
+const PERIOD_DAYS = { daily: 1, weekly: 7, biweekly: 14, monthly: 30 };
+const DURATION_UNIT_DAYS = { days: 1, weeks: 7, months: 30 };
+
+/**
+ * Flat-rate schedule generalized to an arbitrary fixed period length (in
+ * days) instead of calendar months — same anti-drift construction as
+ * generateFlatSchedule (both principal and interest rounding remainders
+ * absorbed by the last installment).
+ */
+function generateFlatScheduleByPeriod({ principalPesewas, numInstallments, periodDays, annualInterestRateBps, startDate }) {
+  const totalInterestPesewas = Math.round(
+    (principalPesewas * annualInterestRateBps * numInstallments * periodDays) / (365 * 10000)
+  );
+  const basePrincipal = Math.floor(principalPesewas / numInstallments);
+  const baseInterest = Math.floor(totalInterestPesewas / numInstallments);
+
+  const rows = [];
+  let principalAccum = 0;
+  let interestAccum = 0;
+  for (let i = 1; i <= numInstallments; i++) {
+    const isLast = i === numInstallments;
+    const principalDuePesewas = isLast ? principalPesewas - principalAccum : basePrincipal;
+    const interestDuePesewas = isLast ? totalInterestPesewas - interestAccum : baseInterest;
+    principalAccum += principalDuePesewas;
+    interestAccum += interestDuePesewas;
+    rows.push({ installmentNumber: i, dueDate: addDaysToDateString(startDate, i * periodDays), principalDuePesewas, interestDuePesewas });
+  }
+  return rows;
+}
+
+/**
+ * Reducing-balance schedule generalized to an arbitrary fixed period
+ * length (in days) — same annuity-formula/anti-drift construction as
+ * generateReducingBalanceSchedule, with the period rate computed as
+ * annualRate * (periodDays/365) instead of annualRate/12.
+ */
+function generateReducingBalanceScheduleByPeriod({ principalPesewas, numInstallments, periodDays, annualInterestRateBps, startDate }) {
+  const periodRate = (annualInterestRateBps / 10000) * (periodDays / 365);
+
+  let installmentAmount;
+  if (periodRate === 0) {
+    installmentAmount = Math.round(principalPesewas / numInstallments);
+  } else {
+    const factor = (1 + periodRate) ** numInstallments;
+    installmentAmount = Math.round((principalPesewas * periodRate * factor) / (factor - 1));
+  }
+
+  const rows = [];
+  let balance = principalPesewas;
+  for (let i = 1; i <= numInstallments; i++) {
+    const isLast = i === numInstallments;
+    const interestDuePesewas = Math.round(balance * periodRate);
+    let principalDuePesewas = isLast ? balance : Math.min(installmentAmount - interestDuePesewas, balance);
+    if (principalDuePesewas < 0) principalDuePesewas = 0;
+    balance -= principalDuePesewas;
+    rows.push({ installmentNumber: i, dueDate: addDaysToDateString(startDate, i * periodDays), principalDuePesewas, interestDuePesewas });
+  }
+  return rows;
+}
+
+function generateLoanSchedule({
+  principalPesewas,
+  termMonths,
+  annualInterestRateBps,
+  interestMethod,
+  startDate,
+  repaymentFrequency = 'monthly',
+  durationUnit = 'months',
+}) {
   if (!Number.isInteger(principalPesewas) || principalPesewas <= 0) {
     throw new Error('principalPesewas must be a positive integer');
   }
@@ -89,11 +171,39 @@ function generateLoanSchedule({ principalPesewas, termMonths, annualInterestRate
   if (!Number.isInteger(annualInterestRateBps) || annualInterestRateBps < 0) {
     throw new Error('annualInterestRateBps must be a non-negative integer');
   }
+
+  // The original, unchanged monthly-calendar path — every pre-existing
+  // caller (still the overwhelming majority: every product whose offer
+  // never opted into a non-monthly cadence) hits this branch and gets
+  // byte-identical output to before this function grew frequency/duration
+  // support, using real calendar months rather than the 30-day
+  // approximation the non-monthly branch below uses.
+  if (repaymentFrequency === 'monthly' && durationUnit === 'months') {
+    if (interestMethod === 'flat') {
+      return generateFlatSchedule({ principalPesewas, termMonths, annualInterestRateBps, startDate });
+    }
+    if (interestMethod === 'reducing_balance') {
+      return generateReducingBalanceSchedule({ principalPesewas, termMonths, annualInterestRateBps, startDate });
+    }
+    throw new Error(`unknown interestMethod '${interestMethod}'`);
+  }
+
+  if (!PERIOD_DAYS[repaymentFrequency]) {
+    throw new Error(`unknown repaymentFrequency '${repaymentFrequency}'`);
+  }
+  if (!DURATION_UNIT_DAYS[durationUnit]) {
+    throw new Error(`unknown durationUnit '${durationUnit}'`);
+  }
+
+  const periodDays = PERIOD_DAYS[repaymentFrequency];
+  const totalDays = termMonths * DURATION_UNIT_DAYS[durationUnit];
+  const numInstallments = Math.max(1, Math.round(totalDays / periodDays));
+
   if (interestMethod === 'flat') {
-    return generateFlatSchedule({ principalPesewas, termMonths, annualInterestRateBps, startDate });
+    return generateFlatScheduleByPeriod({ principalPesewas, numInstallments, periodDays, annualInterestRateBps, startDate });
   }
   if (interestMethod === 'reducing_balance') {
-    return generateReducingBalanceSchedule({ principalPesewas, termMonths, annualInterestRateBps, startDate });
+    return generateReducingBalanceScheduleByPeriod({ principalPesewas, numInstallments, periodDays, annualInterestRateBps, startDate });
   }
   throw new Error(`unknown interestMethod '${interestMethod}'`);
 }
@@ -294,14 +404,58 @@ function evaluateConcessionBounds({
   return { permitted: withinFloor, withinFloor, appliedFloorBps: floorBps, deltaBps, needsApproval };
 }
 
+/**
+ * Amount for a single basis/amount/rate-pair field — the shape
+ * processing_fee_*, insurance_fee_*, and default_charge_* all share (see
+ * migration 060) — as opposed to computeFeesPesewas, which sums an
+ * ARRAY of such fees (the generic fee_schedule column). 'flat' returns
+ * amountPesewas as-is; 'percent_of_principal' computes rateBps against
+ * the given principal.
+ */
+function computeFeeAmountPesewas({ basis, amountPesewas = null, rateBps = null, principalPesewas }) {
+  if (basis === 'flat') return amountPesewas || 0;
+  if (basis === 'percent_of_principal') return Math.round((principalPesewas * (rateBps || 0)) / 10000);
+  throw new Error(`unknown basis '${basis}'`);
+}
+
+/**
+ * Loan module amendment (item 5): decides the loan's ACTIVE sub-status —
+ * 'paying' (current) or 'missed_payment' (at least one unpaid installment
+ * past its OWN due date plus installmentGracePeriodDays) — from that
+ * loan's schedule. Pure and side-effect-free so loanService.refreshLoanStatus
+ * can call it and only issue an UPDATE when the result actually differs
+ * from what's stored; called at read-time (getLoan/listLoans) and after
+ * postRepayment, not from a cron (see Decisions_Log.md — a daily
+ * auto-flag job was explicitly deferred, not built).
+ *
+ * Deliberately distinct from repaymentGracePeriodDays (days after
+ * DISBURSEMENT before the first installment obligation starts at all) —
+ * that's a scheduling concern handled when the schedule is generated, not
+ * a status-recompute concern; see migration 060's comment for the
+ * distinction between the two grace periods.
+ *
+ * @param {Array<{dueDate: string, status: string}>} scheduleRows
+ */
+function computeActiveLoanStatus({ scheduleRows, installmentGracePeriodDays, asOfDate }) {
+  const hasMissedInstallment = scheduleRows.some((row) => {
+    if (row.status === 'paid') return false;
+    const graceDeadline = addDaysToDateString(row.dueDate, installmentGracePeriodDays);
+    return graceDeadline <= asOfDate;
+  });
+  return hasMissedInstallment ? 'missed_payment' : 'paying';
+}
+
 module.exports = {
   addMonthsToDateString,
+  addDaysToDateString,
   generateLoanSchedule,
   allocateRepayment,
   computeOutstandingPrincipalPesewas,
   bucketArrearsDays,
   computeFeesPesewas,
+  computeFeeAmountPesewas,
   computeOverdraftInterestPesewas,
   computeFloatingEffectiveRateBps,
   evaluateConcessionBounds,
+  computeActiveLoanStatus,
 };

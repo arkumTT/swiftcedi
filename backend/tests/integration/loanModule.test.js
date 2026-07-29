@@ -31,9 +31,13 @@ describeIfDb('Module 3: loan management', () => {
   let glAccounts;
   let ownerRoleId;
   let branchManagerRoleId;
+  let loanOfficerRoleId;
+  let systemAdminRoleId;
   let maker;
   let checker;
   let branchManagerChecker;
+  let loanOfficerUser;
+  let systemAdminUser;
 
   beforeAll(async () => {
     execFileSync('node', [path.join(__dirname, '../../src/db/migrate.js'), '--test'], {
@@ -150,6 +154,10 @@ describeIfDb('Module 3: loan management', () => {
     ownerRoleId = roleRows[0].id;
     const { rows: bmRoleRows } = await pool.query("SELECT id FROM roles WHERE name = 'branch_manager'");
     branchManagerRoleId = bmRoleRows[0].id;
+    const { rows: loRoleRows } = await pool.query("SELECT id FROM roles WHERE name = 'loan_officer'");
+    loanOfficerRoleId = loRoleRows[0].id;
+    const { rows: saRoleRows } = await pool.query("SELECT id FROM roles WHERE name = 'system_admin'");
+    systemAdminRoleId = saRoleRows[0].id;
 
     maker = await createTestUser('loan-maker@test.local');
     checker = await createTestUser('loan-checker@test.local');
@@ -158,6 +166,13 @@ describeIfDb('Module 3: loan management', () => {
     // above) does NOT satisfy that role check, so concession tests need
     // their own decider actually holding that role.
     branchManagerChecker = await createTestUser('loan-bm-checker@test.local', branchManagerRoleId);
+    // For the loan.approve tiered-threshold tests below: migration 066 seeds
+    // a lower tier (branch_manager/loan_officer, under GHS 100,000) and an
+    // upper tier (owner/system_admin, at/above GHS 100,000) — see
+    // Decisions_Log.md "Loan module amendment". These deciders each hold
+    // exactly one of the two tiers' roles so cross-tier rejection is testable.
+    loanOfficerUser = await createTestUser('loan-lo@test.local', loanOfficerRoleId);
+    systemAdminUser = await createTestUser('loan-sysadmin@test.local', systemAdminRoleId);
 
     // approval_thresholds is cleared by every integration suite's own
     // cleanup (including this one, above), so migration 057's seeded row
@@ -166,11 +181,32 @@ describeIfDb('Module 3: loan management', () => {
     // same convention cashierModule.test.js/savingsModule.test.js follow
     // for their own threshold-gated actions.
     await pool.query(
-      `INSERT INTO approval_thresholds (action_type, amount_threshold_pesewas, required_approver_role_id)
-       VALUES ('loan.grant_concession', 0, $1)
-       ON CONFLICT (action_type, (COALESCE(branch_id, 0)))
-       DO UPDATE SET required_approver_role_id = EXCLUDED.required_approver_role_id`,
-      [branchManagerRoleId]
+      `INSERT INTO approval_thresholds (action_type, amount_threshold_pesewas, required_approver_role_id, required_approver_role_ids)
+       VALUES ('loan.grant_concession', 0, $1, $2)
+       ON CONFLICT (action_type, (COALESCE(branch_id, 0)), amount_threshold_pesewas)
+       DO UPDATE SET required_approver_role_id = EXCLUDED.required_approver_role_id,
+                     required_approver_role_ids = EXCLUDED.required_approver_role_ids`,
+      [branchManagerRoleId, [branchManagerRoleId]]
+    );
+
+    // Re-seed both 'loan.approve' tiers for the same reason as above — this
+    // is migration 066's exact seed (lower tier at 0, upper tier at GHS
+    // 100,000 = 10,000,000 pesewas).
+    await pool.query(
+      `INSERT INTO approval_thresholds (action_type, amount_threshold_pesewas, required_approver_role_id, required_approver_role_ids)
+       VALUES ('loan.approve', 0, $1, $2)
+       ON CONFLICT (action_type, (COALESCE(branch_id, 0)), amount_threshold_pesewas)
+       DO UPDATE SET required_approver_role_id = EXCLUDED.required_approver_role_id,
+                     required_approver_role_ids = EXCLUDED.required_approver_role_ids`,
+      [branchManagerRoleId, [branchManagerRoleId, loanOfficerRoleId]]
+    );
+    await pool.query(
+      `INSERT INTO approval_thresholds (action_type, amount_threshold_pesewas, required_approver_role_id, required_approver_role_ids)
+       VALUES ('loan.approve', 10000000, $1, $2)
+       ON CONFLICT (action_type, (COALESCE(branch_id, 0)), amount_threshold_pesewas)
+       DO UPDATE SET required_approver_role_id = EXCLUDED.required_approver_role_id,
+                     required_approver_role_ids = EXCLUDED.required_approver_role_ids`,
+      [ownerRoleId, [ownerRoleId, systemAdminRoleId]]
     );
 
     const branch = await branchService.createBranch(pool, { code: 'LON-01', name: 'Loan Test Branch', createdBy: maker });
@@ -304,7 +340,11 @@ describeIfDb('Module 3: loan management', () => {
       appraiserId: maker,
     });
     const approval = await loanService.requestLoanApproval(pool, { loanId: loan.id, requestedBy: maker });
-    await decideAs(approval.id, checker);
+    // Migration 066's tiered loan.approve threshold: branch_manager/loan_officer
+    // decide below GHS 100,000, owner/system_admin at or above it. `checker`
+    // holds owner, which only qualifies for the upper tier.
+    const approver = Number(principalPesewas) >= 10000000 ? checker : branchManagerChecker;
+    await decideAs(approval.id, approver);
     return loanService.disburseLoan(pool, { loanId: loan.id, disbursedBy: maker, disbursementDate });
   }
 
@@ -376,9 +416,83 @@ describeIfDb('Module 3: loan management', () => {
 
     await expect(decideAs(approval.id, maker)).rejects.toThrow(approvalWorkflow.MakerCheckerViolationError);
 
-    await decideAs(approval.id, checker);
+    // Lower-tier loan.approve (below GHS 100,000) — branchManagerChecker
+    // holds a qualifying role; `checker` (owner) does not, see migration 066.
+    await decideAs(approval.id, branchManagerChecker);
     const approved = await loanService.getLoan(pool, loan.id);
     expect(approved.status).toBe('approved');
+  });
+
+  describe('loan.approve: tiered threshold and rejection handling (item 6)', () => {
+    async function applyAndAppraise(principalPesewas) {
+      const product = await createProduct({ minPrincipalPesewas: 1000, maxPrincipalPesewas: 100000000 });
+      const customer = await createVerifiedCustomer(`Tier Borrower ${principalPesewas}`);
+      const loan = await loanService.applyForLoan(pool, {
+        customerId: customer.id,
+        productId: product.id,
+        principalPesewas,
+        termMonths: 6,
+        appliedBy: maker,
+      });
+      await loanService.submitAppraisal(pool, { loanId: loan.id, checklist: {}, recommendation: 'recommend', appraiserId: maker });
+      return loan;
+    }
+
+    test('a lower-tier request (below GHS 100,000) is decidable by a loan_officer', async () => {
+      const loan = await applyAndAppraise(9999999); // GHS 99,999.99 — just under the tier boundary
+      const approval = await loanService.requestLoanApproval(pool, { loanId: loan.id, requestedBy: maker });
+
+      await decideAs(approval.id, loanOfficerUser);
+
+      const approved = await loanService.getLoan(pool, loan.id);
+      expect(approved.status).toBe('approved');
+    });
+
+    test('a lower-tier request cannot be decided by an owner/system_admin who does not hold the lower tier role', async () => {
+      const loan = await applyAndAppraise(500000);
+      const approval = await loanService.requestLoanApproval(pool, { loanId: loan.id, requestedBy: maker });
+
+      await expect(decideAs(approval.id, checker)).rejects.toThrow(approvalWorkflow.MakerCheckerViolationError);
+      await expect(decideAs(approval.id, systemAdminUser)).rejects.toThrow(approvalWorkflow.MakerCheckerViolationError);
+
+      // The lower-tier role still works on the same request.
+      await decideAs(approval.id, loanOfficerUser);
+      const approved = await loanService.getLoan(pool, loan.id);
+      expect(approved.status).toBe('approved');
+    });
+
+    test('an upper-tier request (at/above GHS 100,000) requires owner/system_admin, not branch_manager/loan_officer', async () => {
+      const loan = await applyAndAppraise(10000000); // exactly GHS 100,000 — the tier boundary is inclusive
+      const approval = await loanService.requestLoanApproval(pool, { loanId: loan.id, requestedBy: maker });
+
+      await expect(decideAs(approval.id, branchManagerChecker)).rejects.toThrow(approvalWorkflow.MakerCheckerViolationError);
+      await expect(decideAs(approval.id, loanOfficerUser)).rejects.toThrow(approvalWorkflow.MakerCheckerViolationError);
+
+      await decideAs(approval.id, systemAdminUser);
+      const approved = await loanService.getLoan(pool, loan.id);
+      expect(approved.status).toBe('approved');
+    });
+
+    test('rejecting a loan.approve request flips the loan to rejected (not stuck on pending_approval), and disbursement stays blocked', async () => {
+      const loan = await applyAndAppraise(500000);
+      const approval = await loanService.requestLoanApproval(pool, { loanId: loan.id, requestedBy: maker });
+
+      const pending = await loanService.getLoan(pool, loan.id);
+      expect(pending.status).toBe('pending_approval');
+
+      await decideAs(approval.id, branchManagerChecker, 'rejected');
+
+      const rejected = await loanService.getLoan(pool, loan.id);
+      expect(rejected.status).toBe('rejected');
+
+      await expect(loanService.disburseLoan(pool, { loanId: loan.id, disbursedBy: maker })).rejects.toThrow(
+        loanService.LoanConflictError
+      );
+
+      const { rows: decidedRows } = await pool.query('SELECT status, decided_by FROM approval_requests WHERE id = $1', [approval.id]);
+      expect(decidedRows[0].status).toBe('rejected');
+      expect(Number(decidedRows[0].decided_by)).toBe(Number(branchManagerChecker));
+    });
   });
 
   test('a declined appraisal rejects the loan outright', async () => {
@@ -890,7 +1004,7 @@ describeIfDb('Module 3: loan management', () => {
         appraiserId: maker,
       });
       const approval = await loanService.requestLoanApproval(pool, { loanId: loan.id, requestedBy: maker });
-      await decideAs(approval.id, checker);
+      await decideAs(approval.id, branchManagerChecker);
 
       const disbursed = await loanService.disburseLoan(pool, { loanId: loan.id, disbursedBy: maker });
       expect(disbursed.status).toBe('disbursed');
@@ -973,7 +1087,7 @@ describeIfDb('Module 3: loan management', () => {
       });
       await loanService.submitAppraisal(pool, { loanId: loan.id, checklist: {}, recommendation: 'recommend', appraiserId: maker });
       const approval = await loanService.requestLoanApproval(pool, { loanId: loan.id, requestedBy: maker });
-      await decideAs(approval.id, checker);
+      await decideAs(approval.id, branchManagerChecker);
       await loanService.disburseLoan(pool, { loanId: loan.id, disbursedBy: maker });
 
       const result = await loanService.accrueOverdraftInterest(pool, { loanId: loan.id, accruedBy: maker });
@@ -994,7 +1108,7 @@ describeIfDb('Module 3: loan management', () => {
       });
       await loanService.submitAppraisal(pool, { loanId: loan.id, checklist: {}, recommendation: 'recommend', appraiserId: maker });
       const approval = await loanService.requestLoanApproval(pool, { loanId: loan.id, requestedBy: maker });
-      await decideAs(approval.id, checker);
+      await decideAs(approval.id, branchManagerChecker);
       await loanService.disburseLoan(pool, { loanId: loan.id, disbursedBy: maker });
       await savingsService.requestWithdrawal(pool, { accountId: account.id, amountPesewas: 50000, requestedBy: maker });
 
@@ -1019,7 +1133,7 @@ describeIfDb('Module 3: loan management', () => {
       });
       await loanService.submitAppraisal(pool, { loanId: loan.id, checklist: {}, recommendation: 'recommend', appraiserId: maker });
       const approval = await loanService.requestLoanApproval(pool, { loanId: loan.id, requestedBy: maker });
-      await decideAs(approval.id, checker);
+      await decideAs(approval.id, branchManagerChecker);
 
       // The account is still at a zero balance and no overdraft limit is
       // set yet (activation hasn't run), so an ordinary close succeeds —
@@ -1048,7 +1162,7 @@ describeIfDb('Module 3: loan management', () => {
       });
       await loanService.submitAppraisal(pool, { loanId: loan.id, checklist: {}, recommendation: 'recommend', appraiserId: maker });
       const approval = await loanService.requestLoanApproval(pool, { loanId: loan.id, requestedBy: maker });
-      await decideAs(approval.id, checker);
+      await decideAs(approval.id, branchManagerChecker);
       await loanService.disburseLoan(pool, { loanId: loan.id, disbursedBy: maker });
 
       await savingsService.requestWithdrawal(pool, { accountId: account.id, amountPesewas: 150000, requestedBy: maker });
@@ -1100,8 +1214,13 @@ describeIfDb('Module 3: loan management', () => {
       );
     });
 
-    test('rejects an allowedRepaymentFrequencies value other than monthly — the schedule generator does not amortize on any other cadence', async () => {
-      await expect(createProduct({ allowedRepaymentFrequencies: ['weekly'] })).rejects.toThrow(loanService.LoanValidationError);
+    test('accepts a weekly allowedRepaymentFrequencies value — the schedule generator now amortizes daily/weekly/biweekly too', async () => {
+      const product = await createProduct({ allowedRepaymentFrequencies: ['weekly'] });
+      expect(product.allowed_repayment_frequencies).toEqual(['weekly']);
+    });
+
+    test('rejects an allowedRepaymentFrequencies value the schedule generator does not support at all', async () => {
+      await expect(createProduct({ allowedRepaymentFrequencies: ['fortnightly'] })).rejects.toThrow(loanService.LoanValidationError);
     });
 
     test('updateLoanProduct edits an existing product and is audited, without touching an already-applied loan', async () => {
@@ -1410,7 +1529,7 @@ describeIfDb('Module 3: loan management', () => {
       // Get the loan approved so disbursement would otherwise be reachable.
       await loanService.submitAppraisal(pool, { loanId: loan.id, checklist: {}, recommendation: 'recommend', appraiserId: maker });
       const loanApproval = await loanService.requestLoanApproval(pool, { loanId: loan.id, requestedBy: maker });
-      await decideAs(loanApproval.id, checker);
+      await decideAs(loanApproval.id, branchManagerChecker);
 
       await expect(loanService.disburseLoan(pool, { loanId: loan.id, disbursedBy: maker })).rejects.toThrow(
         /concession awaiting approval/

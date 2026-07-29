@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Plus, Calculator, ShieldAlert } from 'lucide-react';
+import { Plus, Calculator, ShieldAlert, ChevronUp, ChevronDown, ClipboardList } from 'lucide-react';
 import { useAuth } from '../../../auth/AuthContext';
 import { isCrossBranchRole } from '../../../lib/roleScope';
 import { api, ApiError } from '../../../lib/apiClient';
@@ -15,9 +15,53 @@ import { Modal } from '../../../components/Modal';
 import { KpiCard } from '../../../components/KpiCard';
 import { FormField, inputClasses, selectClasses } from '../../../components/FormField';
 import { formatDate, formatGhs, formatBps, parseGhsInput, parsePercentToBps } from '../../../lib/format';
-import type { Loan, LoanProduct, PolicyRate, ArrearsReport, LoanCalculatorResult } from '../../../types/api';
+import type { Loan, LoanProduct, PolicyRate, ArrearsReport, LoanCalculatorResult, Customer, LoanScheduleRow } from '../../../types/api';
 
-const LOAN_STATUSES = ['applied', 'appraised', 'pending_approval', 'approved', 'rejected', 'disbursed', 'closed', 'written_off'];
+const LOAN_STATUSES = [
+  'applied',
+  'appraised',
+  'pending_approval',
+  'approved',
+  'rejected',
+  'disbursed',
+  'paying',
+  'missed_payment',
+  'closed',
+  'written_off',
+];
+
+type SortKey = 'principal_pesewas' | 'total_paid_pesewas' | 'status';
+
+function sortLoans(loans: Loan[], sortKey: SortKey | null, sortDir: 'asc' | 'desc'): Loan[] {
+  if (!sortKey) return loans;
+  const sorted = [...loans].sort((a, b) => {
+    const av = a[sortKey];
+    const bv = b[sortKey];
+    if (typeof av === 'number' && typeof bv === 'number') return av - bv;
+    return String(av).localeCompare(String(bv));
+  });
+  return sortDir === 'asc' ? sorted : sorted.reverse();
+}
+
+/** Clickable column header for the three sortable columns — DataTable's header cell accepts any ReactNode, sort state lives entirely in LoansListPage. */
+function SortableHeader({ label, active, direction, onClick }: { label: string; active: boolean; direction: 'asc' | 'desc'; onClick: () => void }) {
+  return (
+    <button type="button" onClick={onClick} className="flex items-center gap-1 uppercase tracking-wide">
+      {label}
+      {active ? (
+        direction === 'asc' ? (
+          <ChevronUp size={12} />
+        ) : (
+          <ChevronDown size={12} />
+        )
+      ) : (
+        <span className="opacity-30">
+          <ChevronDown size={12} />
+        </span>
+      )}
+    </button>
+  );
+}
 
 export function LoansListPage() {
   const { user, hasPermission } = useAuth();
@@ -30,6 +74,9 @@ export function LoansListPage() {
   const [status, setStatus] = useState('');
   const [productId, setProductId] = useState('');
   const [createOpen, setCreateOpen] = useState(false);
+  const [sortKey, setSortKey] = useState<SortKey | null>(null);
+  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc');
+  const [manageLoan, setManageLoan] = useState<Loan | null>(null);
 
   const productsQuery = useQuery({ queryKey: ['loan-products'], queryFn: () => api.get<LoanProduct[]>('/loans/products') });
 
@@ -43,19 +90,90 @@ export function LoansListPage() {
       }),
   });
 
+  // Loaded in full (same client-side-join pattern productsQuery already
+  // uses for the Loan Offer column) to resolve each row's Photo/Customer
+  // cell without an N+1 fetch per row.
+  const customersQuery = useQuery({
+    queryKey: ['customers-for-loans', { branchId }],
+    queryFn: () => api.get<Customer[]>('/customers', { branchId: crossBranch ? branchId : user!.homeBranchId }),
+  });
+
+  const toggleSort = (key: SortKey) => {
+    if (sortKey === key) {
+      setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
+    } else {
+      setSortKey(key);
+      setSortDir('asc');
+    }
+  };
+
   const columns: Column<Loan>[] = [
-    { key: 'id', header: 'Loan', render: (l) => `#${l.id}` },
-    { key: 'customer', header: 'Customer', render: (l) => `#${l.customer_id}` },
-    { key: 'type', header: 'Type', render: (l) => <span className="capitalize">{l.loan_type}</span> },
-    { key: 'product', header: 'Product', render: (l) => productsQuery.data?.find((p) => p.id === l.product_id)?.name ?? `#${l.product_id}` },
-    { key: 'principal', header: 'Principal', render: (l) => formatGhs(l.principal_pesewas), align: 'right' },
-    { key: 'term', header: 'Term', render: (l) => `${l.term_months} mo` },
-    { key: 'status', header: 'Status', render: (l) => <StatusBadge status={l.status} /> },
-    { key: 'created', header: 'Applied', render: (l) => formatDate(l.created_at) },
+    { key: 'id', header: '#', render: (l) => `#${l.id}` },
+    { key: 'reference', header: 'Reference', render: (l) => <span className="font-mono text-[12px]">{l.reference}</span> },
+    {
+      key: 'photo',
+      header: 'Photo',
+      render: (l) => {
+        const photoUrl = customersQuery.data?.find((c) => c.id === l.customer_id)?.photo_url;
+        return photoUrl ? (
+          <img src={photoUrl} alt="" className="h-8 w-8 rounded-full object-cover" />
+        ) : (
+          <div className="flex h-8 w-8 items-center justify-center rounded-full bg-surface-alt text-[11px] text-text-secondary">—</div>
+        );
+      },
+    },
+    { key: 'customer', header: 'Customer', render: (l) => customersQuery.data?.find((c) => c.id === l.customer_id)?.full_name ?? `#${l.customer_id}` },
+    // No loan-officer-assignment concept exists on a loan today — the
+    // closest available field is who submitted the application.
+    { key: 'agent', header: 'Agent', render: (l) => `#${l.applied_by}` },
+    { key: 'product', header: 'Loan Offer', render: (l) => productsQuery.data?.find((p) => p.id === l.product_id)?.name ?? `#${l.product_id}` },
+    {
+      key: 'principal',
+      header: <SortableHeader label="Principal" active={sortKey === 'principal_pesewas'} direction={sortDir} onClick={() => toggleSort('principal_pesewas')} />,
+      render: (l) => formatGhs(l.principal_pesewas),
+      align: 'right',
+    },
+    { key: 'term', header: 'Term', render: (l) => `${l.term_months} ${l.duration_unit}` },
+    { key: 'expected', header: 'Expected', render: (l) => formatGhs(l.expected_pesewas), align: 'right' },
+    {
+      key: 'totalPaid',
+      header: <SortableHeader label="Total Paid" active={sortKey === 'total_paid_pesewas'} direction={sortDir} onClick={() => toggleSort('total_paid_pesewas')} />,
+      render: (l) => formatGhs(l.total_paid_pesewas),
+      align: 'right',
+    },
+    { key: 'balance', header: 'Balance', render: (l) => formatGhs(l.balance_pesewas), align: 'right' },
+    {
+      key: 'status',
+      header: <SortableHeader label="Status" active={sortKey === 'status'} direction={sortDir} onClick={() => toggleSort('status')} />,
+      render: (l) => <StatusBadge status={l.status} />,
+    },
+    {
+      key: 'action',
+      header: 'Action',
+      render: (l) =>
+        ['disbursed', 'paying', 'missed_payment'].includes(l.status) && hasPermission('loan.post_repayment') ? (
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={(e) => {
+              e.stopPropagation();
+              setManageLoan(l);
+            }}
+          >
+            <ClipboardList size={14} /> Manage
+          </Button>
+        ) : (
+          '—'
+        ),
+    },
   ];
+
+  const sortedLoans = sortLoans(loansQuery.data ?? [], sortKey, sortDir);
 
   return (
     <div className="flex flex-col gap-4">
+      <LoanProductsCard products={productsQuery.data ?? []} isLoading={productsQuery.isLoading} canManage={hasPermission('loan.manage_products')} />
+
       <Card
         title="Loans & Credit"
         actions={
@@ -79,7 +197,7 @@ export function LoansListPage() {
             </select>
           )}
           <select value={productId} onChange={(e) => setProductId(e.target.value)} className={selectClasses + ' h-8 text-[12.5px]'}>
-            <option value="">All products</option>
+            <option value="">All offers</option>
             {productsQuery.data?.map((p) => (
               <option key={p.id} value={p.id}>
                 {p.name}
@@ -97,7 +215,7 @@ export function LoansListPage() {
         </FilterToolbar>
         <DataTable
           columns={columns}
-          rows={loansQuery.data ?? []}
+          rows={sortedLoans}
           getRowKey={(l) => l.id}
           isLoading={loansQuery.isLoading}
           error={loansQuery.error instanceof ApiError ? loansQuery.error.message : null}
@@ -107,13 +225,17 @@ export function LoansListPage() {
         />
       </Card>
 
+      <ManageRepaymentsModal
+        loan={manageLoan}
+        onClose={() => setManageLoan(null)}
+        onChanged={() => queryClient.invalidateQueries({ queryKey: ['loans'] })}
+      />
+
       <LoanCalculatorCard products={productsQuery.data ?? []} />
 
       {hasPermission('loan.view_reports') && <ArrearsReportCard crossBranch={crossBranch} branches={branches ?? []} defaultBranchId={crossBranch ? '' : user!.homeBranchId} />}
 
       {hasPermission('loan.manage_policy_rates') && <PolicyRatesCard />}
-
-      <LoanProductsCard products={productsQuery.data ?? []} isLoading={productsQuery.isLoading} canManage={hasPermission('loan.manage_products')} />
 
       <CreateLoanModal
         open={createOpen}
@@ -143,21 +265,40 @@ function CreateLoanModal({
   const [productId, setProductId] = useState('');
   const [principal, setPrincipal] = useState('');
   const [termMonths, setTermMonths] = useState('');
+  const [repaymentFrequency, setRepaymentFrequency] = useState<'daily' | 'weekly' | 'biweekly' | 'monthly'>('monthly');
   const [reasonCode, setReasonCode] = useState('');
   const [purposeNotes, setPurposeNotes] = useState('');
   const [error, setError] = useState<string | null>(null);
 
   const selectedProduct = products.find((p) => p.id === productId);
 
+  // Keep the chosen frequency valid whenever the offer changes underneath it.
+  if (selectedProduct && selectedProduct.allowed_repayment_frequencies.length > 0 && !selectedProduct.allowed_repayment_frequencies.includes(repaymentFrequency)) {
+    setRepaymentFrequency(selectedProduct.allowed_repayment_frequencies[0]);
+  }
+
   function reset() {
     setCustomerId('');
     setProductId('');
     setPrincipal('');
     setTermMonths('');
+    setRepaymentFrequency('monthly');
     setReasonCode('');
     setPurposeNotes('');
     setError(null);
   }
+
+  const previewQuery = useQuery({
+    queryKey: ['loan-application-preview', productId, principal, termMonths, repaymentFrequency],
+    queryFn: () =>
+      api.post<LoanCalculatorResult>('/loans/calculator', {
+        productId,
+        principalPesewas: parseGhsInput(principal),
+        termMonths: Number(termMonths),
+        repaymentFrequency,
+      }),
+    enabled: Boolean(productId && principal && termMonths),
+  });
 
   const mutation = useMutation({
     mutationFn: () =>
@@ -166,6 +307,7 @@ function CreateLoanModal({
         productId,
         principalPesewas: parseGhsInput(principal),
         termMonths: Number(termMonths),
+        repaymentFrequency,
         reasonCode: reasonCode || undefined,
         purposeNotes: purposeNotes || undefined,
       }),
@@ -200,10 +342,10 @@ function CreateLoanModal({
         <FormField label="Customer ID" hint="Open this from a customer's 360 page, or enter their ID directly — there's no name search yet.">
           {(id) => <input id={id} type="number" value={customerId} onChange={(e) => setCustomerId(e.target.value)} className={inputClasses} />}
         </FormField>
-        <FormField label="Loan product">
+        <FormField label="Loan offer">
           {(id) => (
             <select id={id} value={productId} onChange={(e) => setProductId(e.target.value)} className={selectClasses}>
-              <option value="">Select a product…</option>
+              <option value="">Select a loan offer…</option>
               {products.map((p) => (
                 <option key={p.id} value={p.id}>
                   {p.name} ({formatBps(p.annual_interest_rate_bps)} p.a.)
@@ -219,11 +361,53 @@ function CreateLoanModal({
           {(id) => <input id={id} type="number" step="0.01" value={principal} onChange={(e) => setPrincipal(e.target.value)} className={inputClasses} />}
         </FormField>
         <FormField
-          label="Term (months)"
-          hint={selectedProduct ? `Range: ${selectedProduct.min_term_months} – ${selectedProduct.max_term_months} months` : undefined}
+          label={`Duration${selectedProduct ? ` (${selectedProduct.duration_unit})` : ''}`}
+          hint={selectedProduct ? `Range: ${selectedProduct.min_term_months} – ${selectedProduct.max_term_months} ${selectedProduct.duration_unit}` : undefined}
         >
           {(id) => <input id={id} type="number" value={termMonths} onChange={(e) => setTermMonths(e.target.value)} className={inputClasses} />}
         </FormField>
+        <FormField label="Repayment frequency" hint="Item 3a: this determines the schedule generated below — daily, weekly, bi-weekly, or monthly.">
+          {(id) => (
+            <select id={id} value={repaymentFrequency} onChange={(e) => setRepaymentFrequency(e.target.value as typeof repaymentFrequency)} className={selectClasses}>
+              {REPAYMENT_FREQUENCY_OPTIONS.filter((f) => !selectedProduct || selectedProduct.allowed_repayment_frequencies.includes(f.value)).map((f) => (
+                <option key={f.value} value={f.value}>
+                  {f.label}
+                </option>
+              ))}
+            </select>
+          )}
+        </FormField>
+        {previewQuery.data && (
+          <div className="rounded-md border border-border p-3">
+            <p className="mb-2 text-[12.5px] font-medium text-text-primary">Repayment schedule preview</p>
+            <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+              <KpiCard label="Fees" value={formatGhs(previewQuery.data.feesPesewas)} />
+              <KpiCard label="Net disbursed" value={formatGhs(previewQuery.data.netDisbursedPesewas)} />
+              <KpiCard label="Total interest" value={formatGhs(previewQuery.data.totalInterestPesewas)} />
+              <KpiCard label="Total repayable" value={formatGhs(previewQuery.data.totalRepayablePesewas)} />
+            </div>
+            <div className="mt-3 max-h-48 overflow-y-auto overflow-x-auto">
+              <table className="w-full border-collapse text-sm">
+                <thead>
+                  <tr className="border-b border-border text-[11.5px] font-semibold tracking-wide text-text-secondary uppercase">
+                    <th className="px-2 py-1.5 text-left">#</th>
+                    <th className="px-2 py-1.5 text-left">Due date</th>
+                    <th className="px-2 py-1.5 text-right">Amount</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {previewQuery.data.schedule.map((row) => (
+                    <tr key={row.installmentNumber} className="border-b border-border last:border-b-0">
+                      <td className="px-2 py-1.5">{row.installmentNumber}</td>
+                      <td className="px-2 py-1.5">{formatDate(row.dueDate)}</td>
+                      <td className="px-2 py-1.5 text-right">{formatGhs(row.principalDuePesewas + row.interestDuePesewas)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
         <FormField label="Reason code">
           {(id) =>
             selectedProduct && selectedProduct.reason_codes.length > 0 ? (
@@ -253,11 +437,160 @@ function CreateLoanModal({
   );
 }
 
+/**
+ * The Loans & Credit table's "Action" management panel (item 4): record a
+ * repayment against the loan's open installments, and waive an
+ * installment's outstanding default charge. Ties directly into the
+ * schedule generated at disbursement (item 3a) and the loan's
+ * paying/missed_payment status (item 5) — posting a repayment or waiving
+ * a charge both trigger loanService's own status recompute server-side,
+ * so re-opening this panel (or the table refetch onChanged triggers)
+ * reflects the new status without any client-side status logic here.
+ */
+function ManageRepaymentsModal({ loan, onClose, onChanged }: { loan: Loan | null; onClose: () => void; onChanged: () => void }) {
+  const { hasPermission } = useAuth();
+  const queryClient = useQueryClient();
+  const [amount, setAmount] = useState('');
+  const [error, setError] = useState<string | null>(null);
+  const [waiveReason, setWaiveReason] = useState('');
+  const [waivingScheduleId, setWaivingScheduleId] = useState<string | null>(null);
+
+  const scheduleQuery = useQuery({
+    queryKey: ['loan-schedule', loan?.id],
+    queryFn: () => api.get<LoanScheduleRow[]>(`/loans/${loan!.id}/schedule`),
+    enabled: !!loan,
+  });
+
+  const repayMutation = useMutation({
+    mutationFn: () => api.post(`/loans/${loan!.id}/repayments`, { amountPesewas: parseGhsInput(amount) }),
+    onSuccess: () => {
+      setAmount('');
+      setError(null);
+      queryClient.invalidateQueries({ queryKey: ['loan-schedule', loan?.id] });
+      onChanged();
+    },
+    onError: (err) => setError(err instanceof ApiError ? err.message : 'Unable to record repayment'),
+  });
+
+  const waiveMutation = useMutation({
+    mutationFn: (scheduleId: string) => api.post(`/loans/${loan!.id}/schedule/${scheduleId}/waive-default-charge`, { reason: waiveReason }),
+    onSuccess: () => {
+      setWaivingScheduleId(null);
+      setWaiveReason('');
+      queryClient.invalidateQueries({ queryKey: ['loan-schedule', loan?.id] });
+      onChanged();
+    },
+    onError: (err) => setError(err instanceof ApiError ? err.message : 'Unable to waive charge'),
+  });
+
+  return (
+    <Modal
+      open={!!loan}
+      onClose={() => {
+        onClose();
+        setAmount('');
+        setError(null);
+        setWaivingScheduleId(null);
+      }}
+      title={loan ? `Manage repayments — ${loan.reference}` : 'Manage repayments'}
+      footer={
+        <Button variant="secondary" size="sm" onClick={onClose}>
+          Close
+        </Button>
+      }
+    >
+      {loan && (
+        <div className="flex flex-col gap-4">
+          <div className="grid grid-cols-3 gap-3">
+            <KpiCard label="Expected" value={formatGhs(loan.expected_pesewas)} />
+            <KpiCard label="Total paid" value={formatGhs(loan.total_paid_pesewas)} />
+            <KpiCard label="Balance" value={formatGhs(loan.balance_pesewas)} higherIsBetter={false} />
+          </div>
+
+          <div className="flex items-end gap-2">
+            <FormField label="Record repayment (GH₵)">
+              {(id) => <input id={id} type="number" step="0.01" min="0" value={amount} onChange={(e) => setAmount(e.target.value)} className={inputClasses} />}
+            </FormField>
+            <Button variant="primary" size="md" disabled={!amount || repayMutation.isPending} onClick={() => repayMutation.mutate()}>
+              Record
+            </Button>
+          </div>
+          {error && (
+            <p role="alert" className="text-[13px] text-danger">
+              {error}
+            </p>
+          )}
+
+          <div className="overflow-x-auto rounded-md border border-border">
+            <table className="w-full border-collapse text-sm">
+              <thead>
+                <tr className="border-b border-border text-[11.5px] font-semibold tracking-wide text-text-secondary uppercase">
+                  <th className="px-3 py-2 text-left">#</th>
+                  <th className="px-3 py-2 text-left">Due date</th>
+                  <th className="px-3 py-2 text-right">Principal</th>
+                  <th className="px-3 py-2 text-right">Interest</th>
+                  <th className="px-3 py-2 text-right">Fees / Charges</th>
+                  <th className="px-3 py-2 text-left">Status</th>
+                  <th className="px-3 py-2 text-left" />
+                </tr>
+              </thead>
+              <tbody>
+                {(scheduleQuery.data ?? []).map((row) => (
+                  <tr key={row.id} className="border-b border-border last:border-b-0">
+                    <td className="px-3 py-2">{row.installment_number}</td>
+                    <td className="px-3 py-2">{formatDate(row.due_date)}</td>
+                    <td className="px-3 py-2 text-right">
+                      {formatGhs(row.principal_paid_pesewas)} / {formatGhs(row.principal_due_pesewas)}
+                    </td>
+                    <td className="px-3 py-2 text-right">
+                      {formatGhs(row.interest_paid_pesewas)} / {formatGhs(row.interest_due_pesewas)}
+                    </td>
+                    <td className="px-3 py-2 text-right">
+                      {formatGhs(row.fees_paid_pesewas)} / {formatGhs(row.fees_due_pesewas)}
+                    </td>
+                    <td className="px-3 py-2">
+                      <StatusBadge status={row.status} />
+                    </td>
+                    <td className="px-3 py-2">
+                      {row.default_charge_applied && row.fees_due_pesewas > row.fees_paid_pesewas && hasPermission('loan.waive_charges') && (
+                        <>
+                          {waivingScheduleId === row.id ? (
+                            <div className="flex items-center gap-1.5">
+                              <input
+                                value={waiveReason}
+                                onChange={(e) => setWaiveReason(e.target.value)}
+                                placeholder="Reason"
+                                className={inputClasses + ' h-7 w-32 text-[12px]'}
+                              />
+                              <Button variant="danger" size="sm" disabled={!waiveReason || waiveMutation.isPending} onClick={() => waiveMutation.mutate(row.id)}>
+                                Confirm
+                              </Button>
+                            </div>
+                          ) : (
+                            <Button variant="secondary" size="sm" onClick={() => setWaivingScheduleId(row.id)}>
+                              Waive charge
+                            </Button>
+                          )}
+                        </>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </Modal>
+  );
+}
+
 function LoanCalculatorCard({ products }: { products: LoanProduct[] }) {
   const [productId, setProductId] = useState('');
   const [principal, setPrincipal] = useState('');
   const [termMonths, setTermMonths] = useState('');
   const [error, setError] = useState<string | null>(null);
+  const selectedProduct = products.find((p) => p.id === productId);
 
   const mutation = useMutation({
     mutationFn: () =>
@@ -273,7 +606,7 @@ function LoanCalculatorCard({ products }: { products: LoanProduct[] }) {
     <Card title={<span className="flex items-center gap-1.5"><Calculator size={16} /> Loan calculator</span>}>
       <p className="mb-3 text-[13px] text-text-secondary">Preview a repayment schedule without creating anything.</p>
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-4">
-        <FormField label="Product">
+        <FormField label="Offer">
           {(id) => (
             <select id={id} value={productId} onChange={(e) => setProductId(e.target.value)} className={selectClasses}>
               <option value="">Select…</option>
@@ -288,7 +621,7 @@ function LoanCalculatorCard({ products }: { products: LoanProduct[] }) {
         <FormField label="Principal (GH₵)">
           {(id) => <input id={id} type="number" step="0.01" value={principal} onChange={(e) => setPrincipal(e.target.value)} className={inputClasses} />}
         </FormField>
-        <FormField label="Term (months)">
+        <FormField label={`Duration${selectedProduct ? ` (${selectedProduct.duration_unit})` : ''}`}>
           {(id) => <input id={id} type="number" value={termMonths} onChange={(e) => setTermMonths(e.target.value)} className={inputClasses} />}
         </FormField>
         <div className="flex items-end">
@@ -415,8 +748,8 @@ function PolicyRatesCard() {
       padded={false}
     >
       <p className="px-4 pt-3 text-[12.5px] text-text-secondary">
-        What floating-rate loan products link to — a product's rate is this value plus its own spread, recomputed whenever this
-        changes and on the product's own reset cadence.
+        What floating-rate loan offers link to — an offer's rate is this value plus its own spread, recomputed whenever this
+        changes and on the offer's own reset cadence.
       </p>
       <DataTable
         columns={[
@@ -502,11 +835,11 @@ function LoanProductsCard({ products, isLoading, canManage }: { products: LoanPr
 
   return (
     <Card
-      title="Loan products"
+      title="Loan Offers"
       actions={
         canManage && (
           <Button variant="secondary" size="sm" onClick={() => setCreateOpen(true)}>
-            <Plus size={14} /> New product
+            <Plus size={14} /> New offer
           </Button>
         )
       }
@@ -529,7 +862,7 @@ function LoanProductsCard({ products, isLoading, canManage }: { products: LoanPr
                 formatBps(p.annual_interest_rate_bps)
               ),
           },
-          { key: 'term', header: 'Term range', render: (p) => `${p.min_term_months}–${p.max_term_months} mo` },
+          { key: 'term', header: 'Term range', render: (p) => `${p.min_term_months}–${p.max_term_months} ${p.duration_unit}` },
           { key: 'principal', header: 'Principal range', render: (p) => `${formatGhs(p.min_principal_pesewas)} – ${formatGhs(p.max_principal_pesewas)}` },
           { key: 'status', header: 'Status', render: (p) => <StatusBadge status={p.status} /> },
         ]}
@@ -537,7 +870,7 @@ function LoanProductsCard({ products, isLoading, canManage }: { products: LoanPr
         getRowKey={(p) => p.id}
         isLoading={isLoading}
         onRowClick={canManage ? (p) => setEditProduct(p) : undefined}
-        emptyTitle="No loan products configured yet"
+        emptyTitle="No loan offers configured yet"
       />
       <CreateLoanProductModal
         open={createOpen}
@@ -606,7 +939,7 @@ function RateAndConcessionFields({
           <FormField label="Annual interest rate (%)">
             {(id) => <input id={id} type="number" step="0.01" value={annualRate} onChange={(e) => setAnnualRate(e.target.value)} className={inputClasses} />}
           </FormField>
-          <FormField label="Concession floor — rate can never be negotiated below (%)" hint="Leave blank to not allow any concessions on this product.">
+          <FormField label="Concession floor — rate can never be negotiated below (%)" hint="Leave blank to not allow any concessions on this offer.">
             {(id) => <input id={id} type="number" step="0.01" value={rateFloor} onChange={(e) => setRateFloor(e.target.value)} className={inputClasses} />}
           </FormField>
         </>
@@ -638,7 +971,7 @@ function RateAndConcessionFields({
               )}
             </FormField>
           </div>
-          <FormField label="Concession floor — spread can never be negotiated below (%)" hint="Leave blank to not allow any concessions on this product. The reference rate itself is never negotiable, only the spread.">
+          <FormField label="Concession floor — spread can never be negotiated below (%)" hint="Leave blank to not allow any concessions on this offer. The reference rate itself is never negotiable, only the spread.">
             {(id) => <input id={id} type="number" step="0.01" value={spreadFloor} onChange={(e) => setSpreadFloor(e.target.value)} className={inputClasses} />}
           </FormField>
         </>
@@ -648,6 +981,180 @@ function RateAndConcessionFields({
         hint="A concession discounting the rate/spread by more than this many percentage points — or changing term or fees at all — needs branch manager sign-off. Within this window it applies immediately."
       >
         {(id) => <input id={id} type="number" step="0.01" value={concessionThreshold} onChange={(e) => setConcessionThreshold(e.target.value)} className={inputClasses} />}
+      </FormField>
+    </>
+  );
+}
+
+const REPAYMENT_FREQUENCY_OPTIONS: { value: 'daily' | 'weekly' | 'biweekly' | 'monthly'; label: string }[] = [
+  { value: 'daily', label: 'Daily' },
+  { value: 'weekly', label: 'Weekly' },
+  { value: 'biweekly', label: 'Bi-weekly' },
+  { value: 'monthly', label: 'Monthly' },
+];
+
+/** A basis select ('flat' GH₵ amount or '% of principal') plus the single amount input whose unit follows the selected basis — reused for processing fee, insurance fee, and default charge, which all share this shape (see migration 060). */
+function BasisAmountField({
+  label,
+  hint,
+  basis,
+  setBasis,
+  amount,
+  setAmount,
+}: {
+  label: string;
+  hint?: string;
+  basis: 'flat' | 'percent_of_principal';
+  setBasis: (v: 'flat' | 'percent_of_principal') => void;
+  amount: string;
+  setAmount: (v: string) => void;
+}) {
+  return (
+    <div className="grid grid-cols-2 gap-3">
+      <FormField label={`${label} basis`} hint={hint}>
+        {(id) => (
+          <select id={id} value={basis} onChange={(e) => setBasis(e.target.value as typeof basis)} className={selectClasses}>
+            <option value="flat">Flat amount</option>
+            <option value="percent_of_principal">% of principal</option>
+          </select>
+        )}
+      </FormField>
+      <FormField label={basis === 'flat' ? `${label} (GH₵)` : `${label} (%)`}>
+        {(id) => <input id={id} type="number" step="0.01" min="0" value={amount} onChange={(e) => setAmount(e.target.value)} className={inputClasses} />}
+      </FormField>
+    </div>
+  );
+}
+
+/**
+ * Loan Duration, fee/charge, and grace-period fields shared by create and
+ * edit (item 2 of the loan module amendment). Duration reuses the
+ * existing min/max term bounds — durationUnit (days/weeks/months) governs
+ * what unit those two numbers are expressed in for THIS offer; every
+ * pre-existing offer stays in 'months', unaffected. See migration 060.
+ *
+ * repaymentGracePeriodDays and installmentGracePeriodDays are DIFFERENT:
+ * the former delays the first installment's due date after disbursement,
+ * the latter is how many days an installment can sit unpaid past its OWN
+ * due date before it counts as missed (drives the loan's 'missed_payment'
+ * status and the auto-applied default charge — see Decisions_Log.md).
+ */
+function OfferDurationAndChargesFields({
+  durationUnit,
+  setDurationUnit,
+  minTerm,
+  setMinTerm,
+  maxTerm,
+  setMaxTerm,
+  allowedFrequencies,
+  toggleFrequency,
+  processingFeeBasis,
+  setProcessingFeeBasis,
+  processingFeeAmount,
+  setProcessingFeeAmount,
+  insuranceFeeEnabled,
+  setInsuranceFeeEnabled,
+  insuranceFeeBasis,
+  setInsuranceFeeBasis,
+  insuranceFeeAmount,
+  setInsuranceFeeAmount,
+  defaultChargeBasis,
+  setDefaultChargeBasis,
+  defaultChargeAmount,
+  setDefaultChargeAmount,
+  repaymentGracePeriodDays,
+  setRepaymentGracePeriodDays,
+  installmentGracePeriodDays,
+  setInstallmentGracePeriodDays,
+}: {
+  durationUnit: 'days' | 'weeks' | 'months';
+  setDurationUnit: (v: 'days' | 'weeks' | 'months') => void;
+  minTerm: string;
+  setMinTerm: (v: string) => void;
+  maxTerm: string;
+  setMaxTerm: (v: string) => void;
+  allowedFrequencies: string[];
+  toggleFrequency: (v: string) => void;
+  processingFeeBasis: 'flat' | 'percent_of_principal';
+  setProcessingFeeBasis: (v: 'flat' | 'percent_of_principal') => void;
+  processingFeeAmount: string;
+  setProcessingFeeAmount: (v: string) => void;
+  insuranceFeeEnabled: boolean;
+  setInsuranceFeeEnabled: (v: boolean) => void;
+  insuranceFeeBasis: 'flat' | 'percent_of_principal';
+  setInsuranceFeeBasis: (v: 'flat' | 'percent_of_principal') => void;
+  insuranceFeeAmount: string;
+  setInsuranceFeeAmount: (v: string) => void;
+  defaultChargeBasis: 'flat' | 'percent_of_principal';
+  setDefaultChargeBasis: (v: 'flat' | 'percent_of_principal') => void;
+  defaultChargeAmount: string;
+  setDefaultChargeAmount: (v: string) => void;
+  repaymentGracePeriodDays: string;
+  setRepaymentGracePeriodDays: (v: string) => void;
+  installmentGracePeriodDays: string;
+  setInstallmentGracePeriodDays: (v: string) => void;
+}) {
+  return (
+    <>
+      <FormField label="Loan Duration unit" hint="Governs the unit the min/max duration below (and the application form's duration input) are expressed in.">
+        {(id) => (
+          <select id={id} value={durationUnit} onChange={(e) => setDurationUnit(e.target.value as typeof durationUnit)} className={selectClasses}>
+            <option value="days">Days</option>
+            <option value="weeks">Weeks</option>
+            <option value="months">Months</option>
+          </select>
+        )}
+      </FormField>
+      <div className="grid grid-cols-2 gap-3">
+        <FormField label={`Min duration (${durationUnit})`}>
+          {(id) => <input id={id} type="number" min="1" value={minTerm} onChange={(e) => setMinTerm(e.target.value)} className={inputClasses} />}
+        </FormField>
+        <FormField label={`Max duration (${durationUnit})`}>
+          {(id) => <input id={id} type="number" min="1" value={maxTerm} onChange={(e) => setMaxTerm(e.target.value)} className={inputClasses} />}
+        </FormField>
+      </div>
+      <FormField label="Allowed repayment frequencies" hint="Which cadences an applicant can choose from at application time.">
+        {(id) => (
+          <div id={id} className="flex flex-wrap gap-3 rounded-md border border-border p-2">
+            {REPAYMENT_FREQUENCY_OPTIONS.map((f) => (
+              <label key={f.value} className="flex items-center gap-1.5 text-[13px]">
+                <input type="checkbox" checked={allowedFrequencies.includes(f.value)} onChange={() => toggleFrequency(f.value)} />
+                {f.label}
+              </label>
+            ))}
+          </div>
+        )}
+      </FormField>
+      <BasisAmountField label="Processing fee" basis={processingFeeBasis} setBasis={setProcessingFeeBasis} amount={processingFeeAmount} setAmount={setProcessingFeeAmount} />
+      <FormField label="Insurance fee" hint="Optional — leave unchecked if this offer has no insurance fee.">
+        {(id) => (
+          <label id={id} className="flex items-center gap-1.5 text-[13px]">
+            <input type="checkbox" checked={insuranceFeeEnabled} onChange={(e) => setInsuranceFeeEnabled(e.target.checked)} />
+            This offer charges an insurance fee
+          </label>
+        )}
+      </FormField>
+      {insuranceFeeEnabled && (
+        <BasisAmountField label="Insurance fee" basis={insuranceFeeBasis} setBasis={setInsuranceFeeBasis} amount={insuranceFeeAmount} setAmount={setInsuranceFeeAmount} />
+      )}
+      <FormField label="Repayment grace period (days)" hint="Days after disbursement before the borrower's first repayment obligation starts at all.">
+        {(id) => <input id={id} type="number" min="0" value={repaymentGracePeriodDays} onChange={(e) => setRepaymentGracePeriodDays(e.target.value)} className={inputClasses} />}
+      </FormField>
+      <BasisAmountField
+        label="Default charge"
+        hint="Charged once per installment that goes missed (see installment grace period below) — distinct from the repayment grace period above."
+        basis={defaultChargeBasis}
+        setBasis={setDefaultChargeBasis}
+        amount={defaultChargeAmount}
+        setAmount={setDefaultChargeAmount}
+      />
+      <FormField
+        label="Installment grace period (days)"
+        hint="Days AFTER an installment's own due date before it's marked missed and the default charge above applies — not the same as the repayment grace period, which only delays the FIRST installment."
+      >
+        {(id) => (
+          <input id={id} type="number" min="0" value={installmentGracePeriodDays} onChange={(e) => setInstallmentGracePeriodDays(e.target.value)} className={inputClasses} />
+        )}
       </FormField>
     </>
   );
@@ -668,11 +1175,25 @@ function CreateLoanProductModal({ open, onClose, onCreated }: { open: boolean; o
   const [rateFloor, setRateFloor] = useState('');
   const [spreadFloor, setSpreadFloor] = useState('');
   const [concessionThreshold, setConcessionThreshold] = useState('0');
+  const [durationUnit, setDurationUnit] = useState<'days' | 'weeks' | 'months'>('months');
   const [minTerm, setMinTerm] = useState('');
   const [maxTerm, setMaxTerm] = useState('');
   const [minPrincipal, setMinPrincipal] = useState('');
   const [maxPrincipal, setMaxPrincipal] = useState('');
+  const [allowedFrequencies, setAllowedFrequencies] = useState<string[]>(['monthly']);
+  const [processingFeeBasis, setProcessingFeeBasis] = useState<'flat' | 'percent_of_principal'>('flat');
+  const [processingFeeAmount, setProcessingFeeAmount] = useState('0');
+  const [insuranceFeeEnabled, setInsuranceFeeEnabled] = useState(false);
+  const [insuranceFeeBasis, setInsuranceFeeBasis] = useState<'flat' | 'percent_of_principal'>('flat');
+  const [insuranceFeeAmount, setInsuranceFeeAmount] = useState('0');
+  const [defaultChargeBasis, setDefaultChargeBasis] = useState<'flat' | 'percent_of_principal'>('flat');
+  const [defaultChargeAmount, setDefaultChargeAmount] = useState('0');
+  const [repaymentGracePeriodDays, setRepaymentGracePeriodDays] = useState('0');
+  const [installmentGracePeriodDays, setInstallmentGracePeriodDays] = useState('0');
   const [error, setError] = useState<string | null>(null);
+
+  const toggleFrequency = (v: string) =>
+    setAllowedFrequencies((prev) => (prev.includes(v) ? prev.filter((f) => f !== v) : [...prev, v]));
 
   function reset() {
     setName('');
@@ -688,10 +1209,21 @@ function CreateLoanProductModal({ open, onClose, onCreated }: { open: boolean; o
     setRateFloor('');
     setSpreadFloor('');
     setConcessionThreshold('0');
+    setDurationUnit('months');
     setMinTerm('');
     setMaxTerm('');
     setMinPrincipal('');
     setMaxPrincipal('');
+    setAllowedFrequencies(['monthly']);
+    setProcessingFeeBasis('flat');
+    setProcessingFeeAmount('0');
+    setInsuranceFeeEnabled(false);
+    setInsuranceFeeBasis('flat');
+    setInsuranceFeeAmount('0');
+    setDefaultChargeBasis('flat');
+    setDefaultChargeAmount('0');
+    setRepaymentGracePeriodDays('0');
+    setInstallmentGracePeriodDays('0');
     setError(null);
   }
 
@@ -711,17 +1243,30 @@ function CreateLoanProductModal({ open, onClose, onCreated }: { open: boolean; o
         minRateFloorBps: rateType === 'fixed' && rateFloor ? parsePercentToBps(rateFloor) : null,
         minSpreadFloorBps: rateType === 'floating' && spreadFloor ? parsePercentToBps(spreadFloor) : null,
         concessionApprovalThresholdBps: parsePercentToBps(concessionThreshold),
+        allowedRepaymentFrequencies: allowedFrequencies,
+        durationUnit,
         minTermMonths: Number(minTerm),
         maxTermMonths: Number(maxTerm),
         minPrincipalPesewas: parseGhsInput(minPrincipal),
         maxPrincipalPesewas: parseGhsInput(maxPrincipal),
+        processingFeeBasis,
+        processingFeeAmountPesewas: processingFeeBasis === 'flat' ? parseGhsInput(processingFeeAmount) : undefined,
+        processingFeeRateBps: processingFeeBasis === 'percent_of_principal' ? parsePercentToBps(processingFeeAmount) : undefined,
+        insuranceFeeBasis: insuranceFeeEnabled ? insuranceFeeBasis : null,
+        insuranceFeeAmountPesewas: insuranceFeeEnabled && insuranceFeeBasis === 'flat' ? parseGhsInput(insuranceFeeAmount) : undefined,
+        insuranceFeeRateBps: insuranceFeeEnabled && insuranceFeeBasis === 'percent_of_principal' ? parsePercentToBps(insuranceFeeAmount) : undefined,
+        defaultChargeBasis,
+        defaultChargeAmountPesewas: defaultChargeBasis === 'flat' ? parseGhsInput(defaultChargeAmount) : undefined,
+        defaultChargeRateBps: defaultChargeBasis === 'percent_of_principal' ? parsePercentToBps(defaultChargeAmount) : undefined,
+        repaymentGracePeriodDays: Number(repaymentGracePeriodDays),
+        installmentGracePeriodDays: Number(installmentGracePeriodDays),
       }),
     onSuccess: () => {
       onCreated();
       onClose();
       reset();
     },
-    onError: (err) => setError(err instanceof ApiError ? err.message : 'Unable to create loan product'),
+    onError: (err) => setError(err instanceof ApiError ? err.message : 'Unable to create loan offer'),
   });
 
   return (
@@ -731,14 +1276,14 @@ function CreateLoanProductModal({ open, onClose, onCreated }: { open: boolean; o
         onClose();
         reset();
       }}
-      title="New loan product"
+      title="New loan offer"
       footer={
         <>
           <Button variant="secondary" size="sm" onClick={onClose}>
             Cancel
           </Button>
           <Button variant="primary" size="sm" disabled={mutation.isPending} onClick={() => mutation.mutate()}>
-            Create product
+            Create offer
           </Button>
         </>
       }
@@ -758,7 +1303,7 @@ function CreateLoanProductModal({ open, onClose, onCreated }: { open: boolean; o
             </select>
           )}
         </FormField>
-        <FormField label="Interest method">
+        <FormField label="Interest Basis" hint="How interest is calculated — the same concept as this offer's fixed/floating rate TYPE below is a separate axis (what the rate itself is pegged to).">
           {(id) => (
             <select id={id} value={interestMethod} onChange={(e) => setInterestMethod(e.target.value as typeof interestMethod)} className={selectClasses}>
               <option value="reducing_balance">Reducing balance</option>
@@ -786,13 +1331,37 @@ function CreateLoanProductModal({ open, onClose, onCreated }: { open: boolean; o
           policyRates={policyRatesQuery.data ?? []}
         />
         <div className="grid grid-cols-2 gap-3">
-          <FormField label="Min term (months)">{(id) => <input id={id} type="number" value={minTerm} onChange={(e) => setMinTerm(e.target.value)} className={inputClasses} />}</FormField>
-          <FormField label="Max term (months)">{(id) => <input id={id} type="number" value={maxTerm} onChange={(e) => setMaxTerm(e.target.value)} className={inputClasses} />}</FormField>
-        </div>
-        <div className="grid grid-cols-2 gap-3">
           <FormField label="Min principal (GH₵)">{(id) => <input id={id} type="number" step="0.01" value={minPrincipal} onChange={(e) => setMinPrincipal(e.target.value)} className={inputClasses} />}</FormField>
           <FormField label="Max principal (GH₵)">{(id) => <input id={id} type="number" step="0.01" value={maxPrincipal} onChange={(e) => setMaxPrincipal(e.target.value)} className={inputClasses} />}</FormField>
         </div>
+        <OfferDurationAndChargesFields
+          durationUnit={durationUnit}
+          setDurationUnit={setDurationUnit}
+          minTerm={minTerm}
+          setMinTerm={setMinTerm}
+          maxTerm={maxTerm}
+          setMaxTerm={setMaxTerm}
+          allowedFrequencies={allowedFrequencies}
+          toggleFrequency={toggleFrequency}
+          processingFeeBasis={processingFeeBasis}
+          setProcessingFeeBasis={setProcessingFeeBasis}
+          processingFeeAmount={processingFeeAmount}
+          setProcessingFeeAmount={setProcessingFeeAmount}
+          insuranceFeeEnabled={insuranceFeeEnabled}
+          setInsuranceFeeEnabled={setInsuranceFeeEnabled}
+          insuranceFeeBasis={insuranceFeeBasis}
+          setInsuranceFeeBasis={setInsuranceFeeBasis}
+          insuranceFeeAmount={insuranceFeeAmount}
+          setInsuranceFeeAmount={setInsuranceFeeAmount}
+          defaultChargeBasis={defaultChargeBasis}
+          setDefaultChargeBasis={setDefaultChargeBasis}
+          defaultChargeAmount={defaultChargeAmount}
+          setDefaultChargeAmount={setDefaultChargeAmount}
+          repaymentGracePeriodDays={repaymentGracePeriodDays}
+          setRepaymentGracePeriodDays={setRepaymentGracePeriodDays}
+          installmentGracePeriodDays={installmentGracePeriodDays}
+          setInstallmentGracePeriodDays={setInstallmentGracePeriodDays}
+        />
         {error && (
           <p role="alert" className="text-[13px] text-danger">
             {error}
@@ -815,7 +1384,23 @@ function EditLoanProductModal({ product, onClose, onSaved }: { product: LoanProd
   const [rateFloor, setRateFloor] = useState('');
   const [spreadFloor, setSpreadFloor] = useState('');
   const [concessionThreshold, setConcessionThreshold] = useState('0');
+  const [durationUnit, setDurationUnit] = useState<'days' | 'weeks' | 'months'>('months');
+  const [minTerm, setMinTerm] = useState('');
+  const [maxTerm, setMaxTerm] = useState('');
+  const [allowedFrequencies, setAllowedFrequencies] = useState<string[]>(['monthly']);
+  const [processingFeeBasis, setProcessingFeeBasis] = useState<'flat' | 'percent_of_principal'>('flat');
+  const [processingFeeAmount, setProcessingFeeAmount] = useState('0');
+  const [insuranceFeeEnabled, setInsuranceFeeEnabled] = useState(false);
+  const [insuranceFeeBasis, setInsuranceFeeBasis] = useState<'flat' | 'percent_of_principal'>('flat');
+  const [insuranceFeeAmount, setInsuranceFeeAmount] = useState('0');
+  const [defaultChargeBasis, setDefaultChargeBasis] = useState<'flat' | 'percent_of_principal'>('flat');
+  const [defaultChargeAmount, setDefaultChargeAmount] = useState('0');
+  const [repaymentGracePeriodDays, setRepaymentGracePeriodDays] = useState('0');
+  const [installmentGracePeriodDays, setInstallmentGracePeriodDays] = useState('0');
   const [error, setError] = useState<string | null>(null);
+
+  const toggleFrequency = (v: string) =>
+    setAllowedFrequencies((prev) => (prev.includes(v) ? prev.filter((f) => f !== v) : [...prev, v]));
 
   // Reset local state to the product's current values whenever a different
   // (or no) product is opened for editing — this modal is mounted once and
@@ -833,6 +1418,31 @@ function EditLoanProductModal({ product, onClose, onSaved }: { product: LoanProd
     setRateFloor(product.min_rate_floor_bps !== null ? (product.min_rate_floor_bps / 100).toString() : '');
     setSpreadFloor(product.min_spread_floor_bps !== null ? (product.min_spread_floor_bps / 100).toString() : '');
     setConcessionThreshold((product.concession_approval_threshold_bps / 100).toString());
+    setDurationUnit(product.duration_unit);
+    setMinTerm(product.min_term_months.toString());
+    setMaxTerm(product.max_term_months.toString());
+    setAllowedFrequencies(product.allowed_repayment_frequencies);
+    setProcessingFeeBasis(product.processing_fee_basis);
+    setProcessingFeeAmount(
+      product.processing_fee_basis === 'flat'
+        ? ((product.processing_fee_amount_pesewas ?? 0) / 100).toString()
+        : ((product.processing_fee_rate_bps ?? 0) / 100).toString()
+    );
+    setInsuranceFeeEnabled(product.insurance_fee_basis !== null);
+    setInsuranceFeeBasis(product.insurance_fee_basis ?? 'flat');
+    setInsuranceFeeAmount(
+      product.insurance_fee_basis === 'flat'
+        ? ((product.insurance_fee_amount_pesewas ?? 0) / 100).toString()
+        : ((product.insurance_fee_rate_bps ?? 0) / 100).toString()
+    );
+    setDefaultChargeBasis(product.default_charge_basis);
+    setDefaultChargeAmount(
+      product.default_charge_basis === 'flat'
+        ? ((product.default_charge_amount_pesewas ?? 0) / 100).toString()
+        : ((product.default_charge_rate_bps ?? 0) / 100).toString()
+    );
+    setRepaymentGracePeriodDays(product.repayment_grace_period_days.toString());
+    setInstallmentGracePeriodDays(product.installment_grace_period_days.toString());
   }
 
   const mutation = useMutation({
@@ -848,19 +1458,34 @@ function EditLoanProductModal({ product, onClose, onSaved }: { product: LoanProd
         minRateFloorBps: rateType === 'fixed' && rateFloor ? parsePercentToBps(rateFloor) : null,
         minSpreadFloorBps: rateType === 'floating' && spreadFloor ? parsePercentToBps(spreadFloor) : null,
         concessionApprovalThresholdBps: parsePercentToBps(concessionThreshold),
+        allowedRepaymentFrequencies: allowedFrequencies,
+        durationUnit,
+        minTermMonths: Number(minTerm),
+        maxTermMonths: Number(maxTerm),
+        processingFeeBasis,
+        processingFeeAmountPesewas: processingFeeBasis === 'flat' ? parseGhsInput(processingFeeAmount) : undefined,
+        processingFeeRateBps: processingFeeBasis === 'percent_of_principal' ? parsePercentToBps(processingFeeAmount) : undefined,
+        insuranceFeeBasis: insuranceFeeEnabled ? insuranceFeeBasis : null,
+        insuranceFeeAmountPesewas: insuranceFeeEnabled && insuranceFeeBasis === 'flat' ? parseGhsInput(insuranceFeeAmount) : undefined,
+        insuranceFeeRateBps: insuranceFeeEnabled && insuranceFeeBasis === 'percent_of_principal' ? parsePercentToBps(insuranceFeeAmount) : undefined,
+        defaultChargeBasis,
+        defaultChargeAmountPesewas: defaultChargeBasis === 'flat' ? parseGhsInput(defaultChargeAmount) : undefined,
+        defaultChargeRateBps: defaultChargeBasis === 'percent_of_principal' ? parsePercentToBps(defaultChargeAmount) : undefined,
+        repaymentGracePeriodDays: Number(repaymentGracePeriodDays),
+        installmentGracePeriodDays: Number(installmentGracePeriodDays),
       }),
     onSuccess: () => {
       onSaved();
       onClose();
     },
-    onError: (err) => setError(err instanceof ApiError ? err.message : 'Unable to update loan product'),
+    onError: (err) => setError(err instanceof ApiError ? err.message : 'Unable to update loan offer'),
   });
 
   return (
     <Modal
       open={!!product}
       onClose={onClose}
-      title={product ? `Edit ${product.code}` : 'Edit product'}
+      title={product ? `Edit ${product.code}` : 'Edit offer'}
       footer={
         <>
           <Button variant="secondary" size="sm" onClick={onClose}>
@@ -907,6 +1532,34 @@ function EditLoanProductModal({ product, onClose, onSaved }: { product: LoanProd
             concessionThreshold={concessionThreshold}
             setConcessionThreshold={setConcessionThreshold}
             policyRates={policyRatesQuery.data ?? []}
+          />
+          <OfferDurationAndChargesFields
+            durationUnit={durationUnit}
+            setDurationUnit={setDurationUnit}
+            minTerm={minTerm}
+            setMinTerm={setMinTerm}
+            maxTerm={maxTerm}
+            setMaxTerm={setMaxTerm}
+            allowedFrequencies={allowedFrequencies}
+            toggleFrequency={toggleFrequency}
+            processingFeeBasis={processingFeeBasis}
+            setProcessingFeeBasis={setProcessingFeeBasis}
+            processingFeeAmount={processingFeeAmount}
+            setProcessingFeeAmount={setProcessingFeeAmount}
+            insuranceFeeEnabled={insuranceFeeEnabled}
+            setInsuranceFeeEnabled={setInsuranceFeeEnabled}
+            insuranceFeeBasis={insuranceFeeBasis}
+            setInsuranceFeeBasis={setInsuranceFeeBasis}
+            insuranceFeeAmount={insuranceFeeAmount}
+            setInsuranceFeeAmount={setInsuranceFeeAmount}
+            defaultChargeBasis={defaultChargeBasis}
+            setDefaultChargeBasis={setDefaultChargeBasis}
+            defaultChargeAmount={defaultChargeAmount}
+            setDefaultChargeAmount={setDefaultChargeAmount}
+            repaymentGracePeriodDays={repaymentGracePeriodDays}
+            setRepaymentGracePeriodDays={setRepaymentGracePeriodDays}
+            installmentGracePeriodDays={installmentGracePeriodDays}
+            setInstallmentGracePeriodDays={setInstallmentGracePeriodDays}
           />
           {error && (
             <p role="alert" className="text-[13px] text-danger">

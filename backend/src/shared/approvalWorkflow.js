@@ -40,16 +40,51 @@ function registerExecutionHandler(actionType, handler) {
 }
 
 /**
+ * Companion registry for the opposite case: a module that needs to run a
+ * side effect when a request is REJECTED, not just approved (e.g. the
+ * loan module flipping loans.status to 'rejected' — before this registry
+ * existed, a rejected loan.approve request left the loan stuck on
+ * 'pending_approval' forever, since decide() only ever dispatched
+ * executionHandlers on approval). Deliberately separate from
+ * executionHandlers rather than one handler that takes the decision as an
+ * argument: every existing registered handler (branch/customer closure,
+ * loan restructure/concession) was written assuming it only ever fires on
+ * approval, so a single merged dispatch would have silently started
+ * invoking all of them on rejection too. No action_type has a rejection
+ * handler registered by default — rejection is a true no-op everywhere
+ * except where a module opts in here.
+ */
+const rejectionHandlers = new Map();
+
+function registerRejectionHandler(actionType, handler) {
+  rejectionHandlers.set(actionType, handler);
+}
+
+/**
  * Look up the approval threshold that applies to an action, preferring a
  * branch-specific row over the org-wide (branch_id IS NULL) row.
+ *
+ * Also supports AMOUNT TIERING within one action_type/branch: a module can
+ * seed more than one approval_thresholds row for the same action_type
+ * (distinguished by amount_threshold_pesewas — see migration 066), and
+ * pass amountPesewas here to pick the highest tier the amount actually
+ * qualifies for (e.g. loan.approve's lower tier at 0, decided by
+ * branch_manager/loan_officer, and its upper tier at GHS 100,000, decided
+ * by owner/system_admin — see Decisions_Log.md). When amountPesewas is
+ * omitted (most callers, and every action_type with only one threshold
+ * row configured), this is unchanged from the single-row lookup this
+ * function always did. Kept to ONE query — branch-preference and
+ * amount-tiering are both expressed in the SQL itself — since several
+ * unit tests assert requestApproval's exact db.query() call count.
  */
-async function getApplicableThreshold(db, { actionType, branchId }) {
+async function getApplicableThreshold(db, { actionType, branchId, amountPesewas = null }) {
   const { rows } = await db.query(
     `SELECT * FROM approval_thresholds
      WHERE action_type = $1 AND (branch_id = $2 OR branch_id IS NULL)
-     ORDER BY branch_id NULLS LAST
+       AND ($3::bigint IS NULL OR amount_threshold_pesewas <= $3)
+     ORDER BY branch_id NULLS LAST, amount_threshold_pesewas DESC
      LIMIT 1`,
-    [actionType, branchId]
+    [actionType, branchId, amountPesewas]
   );
   return rows[0] || null;
 }
@@ -97,13 +132,17 @@ async function requestApproval(db, params) {
     payload = null,
   } = params;
 
-  const threshold = await getApplicableThreshold(db, { actionType, branchId });
-  const requiredApproverRoleId = threshold ? threshold.required_approver_role_id : null;
+  const threshold = await getApplicableThreshold(db, { actionType, branchId, amountPesewas });
+  const requiredApproverRoleIds = threshold
+    ? threshold.required_approver_role_ids
+      || (threshold.required_approver_role_id ? [threshold.required_approver_role_id] : null)
+    : null;
+  const requiredApproverRoleId = requiredApproverRoleIds ? requiredApproverRoleIds[0] : null;
 
   const { rows } = await db.query(
     `INSERT INTO approval_requests
-       (action_type, entity_type, entity_id, branch_id, amount_pesewas, payload, requested_by, required_approver_role_id, status)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')
+       (action_type, entity_type, entity_id, branch_id, amount_pesewas, payload, requested_by, required_approver_role_id, required_approver_role_ids, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending')
      RETURNING *`,
     [
       actionType,
@@ -114,6 +153,7 @@ async function requestApproval(db, params) {
       payload === null ? null : JSON.stringify(payload),
       requestedBy,
       requiredApproverRoleId,
+      requiredApproverRoleIds,
     ]
   );
 
@@ -172,12 +212,18 @@ async function decide(db, { approvalId, decidedBy, decision, reason = null, exec
     throw new MakerCheckerViolationError('the requesting user cannot approve or reject their own request');
   }
 
-  if (existing.required_approver_role_id) {
+  // Prefer the multi-role array; fall back to the singular column for rows
+  // written before migration 059 that were never backfilled (shouldn't
+  // happen post-migration, but keeps old data readable).
+  const requiredRoleIds = existing.required_approver_role_ids
+    || (existing.required_approver_role_id ? [existing.required_approver_role_id] : null);
+  if (requiredRoleIds && requiredRoleIds.length > 0) {
     const { rows: userRows } = await db.query('SELECT role_id FROM users WHERE id = $1', [decidedBy]);
     const approver = userRows[0];
-    if (!approver || Number(approver.role_id) !== Number(existing.required_approver_role_id)) {
+    const approverRoleId = approver ? Number(approver.role_id) : null;
+    if (!approverRoleId || !requiredRoleIds.map(Number).includes(approverRoleId)) {
       throw new MakerCheckerViolationError(
-        `user ${decidedBy} does not hold the role required to decide approval_request ${approvalId}`
+        `user ${decidedBy} does not hold a role required to decide approval_request ${approvalId}`
       );
     }
   }
@@ -194,6 +240,12 @@ async function decide(db, { approvalId, decidedBy, decision, reason = null, exec
   const handler = execute || executionHandlers.get(existing.action_type);
   if (decision === 'approved' && typeof handler === 'function') {
     await handler(updated, db);
+  }
+  if (decision === 'rejected') {
+    const onReject = rejectionHandlers.get(existing.action_type);
+    if (typeof onReject === 'function') {
+      await onReject(updated, db);
+    }
   }
 
   await auditLog.record(db, {
@@ -215,7 +267,7 @@ async function decide(db, { approvalId, decidedBy, decision, reason = null, exec
  * own approval-trail view) — there was previously no way to list
  * `approval_requests` at all, only request/decide single rows by id.
  */
-async function listApprovals(db, { status, actionType, entityType, branchId } = {}) {
+async function listApprovals(db, { status, actionType, entityType, entityId, branchId } = {}) {
   const clauses = [];
   const params = [];
   const add = (col, val) => {
@@ -226,6 +278,9 @@ async function listApprovals(db, { status, actionType, entityType, branchId } = 
   add('status', status);
   add('action_type', actionType);
   add('entity_type', entityType);
+  add('entity_id', entityId === undefined || entityId === null ? entityId : String(entityId));
+  // (entity_id is stored as text, so a numeric loanId must be stringified
+  // before comparison — everything else here is already the right type)
   add('branch_id', branchId);
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
   const { rows } = await db.query(
@@ -242,6 +297,7 @@ module.exports = {
   isApprovalRequired,
   listApprovals,
   registerExecutionHandler,
+  registerRejectionHandler,
   ApprovalValidationError,
   ApprovalNotFoundError,
   MakerCheckerViolationError,

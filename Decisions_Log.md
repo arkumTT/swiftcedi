@@ -279,7 +279,7 @@ values, loan status values, account status values._
 | `customers.kyc_status` | `pending`, `verified`, `rejected` | 2 — no restrictive state machine; any value may follow any other (re-review after resubmission, or downgrading a verified customer if fraud surfaces later), just permission-gated and audited via `customerService.updateKycStatus()` |
 | `customers.customer_type` | `individual`, `group`, `sme` | 2 |
 | `credit_bureau_lookups.status` | `completed`, `failed` | 2 |
-| `loans.status` | `applied`, `appraised`, `pending_approval`, `approved`, `rejected`, `disbursed`, `closed`, `written_off` | 3 — see the lifecycle note below; `closed` (fully repaid) and `written_off` (bad debt) are both terminal and deliberately distinct, since Module 8/9 must be able to tell a performing payoff from a loss |
+| `loans.status` | `applied`, `appraised`, `pending_approval`, `approved`, `rejected`, `disbursed`, `paying`, `missed_payment`, `closed`, `written_off` | 3, extended in the loan module amendment (below) — see the lifecycle note below; `closed` (fully repaid) and `written_off` (bad debt) are both terminal and deliberately distinct, since Module 8/9 must be able to tell a performing payoff from a loss. `paying`/`missed_payment` are both "active" sub-states of what used to be a single `disbursed` value — see "Loan module amendment" for the `ACTIVE_LOAN_STATUSES` fix this required everywhere that used to filter on the literal `disbursed` |
 | `loan_products.loan_type` / `loans.loan_type` | `individual`, `group`, `overdraft` | 3 — `overdraft` is in the enum but NOT implemented; it needs a savings account to attach to (Module 4). See Open Questions |
 | `loan_products.interest_method` / `loans.interest_method` | `flat`, `reducing_balance` | 3 |
 | `loan_products.status` | `active`, `inactive` | 3 |
@@ -358,9 +358,9 @@ applied ──appraise(recommend)──> appraised ──requestLoanApproval─�
                                                                           │
                                           approvalWorkflow approve ───> approved
                                                                           │
-                                                       disburseLoan ──> disbursed
-                                                                        │      │
-                                     final repayment ──> closed  <──────┘      │
+                                                       disburseLoan ──> disbursed ──refreshLoanStatus──> paying ⇄ missed_payment
+                                                                        │      │                            │        │
+                                     final repayment ──> closed  <──────┴──────┴────────────────────────────┴────────┘
                                                        writeOffLoan ──> written_off
 ```
 
@@ -368,6 +368,17 @@ Disbursement is deliberately a **separate** action from approval (not
 something the approval handler does): maker-checker is already satisfied
 at the approval step, and disbursement is when cash actually moves, so it
 carries its own `loan.disburse` permission and its own audit entry.
+
+The `pending_approval ──reject──> rejected` arrow shown above was **only
+a diagram promise until the loan module amendment (below) actually wired
+it**: `approvalWorkflow.decide()` had no `loan.approve` rejection handler
+registered, so a rejected loan.approve request updated `approval_requests`
+but left the loan itself stuck on `pending_approval` forever, with no
+route to `applied`/re-appraisal or any other status. Fixed by
+`loanService.applyLoanRejectionDecision`, registered against the new
+`registerRejectionHandler()` (see "Loan module amendment" below) — do not
+re-introduce a threshold-gated action without checking it has both an
+approval AND (if rejection is meaningful for it) a rejection handler.
 
 Follow this pattern for every future status column: app-layer values
 documented here **and** a DB `CHECK` constraint enumerating the same
@@ -457,6 +468,26 @@ registerExecutionHandler(actionType, handler(approvalRequest, db) -> Promise<voi
 - If `required_approver_role_id` is set on the request (from a matching
   `approval_thresholds` row), `decide` also verifies the deciding user
   actually holds that role.
+- **Multi-role thresholds (migration 059, loan module amendment).**
+  `approval_thresholds` and `approval_requests` both gained
+  `required_approver_role_ids BIGINT[]` (additive; backfilled from the
+  existing singular column). A threshold's tier can now require **any one**
+  of several roles to decide, not just one — needed because the loan
+  approval gate (`loan.approve`) is tiered by amount with two roles per
+  tier (see "Loan module amendment" below). `decide()` checks array
+  membership (`requiredRoleIds.includes(approverRoleId)`), falling back to
+  the singular `required_approver_role_id` wrapped in a one-element array
+  for any pre-migration-059 row that was never backfilled. The singular
+  column is still written on every `requestApproval()`/threshold-CRUD call
+  (as `role_ids[0]`) for backward compatibility — do not remove it.
+  `routes/approvals.js`'s threshold CRUD accepts `requiredApproverRoleIds`
+  (array, preferred) or the older singular `requiredApproverRoleId`
+  (wrapped into a one-element array); `GET /approvals/thresholds` returns
+  `required_approver_role_names` (array, via `array_agg`) instead of the
+  old singular `required_approver_role_name`. `AccessApprovalRulesPage.tsx`
+  uses a checkbox list, not a single `<select>`, to set a threshold's roles.
+  Every module that calls `requestApproval()`/`decide()` picked this up for
+  free — no other module's code changed.
 
 ### GL posting interface — `backend/src/shared/glPosting.js`
 
@@ -1120,6 +1151,302 @@ officer-facing UI (the backend accepts `negotiatedFeeSchedule` and the
 bound-enforcement logic already treats any fee change as
 approval-required, but no form control was built for it — Feature 2's
 own wording only asked for "a negotiated rate/term with a reason").
+
+### Loan module amendment — offer fields, schedule frequencies, statuses, approval gate — extension to Module 3
+
+_Added in a later session, after the fixed/floating-rate/concessions
+extension above. Orientation (offer/product form, calculator/creation
+page, application form, loans table, status enum, existing approval
+logic) was done and summarized before any code was written; the open
+questions below were confirmed with a human via targeted questions before
+implementation, not assumed._
+
+**Naming: "Loan Products" → "Loan Offer" is UI-only.** Every user-facing
+label, page title, button, and empty/error string was renamed
+(`LoansListPage.tsx`, `LoanDetailPage.tsx`). Table name (`loan_products`),
+column names, service function names (`createLoanProduct`,
+`loanService.LoanProduct` shapes), and API routes (`/loan-products`) were
+all deliberately left alone — a full rename would touch every migration,
+FK, and route referencing the table for a purely cosmetic change with no
+functional upside. If a genuine rename is ever wanted, do it as its own
+scoped migration, not folded into an unrelated feature change.
+
+**"Interest Basis" is the existing `interest_method` field
+(`flat`/`reducing_balance`), relabeled, not a new column.** Checked first
+whether this was the same concept as the fixed/floating `rate_type` field
+from the prior amendment — it is not: `rate_type` answers "is the RATE
+itself fixed or does it float with a reference rate," `interest_method`
+answers "how is interest calculated over the schedule once the rate is
+known" (flat vs. reducing balance). Both axes are independent and both
+already existed; "Interest Basis" in the UI now labels `interest_method`
+specifically, and no new column or form field was added for it.
+
+**Schema** (migrations `059`–`066`, all additive):
+
+```
+approval_thresholds += required_approver_role_ids BIGINT[] (059, see
+  Shared Services section above)
+approval_thresholds: uniqueness widened from (action_type, branch) to
+  (action_type, branch, amount_threshold_pesewas) (066) — see below
+
+loan_products += processing_fee_basis/amount_pesewas/rate_bps,
+  insurance_fee_basis/amount_pesewas/rate_bps (nullable trio = "no
+  insurance fee"), default_charge_basis/amount_pesewas/rate_bps,
+  repayment_grace_period_days, installment_grace_period_days,
+  duration_unit ('days'|'weeks'|'months', default 'months') (060)
+loan_products.allowed_repayment_frequencies CHECK loosened from
+  {'monthly'} to allow daily/weekly/biweekly/monthly too (060) — the
+  schedule generator now actually supports all four, see loanMath below,
+  reversing the prior amendment's "declarative-only, monthly-only
+  enforced" decision now that the underlying limitation is fixed
+
+loans += the same fee/charge/grace-period/duration_unit fields as
+  loan_products, snapshotted at application time (061) — same "never
+  let a later product edit change what an already-applied loan is
+  charged" guarantee `fee_schedule` already had
+loans += reference (TEXT, UNIQUE, backfilled for existing rows — see
+  reference format below), repayment_frequency, duration_unit (061)
+
+loan_guarantors += relationship VARCHAR(60) (062, loose text like
+  next_of_kin.relationship, not a CHECK-enum)
+loan_collateral += document_url TEXT (062, URL-only — matching
+  customer_documents.file_url's existing precedent; no file-upload
+  storage exists anywhere in this codebase, so a real upload widget was
+  not built, only a link field)
+
+loans.status CHECK += 'paying', 'missed_payment' (063)
+loan_schedules += default_charge_applied BOOLEAN NOT NULL DEFAULT false (064)
+
+loan.waive_charges permission, granted to branch_manager/loan_officer/
+  cashier; loan_officer also granted approval.decide (065, needed for
+  the lower loan.approve tier below)
+```
+
+**`duration_unit` reinterprets existing columns rather than adding
+parallel ones.** `loan_products.min_term_months`/`max_term_months` and
+`loans.term_months` keep their names but are now interpreted in whatever
+unit `duration_unit` specifies for that specific offer/loan (default
+`'months'`, so every pre-existing row is unaffected). A parallel
+`min_term_days`/`min_term_weeks` set of columns was considered and
+rejected as needless duplication — the column holds a plain integer
+count of periods either way; only the period's meaning changes. Frontend
+labels derive the unit string from `duration_unit` everywhere a term is
+shown (fixed three hardcoded "months" labels found via live smoke-test
+screenshots on the calculator card, the loan-offer list card, and the
+loan detail page's header/KPI/standard-terms text — **two more inside
+the pre-existing concession-negotiation UI were deliberately left
+hardcoded**, a scope decision to avoid touching the concession feature's
+own backend semantics; cosmetic-only limitation for non-monthly-duration
+offers, flagged here rather than silently left unnoted).
+
+**Loan reference format: `LN-<branchCode>-#####`**, mirroring
+`savingsService.generateAccountNo`'s existing `SAV-<branchCode>-#####`
+convention exactly rather than inventing a new one (`generateLoanReference`
+in `loanService.js`). Existing rows were backfilled in migration 061,
+numbered by disbursement order per branch, before the column was made
+`UNIQUE`.
+
+**Multi-frequency schedule generation — the prior amendment's "monthly
+only, declarative-only" limitation is now actually fixed.**
+`loanMath.generateLoanSchedule` gained optional `repaymentFrequency`
+(`daily`/`weekly`/`biweekly`/`monthly`) and `durationUnit`
+(`days`/`weeks`/`months`) params. When both are at their defaults
+(`'monthly'`/`'months'`) it calls the exact original
+`generateFlatSchedule`/`generateReducingBalanceSchedule` functions
+unchanged — byte-identical output, covered by a dedicated "monthly+months
+path untouched" unit test — so every pre-existing loan and test is
+unaffected. Non-default combinations route through new
+`generateFlatScheduleByPeriod`/`generateReducingBalanceScheduleByPeriod`,
+generalized by a period-day-count table (`PERIOD_DAYS = {daily:1,
+weekly:7, biweekly:14, monthly:30}`, `DURATION_UNIT_DAYS = {days:1,
+weeks:7, months:30}`) — a deliberate day-based approximation, consistent
+with the overdraft-interest-accrual code's existing 365-day-year
+approximation elsewhere in this module, not a new precision standard.
+The application-time schedule preview (item 3a) calls the same function
+the frontend then re-calls at disbursement, so what a customer sees
+before submitting is exactly what they get.
+
+**Two distinct grace periods — do not conflate them:**
+
+- `repayment_grace_period_days` — days after **disbursement** before the
+  **first installment's due date**. Shifts the whole schedule's start
+  date forward (`disburseLoan` computes `scheduleStartDate =
+  addDaysToDateString(disbursementDate, repayment_grace_period_days)`
+  before generating the schedule).
+- `installment_grace_period_days` — days after **each individual
+  installment's own due date** before that installment is considered
+  missed/penalized. Does not move any due date; it only delays when
+  `computeActiveLoanStatus`/`refreshLoanStatus` treat an unpaid
+  installment as overdue.
+
+Both are documented inline at their schema/UI definition sites (migration
+060's comment, the loan offer form's helper text) specifically because
+the names are easy to conflate.
+
+**Status enum extension: `paying`/`missed_payment` are sub-states of what
+used to be a single `disbursed` value**, computed live rather than
+cron-driven — same "compute on read" tradeoff `getArrearsReport` already
+used, and consistent with this codebase having no live-firing cron
+anywhere (Module 12's own jobs are all manually `triggerJob`'d). New pure
+function `loanMath.computeActiveLoanStatus({scheduleRows,
+installmentGracePeriodDays, asOfDate})` decides `paying` vs.
+`missed_payment`; new `loanService.refreshLoanStatus` calls it and
+persists a change, called from both `getLoan`/`listLoans` (read-time) and
+once more after `postRepayment`. It also auto-applies the offer's
+`default_charge_*` to any installment newly crossing
+`installment_grace_period_days` (added to `loan_schedules.fees_due_pesewas`,
+collected through the existing fees→interest→principal `allocateRepayment`
+waterfall), guarded by `loan_schedules.default_charge_applied` so it only
+fires once per installment. `waiveDefaultCharge` (new, `loan.waive_charges`
+permission) floors `fees_due_pesewas` at `fees_paid_pesewas` — it can
+never claw back cash already collected — and logs before/after via the
+shared audit service rather than a second ledger column.
+
+**`disbursed` stopped meaning "the loan is currently active" everywhere
+that literal-string-matched it — this had a real blast radius.** A new
+`ACTIVE_LOAN_STATUSES = ['disbursed', 'paying', 'missed_payment']` const
+in `loanService.js` replaces every guard that used to check
+`status !== 'disbursed'`/`status === 'disbursed'` to mean "is this loan
+currently outstanding" (`postRepayment`, `requestRestructure`,
+`writeOffLoan`, `getArrearsReport`). Found via a full-codebase grep audit
+after the status migration broke two integration tests
+(`systemAdminModule.test.js`'s reminders job, `analyticsModule.test.js`'s
+agent-productivity query) — also fixed in `analyticsService.js` (6
+occurrences), `complianceService.js` (1), `systemAdminService.js` (1 SQL
+occurrence; a second, `listLoans({status:'disbursed'})` in the
+overdraft-interest-accrual job, was correctly left alone since it's
+already scoped to `loan_type === 'overdraft'` right after, and overdraft
+loans never leave `disbursed` — they have no schedule and so never
+compute `paying`/`missed_payment`). Frontend `LoanDetailPage.tsx` got its
+own `ACTIVE_LOAN_STATUSES` const for the same button-gating logic
+(post_repayment/restructure/write_off), while `accrue_overdraft_interest`/
+`close_overdraft` correctly kept the literal `'disbursed'` check. **Any
+future code that checks a loan's status to mean "is it outstanding" must
+use `ACTIVE_LOAN_STATUSES`, never the literal `'disbursed'` string.**
+
+**`loan.approve` gate: tiered by amount, reusing (and extending) the
+approval-threshold shared infrastructure rather than a bespoke check.**
+There was no approve/reject step at all before this session — a loan
+could reach `pending_approval` via `requestLoanApproval` but the frontend
+had no UI to decide it (confirmed via grep: no frontend file called the
+generic decide endpoint anywhere in this codebase before this change),
+and `approvalWorkflow.decide()`'s rejection path had no handler
+registered for `loan.approve` at all (see the lifecycle-diagram note
+above). The confirmed design: **below GHS 100,000, branch_manager OR
+loan_officer decides; at or above GHS 100,000, owner OR system_admin
+decides** — which the pre-existing `approval_thresholds` table could not
+represent, since it only ever held one threshold row per
+`(action_type, branch)`. Migration 066 widens the uniqueness to
+`(action_type, branch, amount_threshold_pesewas)` so an action_type can
+have multiple TIER rows, and seeds `loan.approve`'s two tiers (org-wide,
+`branch_id IS NULL`):
+
+| Tier | `amount_threshold_pesewas` | Required roles |
+|---|---|---|
+| Lower | 0 | `branch_manager`, `loan_officer` |
+| Upper | 10,000,000 (GHS 100,000) | `owner`, `system_admin` |
+
+`approvalWorkflow.getApplicableThreshold(db, {actionType, branchId,
+amountPesewas})` picks the highest tier whose `amount_threshold_pesewas
+<= amountPesewas` in ONE query (deliberately, to preserve existing unit
+tests' exact `db.query()` call-count assertions) — every other
+threshold-gated action_type (`savings.withdraw`, `gl.request_manual_jv`,
+`loan.grant_concession`, investment redemption, cashback) still has only
+one row each, so this is a no-op for them. `requestApproval` now forwards
+`amountPesewas` through; `loanService.requestLoanApproval` already passed
+the loan's own principal as `amountPesewas` on every call (loan approval
+is never threshold-gated on *whether* it's needed — every loan requires
+it — only on *who* decides), so the lower tier's 0 threshold guarantees a
+matching row for every amount. `decide()`'s existing multi-role array
+check (migration 059, see Shared Services) enforces which of the two
+roles per tier actually qualifies.
+
+`loanService.applyLoanRejectionDecision`, registered via the new
+`registerRejectionHandler('loan.approve', ...)` (see Shared Services),
+flips the loan to `rejected` on a rejected decision — the gap the
+lifecycle diagram above already claimed was wired but wasn't.
+`LoanDetailPage.tsx` gained the first Approve/Reject buttons in this
+codebase: an Approve button, a Reject button (opens a modal requiring a
+reason), both gated on `status === 'pending_approval' &&
+hasPermission('approval.decide')` and a `pendingApprovalQuery` that finds
+the loan's own pending `loan.approve` request via a new `entityId` filter
+added to `approvalWorkflow.listApprovals`/`GET /approvals` (stringified
+before comparison, since `approval_requests.entity_id` is text).
+Approval/rejection is audited automatically via `approvalWorkflow.decide()`'s
+existing `auditLog.record()` call (approver, timestamp, decision reason)
+— no separate audit write was needed.
+
+**`loan.grant_concession` (the prior amendment's per-loan rate/term
+concession approval) and `loan.approve` (this amendment's general
+disbursement gate) are two genuinely independent approval flows, not
+duplicates, and were reconciled rather than merged:** `loan.approve`
+gates whether a loan may be disbursed at all; `loan.grant_concession`
+gates whether an *already-approved-or-approvable* loan's standard
+rate/term/fees may be renegotiated. A loan can have a concession request
+pending independent of where it sits in the approve/disburse lifecycle —
+`assertApprovedForDisbursement` (the shared precondition function both
+ordinary disbursement and overdraft activation call) already blocked
+disbursement while a concession is pending, unchanged by this amendment.
+Both flows go through the same `approval_requests` table and
+`approvalWorkflow.decide()` function; only their `action_type` and
+threshold-tier configuration differ.
+
+**Loans & Credit table column order is exact, per confirmation**: `# |
+Reference | Photo | Customer | Agent | Loan Offer | Principal (sortable)
+| Term | Expected | Total Paid (sortable) | Balance | Status (sortable) |
+Action`. "Agent" uses `loan.applied_by` (rendered as `#<id>`) — confirmed
+via grep that no "loan officer assigned to a loan" concept exists
+anywhere in this codebase (`field_agents` is a susu-collection-only
+subsystem, unrelated to loan origination), so `applied_by` is the closest
+available field; documented inline in `LoansListPage.tsx` rather than
+inventing a new assignment concept. "Expected" = sum of installments due
+on/before today (confirmed decision), "Total Paid"/"Balance" are computed
+from `loan_repayments`/`loan_schedules`, all three via a new
+`loanService.attachLoanAggregates` — a SEPARATE query from the base
+`loans` SELECT (not joined into it) specifically so `refreshLoanStatus`'s
+own `UPDATE loans ... RETURNING *` can't silently drop these computed
+columns off a just-recomputed row. `Action` opens `ManageRepaymentsModal`
+(record a repayment; waive a specific installment's default charge,
+gated by `loan.waive_charges`), gated by `loan.post_repayment` and only
+shown while the loan is in `ACTIVE_LOAN_STATUSES`. Sorting is owned by
+plain `useState` in `LoansListPage.tsx` (no new library); `DataTable.tsx`'s
+`Column.header` type was widened from `string` to `ReactNode` (a
+backward-compatible one-line change) so a sortable header with a chevron
+icon could render without adding a new prop to the shared table
+component.
+
+**Suggested extras (item 7) — listed but explicitly NOT built without
+confirmation, none were greenlit this session:**
+
+| Extra | Rough effort |
+|---|---|
+| PAR/NPL dashboard for management | Medium — `analyticsService`/`complianceService` already compute PAR-adjacent aggregates (see their own sections); mostly a new frontend view over existing queries |
+| Daily auto-flag job for overdue installments | Small — `refreshLoanStatus` already does the compute; wiring it into Module 12's job registry (`triggerJob`) as a new scheduled job is the only new work |
+| Repayment reminder notifications (SMS/MoMo) | Large — no SMS/push/notification-delivery gateway exists anywhere in this codebase yet (`reminder_notifications` is log-only, same gap Module 12's own section already flags) |
+| Loan restructuring/top-up workflow for existing customers | Small — `requestRestructure`/`applyRestructureOnApproval` already exist from Module 3; a "top-up" (new principal added to an existing loan) would be new |
+| Per-loan PDF statement/receipt generation | Medium — no PDF generation library or pattern exists anywhere in this codebase yet |
+| Officer/agent collections performance view | Medium — `analyticsService`'s existing agent/loan-officer productivity queries are the closest starting point, but "collections performance" specifically is a new aggregate |
+| Bulk CSV import for loan applications | Medium — `systemAdminService`'s existing CSV-export allowlist pattern is the closest precedent; import has no existing precedent (validation-per-row, partial-failure handling) |
+| Document/insurance expiry tracking for collateral | Small — `loan_collateral` has no expiry-date column yet; would need one additive column plus a query, no new infrastructure |
+
+**Testing note**: `approval_thresholds` is not truncated by
+`loanModule.test.js`'s own `beforeAll` (or any other suite's), so
+migration 066's seeded `loan.approve` tier rows persist across a full
+`npx jest` run once applied — every integration suite whose fixture
+loans go through `takeLoanToDisbursed`-style helpers had to be checked
+for whether their decider held a qualifying tier role.
+`complianceModule.test.js`, `analyticsModule.test.js`, and
+`systemAdminModule.test.js` all previously decided `loan.approve` with a
+plain owner-role `checker`, which no longer qualifies for the (now
+tiered) lower bracket their fixture loans fall into — each gained its own
+`branchManagerChecker` test user, the same pattern `loanModule.test.js`
+already used for `loan.grant_concession`. `loanModule.test.js` itself
+gained a dedicated `describe('loan.approve: tiered threshold and
+rejection handling ...')` block covering: lower-tier decidable by
+loan_officer, lower-tier rejecting an owner/system_admin decider,
+upper-tier decidable by owner/system_admin (rejecting
+branch_manager/loan_officer), and rejection flipping the loan to
+`rejected` with disbursement staying blocked.
 
 ### Savings / susu / standing orders — `backend/src/modules/savings/` (Module 4)
 

@@ -40,8 +40,10 @@ describeIfDb('Module 12: system administration', () => {
   let pool;
   let branchId;
   let ownerRoleId;
+  let branchManagerRoleId;
   let maker;
   let checker;
+  let branchManagerChecker;
 
   beforeAll(async () => {
     execFileSync('node', [path.join(__dirname, '../../src/db/migrate.js'), '--test'], {
@@ -146,9 +148,15 @@ describeIfDb('Module 12: system administration', () => {
 
     const { rows: ownerRows } = await pool.query("SELECT id FROM roles WHERE name = 'owner'");
     ownerRoleId = ownerRows[0].id;
+    const { rows: bmRows } = await pool.query("SELECT id FROM roles WHERE name = 'branch_manager'");
+    branchManagerRoleId = bmRows[0].id;
 
     maker = await createTestUser('sysadmin-maker@test.local');
     checker = await createTestUser('sysadmin-checker@test.local');
+    // Migration 066: loan.approve below GHS 100,000 requires branch_manager/
+    // loan_officer, not the plain owner-role `checker` — every loan here
+    // disbursed via takeLoanToDisbursed() is well under that threshold.
+    branchManagerChecker = await createTestUser('sysadmin-bm-checker@test.local', branchManagerRoleId);
 
     const branch = await branchService.createBranch(pool, { code: 'SYS-01', name: 'System Admin Test Branch', createdBy: maker });
     branchId = branch.id;
@@ -158,11 +166,11 @@ describeIfDb('Module 12: system administration', () => {
     await pool.end();
   });
 
-  async function createTestUser(email) {
+  async function createTestUser(email, roleId = ownerRoleId) {
     const { rows } = await pool.query(
       `INSERT INTO users (full_name, email, password_hash, role_id, home_branch_id)
        VALUES ($1, $1, 'x', $2, (SELECT id FROM branches WHERE code = 'HQ')) RETURNING id`,
-      [email, ownerRoleId]
+      [email, roleId]
     );
     return rows[0].id;
   }
@@ -218,7 +226,9 @@ describeIfDb('Module 12: system administration', () => {
     const loan = await loanService.applyForLoan(pool, { customerId: customer.id, productId: product.id, principalPesewas, termMonths, appliedBy: maker });
     await loanService.submitAppraisal(pool, { loanId: loan.id, checklist: { verified: true }, recommendation: 'recommend', appraiserId: maker });
     const approval = await loanService.requestLoanApproval(pool, { loanId: loan.id, requestedBy: maker });
-    await decideAs(approval.id, checker);
+    // Migration 066: loan.approve below GHS 100,000 requires branch_manager/
+    // loan_officer, not the plain owner-role `checker`.
+    await decideAs(approval.id, branchManagerChecker);
     return loanService.disburseLoan(pool, { loanId: loan.id, disbursedBy: maker, disbursementDate });
   }
 

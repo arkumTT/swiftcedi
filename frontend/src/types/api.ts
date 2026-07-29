@@ -254,6 +254,7 @@ export interface Customer {
   phone: string | null;
   email: string | null;
   address: string | null;
+  photo_url: string | null;
   status: 'active' | 'inactive' | 'closed';
   classification: string | null;
   kyc_status: 'pending' | 'verified' | 'rejected';
@@ -304,18 +305,48 @@ export interface Customer360 {
 
 export interface Loan {
   id: string;
+  reference: string;
   loan_type: 'individual' | 'group' | 'overdraft';
   customer_id: string;
   branch_id: string;
   product_id: string;
+  applied_by: string;
   principal_pesewas: number;
   term_months: number;
+  duration_unit: 'days' | 'weeks' | 'months';
+  repayment_frequency: 'daily' | 'weekly' | 'biweekly' | 'monthly';
   interest_method: 'flat' | 'reducing_balance';
   annual_interest_rate_bps: number;
   fee_schedule: { code?: string; type: 'flat' | 'percent_of_principal'; amountPesewas?: number; rateBps?: number }[];
-  status: 'applied' | 'appraised' | 'pending_approval' | 'approved' | 'rejected' | 'disbursed' | 'closed' | 'written_off';
+  processing_fee_basis: 'flat' | 'percent_of_principal';
+  processing_fee_amount_pesewas: number | null;
+  processing_fee_rate_bps: number | null;
+  insurance_fee_basis: 'flat' | 'percent_of_principal' | null;
+  insurance_fee_amount_pesewas: number | null;
+  insurance_fee_rate_bps: number | null;
+  default_charge_basis: 'flat' | 'percent_of_principal';
+  default_charge_amount_pesewas: number | null;
+  default_charge_rate_bps: number | null;
+  repayment_grace_period_days: number;
+  installment_grace_period_days: number;
+  status:
+    | 'applied'
+    | 'appraised'
+    | 'pending_approval'
+    | 'approved'
+    | 'rejected'
+    | 'disbursed'
+    | 'paying'
+    | 'missed_payment'
+    | 'closed'
+    | 'written_off';
   disbursed_at: string | null;
   created_at: string;
+  // Attached by loanService's getLoan/listLoans (not stored on the loans
+  // table itself) — see attachLoanAggregates.
+  total_paid_pesewas: number;
+  balance_pesewas: number;
+  expected_pesewas: number;
 }
 
 export interface SavingsAccount {
@@ -513,12 +544,24 @@ export interface LoanProduct {
   min_rate_floor_bps: number | null;
   min_spread_floor_bps: number | null;
   concession_approval_threshold_bps: number;
-  allowed_repayment_frequencies: string[];
+  allowed_repayment_frequencies: ('daily' | 'weekly' | 'biweekly' | 'monthly')[];
+  duration_unit: 'days' | 'weeks' | 'months';
   min_term_months: number;
   max_term_months: number;
   min_principal_pesewas: number;
   max_principal_pesewas: number;
   fee_schedule: { code?: string; type: 'flat' | 'percent_of_principal'; amountPesewas?: number; rateBps?: number }[];
+  processing_fee_basis: 'flat' | 'percent_of_principal';
+  processing_fee_amount_pesewas: number | null;
+  processing_fee_rate_bps: number | null;
+  insurance_fee_basis: 'flat' | 'percent_of_principal' | null;
+  insurance_fee_amount_pesewas: number | null;
+  insurance_fee_rate_bps: number | null;
+  default_charge_basis: 'flat' | 'percent_of_principal';
+  default_charge_amount_pesewas: number | null;
+  default_charge_rate_bps: number | null;
+  repayment_grace_period_days: number;
+  installment_grace_period_days: number;
   par_bucket_days: number[];
   reason_codes: string[];
   status: 'active' | 'inactive';
@@ -541,6 +584,21 @@ export interface PolicyRateChange {
   new_rate_bps: number;
   effective_date: string;
   changed_by: string;
+  created_at: string;
+}
+
+export interface ApprovalRequest {
+  id: string;
+  action_type: string;
+  entity_type: string;
+  entity_id: string;
+  branch_id: string;
+  amount_pesewas: number | null;
+  requested_by: string;
+  status: 'pending' | 'approved' | 'rejected' | 'cancelled';
+  decided_by: string | null;
+  decided_at: string | null;
+  decision_reason: string | null;
   created_at: string;
 }
 
@@ -589,6 +647,7 @@ export interface LoanScheduleRow {
   interest_paid_pesewas: number;
   fees_paid_pesewas: number;
   status: 'pending' | 'partially_paid' | 'paid';
+  default_charge_applied: boolean;
 }
 
 export interface LoanRepayment {
@@ -607,6 +666,7 @@ export interface LoanCollateral {
   loan_id: string;
   description: string;
   estimated_value_pesewas: number | null;
+  document_url: string | null;
   verification_status: 'pending' | 'verified' | 'rejected';
 }
 
@@ -617,6 +677,7 @@ export interface LoanGuarantor {
   guarantor_name: string | null;
   guarantor_phone: string | null;
   guaranteed_amount_pesewas: number | null;
+  relationship: string | null;
   verification_status: 'pending' | 'verified' | 'rejected';
 }
 
@@ -626,6 +687,7 @@ export interface LoanCalculatorResult {
   termMonths: number;
   interestMethod: string;
   annualInterestRateBps: number;
+  repaymentFrequency: 'daily' | 'weekly' | 'biweekly' | 'monthly';
   feesPesewas: number;
   netDisbursedPesewas: number;
   totalInterestPesewas: number;

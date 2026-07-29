@@ -169,7 +169,7 @@ async function runRepaymentDueRemindersJob(pool, { asOfDate = todayIso(), daysAh
     `SELECT ls.id, ls.due_date, l.customer_id
        FROM loan_schedules ls
        JOIN loans l ON l.id = ls.loan_id AND ls.schedule_version = l.current_schedule_version
-      WHERE l.status = 'disbursed'
+      WHERE l.status IN ('disbursed', 'paying', 'missed_payment')
         AND ls.due_date >= $1 AND ls.due_date <= $1::date + ($2 || ' days')::interval
         AND (ls.principal_due_pesewas + ls.interest_due_pesewas + ls.fees_due_pesewas)
           > (ls.principal_paid_pesewas + ls.interest_paid_pesewas + ls.fees_paid_pesewas)`,

@@ -41,7 +41,37 @@ const todayIso = () => new Date().toISOString().slice(0, 10);
 
 // --- Loan products ---------------------------------------------------------
 
-const REPAYMENT_FREQUENCIES_SUPPORTED = ['monthly'];
+const REPAYMENT_FREQUENCIES_SUPPORTED = ['daily', 'weekly', 'biweekly', 'monthly'];
+const FEE_BASES = ['flat', 'percent_of_principal'];
+const DURATION_UNITS = ['days', 'weeks', 'months'];
+
+/**
+ * Validates+resolves one basis/amount/rate field group (processing fee,
+ * insurance fee, or default charge — see migration 060). `optional: true`
+ * (insurance fee only) allows basis to be omitted entirely, meaning "this
+ * offer has none"; the other two are always required.
+ */
+function resolveFeeBasisFields({ label, basis, amountPesewas, rateBps, optional = false }) {
+  if (optional && basis === null) {
+    return { basis: null, amountPesewas: null, rateBps: null };
+  }
+  if (!FEE_BASES.includes(basis)) {
+    throw new LoanValidationError(`${label}Basis must be 'flat' or 'percent_of_principal'${optional ? ' (or omitted)' : ''}`);
+  }
+  if (basis === 'flat') {
+    // amountPesewas may arrive as a string here when it's a merge fallback
+    // from a DB row (pg returns BIGINT columns as strings, not numbers).
+    const amount = amountPesewas === null || amountPesewas === undefined ? amountPesewas : Number(amountPesewas);
+    if (!Number.isInteger(amount) || amount < 0) {
+      throw new LoanValidationError(`${label}AmountPesewas must be a non-negative integer for a flat ${label}`);
+    }
+    return { basis, amountPesewas: amount, rateBps: null };
+  }
+  if (!Number.isInteger(rateBps) || rateBps < 0) {
+    throw new LoanValidationError(`${label}RateBps must be a non-negative integer for a percent_of_principal ${label}`);
+  }
+  return { basis, amountPesewas: null, rateBps };
+}
 
 /**
  * Validates+resolves the fixed/floating rate fields shared by
@@ -79,13 +109,8 @@ async function resolveRateFields(pool, { rateType, annualInterestRateBps, refere
 function assertAllowedRepaymentFrequencies(allowedRepaymentFrequencies) {
   const unsupported = allowedRepaymentFrequencies.filter((f) => !REPAYMENT_FREQUENCIES_SUPPORTED.includes(f));
   if (unsupported.length > 0) {
-    // Deliberate scope boundary, not a bug: loanMath.js's schedule
-    // generator amortizes MONTHLY only (see its module comment). This
-    // field records real product intent without silently implying a
-    // repayment cadence this codebase doesn't actually amortize — see
-    // Decisions_Log.md.
     throw new LoanValidationError(
-      `allowedRepaymentFrequencies only supports ${REPAYMENT_FREQUENCIES_SUPPORTED.join(', ')} today (got: ${unsupported.join(', ')}) — the loan schedule generator does not yet amortize on any other cadence`
+      `allowedRepaymentFrequencies only supports ${REPAYMENT_FREQUENCIES_SUPPORTED.join(', ')} (got: ${unsupported.join(', ')})`
     );
   }
 }
@@ -106,6 +131,7 @@ async function createLoanProduct(pool, params) {
     minSpreadFloorBps = null,
     concessionApprovalThresholdBps = 0,
     allowedRepaymentFrequencies = ['monthly'],
+    durationUnit = 'months',
     minTermMonths,
     maxTermMonths,
     minPrincipalPesewas,
@@ -113,11 +139,25 @@ async function createLoanProduct(pool, params) {
     feeSchedule = [],
     parBucketDays = [30, 60, 90],
     reasonCodes = [],
+    processingFeeBasis = 'flat',
+    processingFeeAmountPesewas = 0,
+    processingFeeRateBps = null,
+    insuranceFeeBasis = null,
+    insuranceFeeAmountPesewas = null,
+    insuranceFeeRateBps = null,
+    defaultChargeBasis = 'flat',
+    defaultChargeAmountPesewas = 0,
+    defaultChargeRateBps = null,
+    repaymentGracePeriodDays = 0,
+    installmentGracePeriodDays = 0,
     createdBy,
   } = params;
 
   if (!name || !code || !loanType || !interestMethod || !createdBy) {
     throw new LoanValidationError('name, code, loanType, interestMethod, and createdBy are required');
+  }
+  if (!DURATION_UNITS.includes(durationUnit)) {
+    throw new LoanValidationError(`durationUnit must be one of ${DURATION_UNITS.join(', ')}`);
   }
   assertAllowedRepaymentFrequencies(allowedRepaymentFrequencies);
   const rate = await resolveRateFields(pool, { rateType, annualInterestRateBps, referenceRateId, spreadBps, resetFrequency });
@@ -126,13 +166,28 @@ async function createLoanProduct(pool, params) {
   // fee config at disbursement time, when money is moving.
   loanMath.computeFeesPesewas(feeSchedule, 100000);
 
+  const processingFee = resolveFeeBasisFields({ label: 'processingFee', basis: processingFeeBasis, amountPesewas: processingFeeAmountPesewas, rateBps: processingFeeRateBps });
+  const insuranceFee = resolveFeeBasisFields({ label: 'insuranceFee', basis: insuranceFeeBasis, amountPesewas: insuranceFeeAmountPesewas, rateBps: insuranceFeeRateBps, optional: true });
+  const defaultCharge = resolveFeeBasisFields({ label: 'defaultCharge', basis: defaultChargeBasis, amountPesewas: defaultChargeAmountPesewas, rateBps: defaultChargeRateBps });
+  if (!Number.isInteger(repaymentGracePeriodDays) || repaymentGracePeriodDays < 0) {
+    throw new LoanValidationError('repaymentGracePeriodDays must be a non-negative integer');
+  }
+  if (!Number.isInteger(installmentGracePeriodDays) || installmentGracePeriodDays < 0) {
+    throw new LoanValidationError('installmentGracePeriodDays must be a non-negative integer');
+  }
+
   const { rows } = await pool.query(
     `INSERT INTO loan_products
        (name, code, description, loan_type, interest_method, annual_interest_rate_bps, rate_type, reference_rate_id,
         spread_bps, reset_frequency, min_rate_floor_bps, min_spread_floor_bps, concession_approval_threshold_bps,
-        allowed_repayment_frequencies, min_term_months, max_term_months, min_principal_pesewas, max_principal_pesewas,
-        fee_schedule, par_bucket_days, reason_codes, created_by)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+        allowed_repayment_frequencies, duration_unit, min_term_months, max_term_months, min_principal_pesewas, max_principal_pesewas,
+        fee_schedule, par_bucket_days, reason_codes,
+        processing_fee_basis, processing_fee_amount_pesewas, processing_fee_rate_bps,
+        insurance_fee_basis, insurance_fee_amount_pesewas, insurance_fee_rate_bps,
+        default_charge_basis, default_charge_amount_pesewas, default_charge_rate_bps,
+        repayment_grace_period_days, installment_grace_period_days, created_by)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22,
+             $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34)
      RETURNING *`,
     [
       name,
@@ -149,6 +204,7 @@ async function createLoanProduct(pool, params) {
       minSpreadFloorBps,
       concessionApprovalThresholdBps,
       allowedRepaymentFrequencies,
+      durationUnit,
       minTermMonths,
       maxTermMonths,
       minPrincipalPesewas,
@@ -156,6 +212,17 @@ async function createLoanProduct(pool, params) {
       JSON.stringify(feeSchedule),
       parBucketDays,
       reasonCodes,
+      processingFee.basis,
+      processingFee.amountPesewas,
+      processingFee.rateBps,
+      insuranceFee.basis,
+      insuranceFee.amountPesewas,
+      insuranceFee.rateBps,
+      defaultCharge.basis,
+      defaultCharge.amountPesewas,
+      defaultCharge.rateBps,
+      repaymentGracePeriodDays,
+      installmentGracePeriodDays,
       createdBy,
     ]
   );
@@ -218,6 +285,7 @@ async function updateLoanProduct(pool, { productId, updatedBy, actorBranchId, ..
     minSpreadFloorBps: fields.minSpreadFloorBps !== undefined ? fields.minSpreadFloorBps : before.min_spread_floor_bps,
     concessionApprovalThresholdBps: fields.concessionApprovalThresholdBps ?? before.concession_approval_threshold_bps,
     allowedRepaymentFrequencies: fields.allowedRepaymentFrequencies ?? before.allowed_repayment_frequencies,
+    durationUnit: fields.durationUnit ?? before.duration_unit,
     minTermMonths: fields.minTermMonths ?? before.min_term_months,
     maxTermMonths: fields.maxTermMonths ?? before.max_term_months,
     minPrincipalPesewas: fields.minPrincipalPesewas ?? before.min_principal_pesewas,
@@ -225,10 +293,24 @@ async function updateLoanProduct(pool, { productId, updatedBy, actorBranchId, ..
     feeSchedule: fields.feeSchedule ?? before.fee_schedule,
     parBucketDays: fields.parBucketDays ?? before.par_bucket_days,
     reasonCodes: fields.reasonCodes ?? before.reason_codes,
+    processingFeeBasis: fields.processingFeeBasis ?? before.processing_fee_basis,
+    processingFeeAmountPesewas: fields.processingFeeAmountPesewas !== undefined ? fields.processingFeeAmountPesewas : before.processing_fee_amount_pesewas,
+    processingFeeRateBps: fields.processingFeeRateBps !== undefined ? fields.processingFeeRateBps : before.processing_fee_rate_bps,
+    insuranceFeeBasis: fields.insuranceFeeBasis !== undefined ? fields.insuranceFeeBasis : before.insurance_fee_basis,
+    insuranceFeeAmountPesewas: fields.insuranceFeeAmountPesewas !== undefined ? fields.insuranceFeeAmountPesewas : before.insurance_fee_amount_pesewas,
+    insuranceFeeRateBps: fields.insuranceFeeRateBps !== undefined ? fields.insuranceFeeRateBps : before.insurance_fee_rate_bps,
+    defaultChargeBasis: fields.defaultChargeBasis ?? before.default_charge_basis,
+    defaultChargeAmountPesewas: fields.defaultChargeAmountPesewas !== undefined ? fields.defaultChargeAmountPesewas : before.default_charge_amount_pesewas,
+    defaultChargeRateBps: fields.defaultChargeRateBps !== undefined ? fields.defaultChargeRateBps : before.default_charge_rate_bps,
+    repaymentGracePeriodDays: fields.repaymentGracePeriodDays ?? before.repayment_grace_period_days,
+    installmentGracePeriodDays: fields.installmentGracePeriodDays ?? before.installment_grace_period_days,
   };
 
   if (!['active', 'inactive'].includes(merged.status)) {
     throw new LoanValidationError("status must be 'active' or 'inactive'");
+  }
+  if (!DURATION_UNITS.includes(merged.durationUnit)) {
+    throw new LoanValidationError(`durationUnit must be one of ${DURATION_UNITS.join(', ')}`);
   }
   assertAllowedRepaymentFrequencies(merged.allowedRepaymentFrequencies);
   const rate = await resolveRateFields(pool, {
@@ -239,16 +321,29 @@ async function updateLoanProduct(pool, { productId, updatedBy, actorBranchId, ..
     resetFrequency: merged.resetFrequency,
   });
   loanMath.computeFeesPesewas(merged.feeSchedule, 100000);
+  const processingFee = resolveFeeBasisFields({ label: 'processingFee', basis: merged.processingFeeBasis, amountPesewas: merged.processingFeeAmountPesewas, rateBps: merged.processingFeeRateBps });
+  const insuranceFee = resolveFeeBasisFields({ label: 'insuranceFee', basis: merged.insuranceFeeBasis, amountPesewas: merged.insuranceFeeAmountPesewas, rateBps: merged.insuranceFeeRateBps, optional: true });
+  const defaultCharge = resolveFeeBasisFields({ label: 'defaultCharge', basis: merged.defaultChargeBasis, amountPesewas: merged.defaultChargeAmountPesewas, rateBps: merged.defaultChargeRateBps });
+  if (!Number.isInteger(merged.repaymentGracePeriodDays) || merged.repaymentGracePeriodDays < 0) {
+    throw new LoanValidationError('repaymentGracePeriodDays must be a non-negative integer');
+  }
+  if (!Number.isInteger(merged.installmentGracePeriodDays) || merged.installmentGracePeriodDays < 0) {
+    throw new LoanValidationError('installmentGracePeriodDays must be a non-negative integer');
+  }
 
   const { rows } = await pool.query(
     `UPDATE loan_products SET
        name = $1, description = $2, status = $3, interest_method = $4, annual_interest_rate_bps = $5,
        rate_type = $6, reference_rate_id = $7, spread_bps = $8, reset_frequency = $9,
        min_rate_floor_bps = $10, min_spread_floor_bps = $11, concession_approval_threshold_bps = $12,
-       allowed_repayment_frequencies = $13, min_term_months = $14, max_term_months = $15,
-       min_principal_pesewas = $16, max_principal_pesewas = $17, fee_schedule = $18,
-       par_bucket_days = $19, reason_codes = $20, updated_at = now()
-     WHERE id = $21
+       allowed_repayment_frequencies = $13, duration_unit = $14, min_term_months = $15, max_term_months = $16,
+       min_principal_pesewas = $17, max_principal_pesewas = $18, fee_schedule = $19,
+       par_bucket_days = $20, reason_codes = $21,
+       processing_fee_basis = $22, processing_fee_amount_pesewas = $23, processing_fee_rate_bps = $24,
+       insurance_fee_basis = $25, insurance_fee_amount_pesewas = $26, insurance_fee_rate_bps = $27,
+       default_charge_basis = $28, default_charge_amount_pesewas = $29, default_charge_rate_bps = $30,
+       repayment_grace_period_days = $31, installment_grace_period_days = $32, updated_at = now()
+     WHERE id = $33
      RETURNING *`,
     [
       merged.name,
@@ -264,6 +359,7 @@ async function updateLoanProduct(pool, { productId, updatedBy, actorBranchId, ..
       merged.minSpreadFloorBps,
       merged.concessionApprovalThresholdBps,
       merged.allowedRepaymentFrequencies,
+      merged.durationUnit,
       merged.minTermMonths,
       merged.maxTermMonths,
       merged.minPrincipalPesewas,
@@ -271,6 +367,17 @@ async function updateLoanProduct(pool, { productId, updatedBy, actorBranchId, ..
       JSON.stringify(merged.feeSchedule),
       merged.parBucketDays,
       merged.reasonCodes,
+      processingFee.basis,
+      processingFee.amountPesewas,
+      processingFee.rateBps,
+      insuranceFee.basis,
+      insuranceFee.amountPesewas,
+      insuranceFee.rateBps,
+      defaultCharge.basis,
+      defaultCharge.amountPesewas,
+      defaultCharge.rateBps,
+      merged.repaymentGracePeriodDays,
+      merged.installmentGracePeriodDays,
       productId,
     ]
   );
@@ -289,22 +396,63 @@ async function updateLoanProduct(pool, { productId, updatedBy, actorBranchId, ..
   return after;
 }
 
+function assertRepaymentFrequencyAllowed(product, repaymentFrequency) {
+  if (!product.allowed_repayment_frequencies.includes(repaymentFrequency)) {
+    throw new LoanValidationError(
+      `repaymentFrequency '${repaymentFrequency}' is not offered by product ${product.code} (allowed: ${product.allowed_repayment_frequencies.join(', ')})`
+    );
+  }
+}
+
+/**
+ * Processing fee + insurance fee (both migration 060 basis/amount/rate
+ * fields) — netted from the disbursed amount alongside the generic
+ * fee_schedule array, same one-time-at-origination treatment. Default
+ * charge is NOT included here: it only ever applies later, to a specific
+ * missed installment (see refreshLoanStatus), never netted at
+ * disbursement. Takes either a loan_products row (preview) or a loans row
+ * (actual disbursement, since loans snapshot these fields at application
+ * time) — both share the same column names.
+ */
+function computeOriginationFeesPesewas(entity, principalPesewas) {
+  const processingFeePesewas = loanMath.computeFeeAmountPesewas({
+    basis: entity.processing_fee_basis,
+    amountPesewas: entity.processing_fee_amount_pesewas !== null ? Number(entity.processing_fee_amount_pesewas) : null,
+    rateBps: entity.processing_fee_rate_bps,
+    principalPesewas,
+  });
+  const insuranceFeePesewas = entity.insurance_fee_basis
+    ? loanMath.computeFeeAmountPesewas({
+        basis: entity.insurance_fee_basis,
+        amountPesewas: entity.insurance_fee_amount_pesewas !== null ? Number(entity.insurance_fee_amount_pesewas) : null,
+        rateBps: entity.insurance_fee_rate_bps,
+        principalPesewas,
+      })
+    : 0;
+  return processingFeePesewas + insuranceFeePesewas;
+}
+
 /**
  * Loan calculator — pure preview, creates nothing. Usable by staff
- * pre-appraisal and by customer-facing self-service (no commitment).
+ * pre-appraisal and by customer-facing self-service (no commitment), and
+ * reused at application time (item 3a) to preview the schedule for the
+ * frequency the applicant is about to pick, before they submit.
  */
-async function calculateLoan(pool, { productId, principalPesewas, termMonths, startDate = todayIso() }) {
+async function calculateLoan(pool, { productId, principalPesewas, termMonths, repaymentFrequency = 'monthly', startDate = todayIso() }) {
   const product = await getLoanProduct(pool, productId);
   assertWithinProductLimits(product, principalPesewas, termMonths);
+  assertRepaymentFrequencyAllowed(product, repaymentFrequency);
 
   const schedule = loanMath.generateLoanSchedule({
     principalPesewas,
     termMonths,
     annualInterestRateBps: product.annual_interest_rate_bps,
     interestMethod: product.interest_method,
-    startDate,
+    startDate: loanMath.addDaysToDateString(startDate, product.repayment_grace_period_days),
+    repaymentFrequency,
+    durationUnit: product.duration_unit,
   });
-  const feesPesewas = loanMath.computeFeesPesewas(product.fee_schedule, principalPesewas);
+  const feesPesewas = loanMath.computeFeesPesewas(product.fee_schedule, principalPesewas) + computeOriginationFeesPesewas(product, principalPesewas);
   const totalInterestPesewas = schedule.reduce((s, r) => s + r.interestDuePesewas, 0);
 
   return {
@@ -313,6 +461,7 @@ async function calculateLoan(pool, { productId, principalPesewas, termMonths, st
     termMonths,
     interestMethod: product.interest_method,
     annualInterestRateBps: product.annual_interest_rate_bps,
+    repaymentFrequency,
     feesPesewas,
     netDisbursedPesewas: principalPesewas - feesPesewas,
     totalInterestPesewas,
@@ -418,10 +567,199 @@ async function resetFloatingRateProducts(pool, { asOfDate = todayIso(), resetBy,
 
 // --- Loan application ------------------------------------------------------
 
+// Every status a non-overdraft loan can hold between disbursement and
+// closure/write-off — used both by refreshLoanStatus (below) and by every
+// other place in this module (and analyticsService/complianceService/
+// systemAdminService) that used to mean "currently open" by checking
+// `status = 'disbursed'` literally. See Decisions_Log.md "Loan module
+// amendment" for the full list of call sites this touched.
+const ACTIVE_LOAN_STATUSES = ['disbursed', 'paying', 'missed_payment'];
+
+/**
+ * Loan module amendment (item 5): recomputes — and, if it changed,
+ * persists — a disbursed non-overdraft loan's status between 'paying' and
+ * 'missed_payment' from its own schedule, auto-applying the offer's
+ * default charge (added to fees_due_pesewas, collected through the same
+ * fees-then-interest-then-principal waterfall as any other fee) to any
+ * installment that newly crosses past its installment_grace_period_days.
+ * Called at read-time (getLoan/listLoans) and once more after
+ * postRepayment — deliberately NOT from a cron: a daily auto-flag job was
+ * one of the item-7 extras explicitly deferred this pass, not built (see
+ * Decisions_Log.md) — so a loan's status can lag by as much as the gap
+ * between two reads, the same tradeoff getArrearsReport's live
+ * days-overdue computation already accepts. Overdraft facilities (no
+ * installment schedule) are skipped entirely and stay on 'disbursed' for
+ * their whole active life, unchanged from before this feature.
+ */
+async function refreshLoanStatus(pool, loan) {
+  if (loan.loan_type === 'overdraft' || !ACTIVE_LOAN_STATUSES.includes(loan.status)) {
+    return loan;
+  }
+
+  const { rows: scheduleRows } = await pool.query(
+    `SELECT id, due_date, status, fees_due_pesewas, default_charge_applied
+       FROM loan_schedules
+      WHERE loan_id = $1 AND schedule_version = $2
+      ORDER BY installment_number`,
+    [loan.id, loan.current_schedule_version]
+  );
+  const asOfDate = todayIso();
+  const toDateStr = (d) => (d instanceof Date ? d.toISOString().slice(0, 10) : d);
+
+  const defaultChargePesewas = loanMath.computeFeeAmountPesewas({
+    basis: loan.default_charge_basis,
+    amountPesewas: loan.default_charge_amount_pesewas !== null ? Number(loan.default_charge_amount_pesewas) : null,
+    rateBps: loan.default_charge_rate_bps,
+    principalPesewas: Number(loan.principal_pesewas),
+  });
+  for (const row of scheduleRows) {
+    if (row.status === 'paid' || row.default_charge_applied || defaultChargePesewas <= 0) continue;
+    const graceDeadline = loanMath.addDaysToDateString(toDateStr(row.due_date), loan.installment_grace_period_days);
+    if (graceDeadline > asOfDate) continue;
+
+    const newFeesDue = Number(row.fees_due_pesewas) + defaultChargePesewas;
+    await pool.query('UPDATE loan_schedules SET fees_due_pesewas = $1, default_charge_applied = true WHERE id = $2', [
+      newFeesDue,
+      row.id,
+    ]);
+    await auditLog.record(pool, {
+      userId: null,
+      branchId: loan.branch_id,
+      action: 'loan.default_charge_applied',
+      entityType: 'loan',
+      entityId: loan.id,
+      afterState: { scheduleId: Number(row.id), defaultChargePesewas },
+    });
+  }
+
+  const newStatus = loanMath.computeActiveLoanStatus({
+    scheduleRows: scheduleRows.map((r) => ({ dueDate: toDateStr(r.due_date), status: r.status })),
+    installmentGracePeriodDays: loan.installment_grace_period_days,
+    asOfDate,
+  });
+  if (newStatus === loan.status) return loan;
+
+  const { rows } = await pool.query('UPDATE loans SET status = $1, updated_at = now() WHERE id = $2 RETURNING *', [
+    newStatus,
+    loan.id,
+  ]);
+  await auditLog.record(pool, {
+    userId: null,
+    branchId: loan.branch_id,
+    action: 'loan.status_recomputed',
+    entityType: 'loan',
+    entityId: loan.id,
+    beforeState: { status: loan.status },
+    afterState: { status: newStatus },
+  });
+  return rows[0];
+}
+
+/**
+ * Manually waives an installment's outstanding default charge (the
+ * "waive penalties" side of item 4's repayment-management action panel —
+ * there is no separate manual "apply" action since the charge already
+ * applies automatically via refreshLoanStatus). Reduces fees_due_pesewas
+ * down to whatever fees are already paid (never below — a waiver cannot
+ * claw back cash already collected); the audit_log entry (before/after
+ * fees_due_pesewas) is the durable record of the waiver, matching how
+ * every other financial adjustment in this codebase is recorded, rather
+ * than a second parallel ledger column.
+ */
+async function waiveDefaultCharge(pool, { loanId, scheduleId, waivedBy, reason }) {
+  if (!waivedBy || !reason) throw new LoanValidationError('waivedBy and reason are required');
+  const loan = await getLoan(pool, loanId);
+  const { rows: scheduleRows } = await pool.query('SELECT * FROM loan_schedules WHERE id = $1 AND loan_id = $2', [
+    scheduleId,
+    loanId,
+  ]);
+  const schedule = scheduleRows[0];
+  if (!schedule) throw new LoanNotFoundError(`loan_schedule ${scheduleId} not found on loan ${loanId}`);
+  if (!schedule.default_charge_applied) {
+    throw new LoanConflictError(`loan_schedule ${scheduleId} has no default charge applied to waive`);
+  }
+
+  // Floors at what's already been paid — a waiver forgives the remaining
+  // OUTSTANDING charge, it can never claw back cash already collected.
+  // If principal and interest were already fully repaid and the charge
+  // was the only thing still outstanding, waiving it means nothing is
+  // owed on this installment anymore — flip it to 'paid' so the next
+  // status recompute correctly sees it as settled, not still missed.
+  const newFeesDue = Number(schedule.fees_paid_pesewas);
+  const nowFullyPaid =
+    Number(schedule.principal_paid_pesewas) >= Number(schedule.principal_due_pesewas) &&
+    Number(schedule.interest_paid_pesewas) >= Number(schedule.interest_due_pesewas);
+  const { rows } = await pool.query(
+    `UPDATE loan_schedules SET fees_due_pesewas = $1, status = $2 WHERE id = $3 RETURNING *`,
+    [newFeesDue, nowFullyPaid ? 'paid' : schedule.status, scheduleId]
+  );
+
+  await auditLog.record(pool, {
+    userId: waivedBy,
+    branchId: loan.branch_id,
+    action: 'loan.default_charge_waived',
+    entityType: 'loan',
+    entityId: loanId,
+    beforeState: { scheduleId, feesDuePesewas: Number(schedule.fees_due_pesewas), reason },
+    afterState: { scheduleId, feesDuePesewas: Number(rows[0].fees_due_pesewas) },
+  });
+
+  return rows[0];
+}
+
+/**
+ * Attaches per-loan repayment aggregates the Loans & Credit table needs
+ * (item 4): totalPaidPesewas (everything collected across principal +
+ * interest + fees), balancePesewas (outstanding principal), and
+ * expectedPesewas (what should have been paid by today per the schedule
+ * — sum of installments due on/before today — a PAR-style comparison
+ * against totalPaidPesewas). A separate query rather than joined into the
+ * main SELECT so refreshLoanStatus's own `UPDATE loans ... RETURNING *`
+ * (which only ever touches the loans table) can't silently drop these
+ * columns off a just-recomputed row. Overdraft facilities have no
+ * schedule at all, so they fall back to balance = principal (the
+ * approved limit) and 0 paid/expected — a savings-account-side "drawn
+ * balance" concept doesn't apply here.
+ */
+async function attachLoanAggregates(pool, loans) {
+  if (loans.length === 0) return loans;
+  const ids = loans.map((l) => Number(l.id));
+  const { rows } = await pool.query(
+    `SELECT l.id AS loan_id,
+            COUNT(s.id) AS schedule_row_count,
+            COALESCE(SUM(s.principal_paid_pesewas + s.interest_paid_pesewas + s.fees_paid_pesewas), 0) AS total_paid_pesewas,
+            COALESCE(SUM(s.principal_due_pesewas - s.principal_paid_pesewas), 0) AS outstanding_principal_pesewas,
+            COALESCE(SUM(CASE WHEN s.due_date <= CURRENT_DATE
+                              THEN s.principal_due_pesewas + s.interest_due_pesewas + s.fees_due_pesewas
+                              ELSE 0 END), 0) AS expected_pesewas
+       FROM loans l
+       LEFT JOIN loan_schedules s ON s.loan_id = l.id AND s.schedule_version = l.current_schedule_version
+      WHERE l.id = ANY($1)
+      GROUP BY l.id`,
+    [ids]
+  );
+  const byId = new Map(rows.map((r) => [Number(r.loan_id), r]));
+  return loans.map((loan) => {
+    const agg = byId.get(Number(loan.id));
+    // No schedule rows at all (not yet disbursed, or an overdraft, which
+    // never gets one) -> nothing paid/expected yet, and the full
+    // principal (or approved limit) is the outstanding balance.
+    const hasSchedule = agg && Number(agg.schedule_row_count) > 0;
+    return {
+      ...loan,
+      total_paid_pesewas: hasSchedule ? Number(agg.total_paid_pesewas) : 0,
+      balance_pesewas: hasSchedule ? Number(agg.outstanding_principal_pesewas) : Number(loan.principal_pesewas),
+      expected_pesewas: hasSchedule ? Number(agg.expected_pesewas) : 0,
+    };
+  });
+}
+
 async function getLoan(pool, loanId) {
   const { rows } = await pool.query('SELECT * FROM loans WHERE id = $1', [loanId]);
   if (!rows[0]) throw new LoanNotFoundError(`loan ${loanId} not found`);
-  return rows[0];
+  const loan = await refreshLoanStatus(pool, rows[0]);
+  const [withAggregates] = await attachLoanAggregates(pool, [loan]);
+  return withAggregates;
 }
 
 async function listLoans(pool, { branchId, customerId, status, productId } = {}) {
@@ -438,7 +776,13 @@ async function listLoans(pool, { branchId, customerId, status, productId } = {})
   addFilter('product_id', productId);
   const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
   const { rows } = await pool.query(`SELECT * FROM loans ${where} ORDER BY created_at DESC`, params);
-  return rows;
+  // Recomputed live rather than persisted by a background job (see
+  // refreshLoanStatus) — a loan whose true status just changed can
+  // therefore show that new status even though it was selected by its
+  // OLD status matching the `status` filter above; the same live-compute
+  // tradeoff getArrearsReport already accepts.
+  const refreshed = await Promise.all(rows.map((loan) => refreshLoanStatus(pool, loan)));
+  return attachLoanAggregates(pool, refreshed);
 }
 
 /**
@@ -468,12 +812,26 @@ async function findGroupCreditBlockers(db, groupCustomerId) {
   return rows;
 }
 
+/**
+ * Loan references are `LN-<branchCode>-<zero-padded 5-digit sequence>`,
+ * matching the existing `SAV-<branchCode>-#####` convention
+ * (savingsService.generateAccountNo) rather than a date-based format —
+ * see Decisions_Log.md.
+ */
+async function generateLoanReference(db, branchId) {
+  const { rows } = await db.query('SELECT code FROM branches WHERE id = $1', [branchId]);
+  if (!rows[0]) throw new LoanValidationError(`branch ${branchId} not found`);
+  const { rows: seqRows } = await db.query('SELECT COUNT(*)::int AS n FROM loans WHERE branch_id = $1', [branchId]);
+  return `LN-${rows[0].code}-${String(seqRows[0].n + 1).padStart(5, '0')}`;
+}
+
 async function applyForLoan(pool, params) {
   const {
     customerId,
     productId,
     principalPesewas,
     termMonths,
+    repaymentFrequency = 'monthly',
     reasonCode = null,
     purposeNotes = null,
     overdraftSavingsAccountId = null,
@@ -488,6 +846,13 @@ async function applyForLoan(pool, params) {
     throw new LoanConflictError(`loan_product ${productId} is not active`);
   }
   assertWithinProductLimits(product, principalPesewas, termMonths);
+  // Overdraft facilities never generate an installment schedule (see
+  // disburseLoan/activateOverdraft), so a repayment frequency has no
+  // meaning for them — the field just stays at its 'monthly' default,
+  // unused.
+  if (product.loan_type !== 'overdraft') {
+    assertRepaymentFrequencyAllowed(product, repaymentFrequency);
+  }
 
   if (product.reason_codes.length > 0 && reasonCode && !product.reason_codes.includes(reasonCode)) {
     throw new LoanValidationError(`reasonCode '${reasonCode}' is not allowed by product ${product.code}`);
@@ -558,12 +923,18 @@ async function applyForLoan(pool, params) {
     throw new LoanValidationError(`overdraftSavingsAccountId is only applicable to overdraft loans`);
   }
 
+  const reference = await generateLoanReference(pool, customer.branch_id);
+
   const { rows } = await pool.query(
     `INSERT INTO loans
        (loan_type, customer_id, branch_id, product_id, principal_pesewas, term_months,
         interest_method, annual_interest_rate_bps, fee_schedule, reason_code, purpose_notes,
-        overdraft_savings_account_id, applied_by)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        overdraft_savings_account_id, applied_by, reference, repayment_frequency, duration_unit,
+        processing_fee_basis, processing_fee_amount_pesewas, processing_fee_rate_bps,
+        insurance_fee_basis, insurance_fee_amount_pesewas, insurance_fee_rate_bps,
+        default_charge_basis, default_charge_amount_pesewas, default_charge_rate_bps,
+        repayment_grace_period_days, installment_grace_period_days)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
      RETURNING *`,
     [
       product.loan_type,
@@ -576,12 +947,27 @@ async function applyForLoan(pool, params) {
       product.annual_interest_rate_bps,
       // Snapshotted here (not read live at disbursement) for the same
       // reason interest_method/annual_interest_rate_bps already are —
-      // see migration 055_loans_fee_schedule_snapshot.sql.
+      // see migration 055_loans_fee_schedule_snapshot.sql, and now
+      // migration 061 for the new offer fields below.
       JSON.stringify(product.fee_schedule),
       reasonCode,
       purposeNotes,
       overdraftSavingsAccountId,
       appliedBy,
+      reference,
+      repaymentFrequency,
+      product.duration_unit,
+      product.processing_fee_basis,
+      product.processing_fee_amount_pesewas,
+      product.processing_fee_rate_bps,
+      product.insurance_fee_basis,
+      product.insurance_fee_amount_pesewas,
+      product.insurance_fee_rate_bps,
+      product.default_charge_basis,
+      product.default_charge_amount_pesewas,
+      product.default_charge_rate_bps,
+      product.repayment_grace_period_days,
+      product.installment_grace_period_days,
     ]
   );
   const loan = rows[0];
@@ -693,7 +1079,7 @@ async function requestLoanApproval(pool, { loanId, requestedBy }) {
   return approvalRequest;
 }
 
-/** Registered as the 'loan.approve' execution handler — flips the loan to `approved` (or `rejected`). Disbursement stays a separate, explicitly-permissioned action. */
+/** Registered as the 'loan.approve' execution handler — flips the loan to `approved`. Disbursement stays a separate, explicitly-permissioned action. */
 async function applyLoanApprovalDecision(approvalRequest, db) {
   const loanId = Number(approvalRequest.entity_id);
   const { rows: beforeRows } = await db.query('SELECT * FROM loans WHERE id = $1 FOR UPDATE', [loanId]);
@@ -709,6 +1095,37 @@ async function applyLoanApprovalDecision(approvalRequest, db) {
     userId: approvalRequest.decided_by,
     branchId: before.branch_id,
     action: 'loan.approved',
+    entityType: 'loan',
+    entityId: loanId,
+    beforeState: { status: before.status },
+    afterState: { status: rows[0].status },
+  });
+}
+
+/**
+ * Registered as the 'loan.approve' REJECTION handler (see
+ * approvalWorkflow.registerRejectionHandler) — flips the loan to
+ * `rejected`. Loan module amendment item 6: before this existed, a
+ * rejected approval left the loan stuck on `pending_approval` forever,
+ * since approvalWorkflow.decide() only ever dispatched a side effect on
+ * approval. `rejected` was already a reachable loans.status value (via
+ * appraisal decline — see migration 023) but never via this path.
+ */
+async function applyLoanRejectionDecision(approvalRequest, db) {
+  const loanId = Number(approvalRequest.entity_id);
+  const { rows: beforeRows } = await db.query('SELECT * FROM loans WHERE id = $1 FOR UPDATE', [loanId]);
+  const before = beforeRows[0];
+  if (!before) throw new LoanNotFoundError(`loan ${loanId} not found`);
+
+  const { rows } = await db.query(
+    "UPDATE loans SET status = 'rejected', updated_at = now() WHERE id = $1 RETURNING *",
+    [loanId]
+  );
+
+  await auditLog.record(db, {
+    userId: approvalRequest.decided_by,
+    branchId: before.branch_id,
+    action: 'loan.approval_rejected',
     entityType: 'loan',
     entityId: loanId,
     beforeState: { status: before.status },
@@ -865,20 +1282,29 @@ async function disburseLoan(pool, { loanId, disbursedBy, disbursementDate = toda
     // product's fee_schedule can be edited after this loan applied (see
     // updateLoanProduct), and that must never silently change what this
     // loan is actually charged at disbursement. See migration
-    // 055_loans_fee_schedule_snapshot.sql.
-    feesPesewas = loanMath.computeFeesPesewas(loan.fee_schedule, Number(loan.principal_pesewas));
+    // 055_loans_fee_schedule_snapshot.sql, and migration 061 for
+    // processing/insurance fees, netted the same way.
+    feesPesewas =
+      loanMath.computeFeesPesewas(loan.fee_schedule, Number(loan.principal_pesewas)) +
+      computeOriginationFeesPesewas(loan, Number(loan.principal_pesewas));
     if (feesPesewas >= Number(loan.principal_pesewas)) {
       throw new LoanValidationError(
         `computed fees (${feesPesewas}) must be less than the principal (${loan.principal_pesewas})`
       );
     }
 
+    // First installment is due repaymentGracePeriodDays after
+    // disbursement, not on the disbursement date itself — see migration
+    // 060's comment distinguishing this from installmentGracePeriodDays.
+    const scheduleStartDate = loanMath.addDaysToDateString(disbursementDate, loan.repayment_grace_period_days);
     const schedule = loanMath.generateLoanSchedule({
       principalPesewas: Number(loan.principal_pesewas),
       termMonths: loan.term_months,
       annualInterestRateBps: loan.annual_interest_rate_bps,
       interestMethod: loan.interest_method,
-      startDate: disbursementDate,
+      startDate: scheduleStartDate,
+      repaymentFrequency: loan.repayment_frequency,
+      durationUnit: loan.duration_unit,
     });
 
     // Module 12: roll each due date forward past non-working days — see
@@ -1172,7 +1598,7 @@ async function postRepayment(pool, { loanId, amountPesewas, paymentDate = todayI
     const { rows: loanRows } = await client.query('SELECT * FROM loans WHERE id = $1 FOR UPDATE', [loanId]);
     const loan = loanRows[0];
     if (!loan) throw new LoanNotFoundError(`loan ${loanId} not found`);
-    if (loan.status !== 'disbursed') {
+    if (!ACTIVE_LOAN_STATUSES.includes(loan.status)) {
       throw new LoanConflictError(`loan ${loanId} is not open for repayment (status: ${loan.status})`);
     }
 
@@ -1292,6 +1718,14 @@ async function postRepayment(pool, { loanId, amountPesewas, paymentDate = todayI
     afterState: { amountPesewas, principalTotal, interestTotal, feesTotal, journalEntryId: journalEntry.id, loanClosed: fullyRepaid },
   });
 
+  // Wire the status transition to the payment-recording action itself
+  // (item 5) rather than waiting for the next unrelated read — a
+  // repayment that clears the last overdue installment should flip the
+  // loan back to 'paying' immediately, not just eventually.
+  if (!fullyRepaid) {
+    await getLoan(pool, loanId); // getLoan itself calls refreshLoanStatus
+  }
+
   return {
     loanId,
     amountPesewas,
@@ -1329,7 +1763,7 @@ async function requestRestructure(pool, { loanId, newTermMonths, newAnnualIntere
   }
 
   const loan = await getLoan(pool, loanId);
-  if (loan.status !== 'disbursed') {
+  if (!ACTIVE_LOAN_STATUSES.includes(loan.status)) {
     throw new LoanConflictError(`only a disbursed loan can be restructured (status: ${loan.status})`);
   }
 
@@ -1766,7 +2200,7 @@ async function writeOffLoan(pool, { loanId, reason, writtenOffBy, writeOffDate =
   if (!reason || !writtenOffBy) throw new LoanValidationError('reason and writtenOffBy are required');
 
   const loan = await getLoan(pool, loanId);
-  if (loan.status !== 'disbursed') {
+  if (!ACTIVE_LOAN_STATUSES.includes(loan.status)) {
     throw new LoanConflictError(`only a disbursed loan can be written off (status: ${loan.status})`);
   }
 
@@ -1818,13 +2252,13 @@ async function writeOffLoan(pool, { loanId, reason, writtenOffBy, writeOffDate =
 
 // --- Collateral & guarantors --------------------------------------------------
 
-async function addCollateral(pool, { loanId, description, estimatedValuePesewas = null, createdBy }) {
+async function addCollateral(pool, { loanId, description, estimatedValuePesewas = null, documentUrl = null, createdBy }) {
   if (!description || !createdBy) throw new LoanValidationError('description and createdBy are required');
   const loan = await getLoan(pool, loanId);
   const { rows } = await pool.query(
-    `INSERT INTO loan_collateral (loan_id, description, estimated_value_pesewas, created_by)
-     VALUES ($1, $2, $3, $4) RETURNING *`,
-    [loanId, description, estimatedValuePesewas, createdBy]
+    `INSERT INTO loan_collateral (loan_id, description, estimated_value_pesewas, document_url, created_by)
+     VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+    [loanId, description, estimatedValuePesewas, documentUrl, createdBy]
   );
   await auditLog.record(pool, {
     userId: createdBy,
@@ -1864,16 +2298,24 @@ async function listCollateral(pool, { loanId }) {
 }
 
 async function addGuarantor(pool, params) {
-  const { loanId, customerId = null, guarantorName = null, guarantorPhone = null, guaranteedAmountPesewas = null, createdBy } = params;
+  const {
+    loanId,
+    customerId = null,
+    guarantorName = null,
+    guarantorPhone = null,
+    guaranteedAmountPesewas = null,
+    relationship = null,
+    createdBy,
+  } = params;
   if (!createdBy) throw new LoanValidationError('createdBy is required');
   if (!customerId && !guarantorName) {
     throw new LoanValidationError('either customerId or guarantorName is required');
   }
   const loan = await getLoan(pool, loanId);
   const { rows } = await pool.query(
-    `INSERT INTO loan_guarantors (loan_id, customer_id, guarantor_name, guarantor_phone, guaranteed_amount_pesewas, created_by)
-     VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-    [loanId, customerId, guarantorName, guarantorPhone, guaranteedAmountPesewas, createdBy]
+    `INSERT INTO loan_guarantors (loan_id, customer_id, guarantor_name, guarantor_phone, guaranteed_amount_pesewas, relationship, created_by)
+     VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+    [loanId, customerId, guarantorName, guarantorPhone, guaranteedAmountPesewas, relationship, createdBy]
   );
   await auditLog.record(pool, {
     userId: createdBy,
@@ -1920,7 +2362,7 @@ async function getArrearsReport(pool, { branchId = null, asOfDate = todayIso() }
        FROM loans l
        JOIN loan_products p ON p.id = l.product_id
        JOIN loan_schedules s ON s.loan_id = l.id AND s.schedule_version = l.current_schedule_version
-      WHERE l.status = 'disbursed' ${branchFilter}
+      WHERE l.status IN ('disbursed', 'paying', 'missed_payment') ${branchFilter}
       GROUP BY l.id, p.par_bucket_days`,
     params
   );
@@ -1961,6 +2403,7 @@ function registerLoanExecutionHandlers() {
   approvalWorkflow.registerExecutionHandler('loan.approve', applyLoanApprovalDecision);
   approvalWorkflow.registerExecutionHandler('loan.restructure', applyRestructureOnApproval);
   approvalWorkflow.registerExecutionHandler('loan.grant_concession', applyConcessionOnApproval);
+  approvalWorkflow.registerRejectionHandler('loan.approve', applyLoanRejectionDecision);
 }
 
 module.exports = {
@@ -1996,6 +2439,7 @@ module.exports = {
   listCollateral,
   addGuarantor,
   listGuarantors,
+  waiveDefaultCharge,
   getArrearsReport,
   findGroupCreditBlockers,
   registerLoanExecutionHandlers,

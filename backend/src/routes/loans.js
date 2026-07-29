@@ -134,8 +134,8 @@ function loansRouter(pool) {
     '/calculator',
     auth,
     asyncHandler(async (req, res) => {
-      const { productId, principalPesewas, termMonths, startDate } = req.body || {};
-      res.json(await loanService.calculateLoan(pool, { productId, principalPesewas, termMonths, startDate }));
+      const { productId, principalPesewas, termMonths, repaymentFrequency, startDate } = req.body || {};
+      res.json(await loanService.calculateLoan(pool, { productId, principalPesewas, termMonths, repaymentFrequency, startDate }));
     })
   );
 
@@ -313,6 +313,22 @@ function loansRouter(pool) {
   );
 
   router.post(
+    '/:id/schedule/:scheduleId/waive-default-charge',
+    auth,
+    requirePermission('loan.waive_charges'),
+    asyncHandler(async (req, res) => {
+      const { reason } = req.body || {};
+      const schedule = await loanService.waiveDefaultCharge(pool, {
+        loanId: req.params.id,
+        scheduleId: req.params.scheduleId,
+        reason,
+        waivedBy: req.user.id,
+      });
+      res.json(schedule);
+    })
+  );
+
+  router.post(
     '/:id/restructure-requests',
     auth,
     requirePermission('loan.restructure'),
@@ -393,11 +409,12 @@ function loansRouter(pool) {
     auth,
     requirePermission('loan.manage_collateral'),
     asyncHandler(async (req, res) => {
-      const { description, estimatedValuePesewas } = req.body || {};
+      const { description, estimatedValuePesewas, documentUrl } = req.body || {};
       const collateral = await loanService.addCollateral(pool, {
         loanId: req.params.id,
         description,
         estimatedValuePesewas,
+        documentUrl,
         createdBy: req.user.id,
       });
       res.status(201).json(collateral);
@@ -432,13 +449,14 @@ function loansRouter(pool) {
     auth,
     requirePermission('loan.manage_guarantors'),
     asyncHandler(async (req, res) => {
-      const { customerId, guarantorName, guarantorPhone, guaranteedAmountPesewas } = req.body || {};
+      const { customerId, guarantorName, guarantorPhone, guaranteedAmountPesewas, relationship } = req.body || {};
       const guarantor = await loanService.addGuarantor(pool, {
         loanId: req.params.id,
         customerId,
         guarantorName,
         guarantorPhone,
         guaranteedAmountPesewas,
+        relationship,
         createdBy: req.user.id,
       });
       res.status(201).json(guarantor);
