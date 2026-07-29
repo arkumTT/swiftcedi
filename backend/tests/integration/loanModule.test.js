@@ -168,7 +168,7 @@ describeIfDb('Module 3: loan management', () => {
     await pool.query(
       `INSERT INTO approval_thresholds (action_type, amount_threshold_pesewas, required_approver_role_id, required_approver_role_ids)
        VALUES ('loan.grant_concession', 0, $1, $2)
-       ON CONFLICT (action_type, (COALESCE(branch_id, 0)))
+       ON CONFLICT (action_type, (COALESCE(branch_id, 0)), amount_threshold_pesewas)
        DO UPDATE SET required_approver_role_id = EXCLUDED.required_approver_role_id,
                      required_approver_role_ids = EXCLUDED.required_approver_role_ids`,
       [branchManagerRoleId, [branchManagerRoleId]]
@@ -1101,8 +1101,13 @@ describeIfDb('Module 3: loan management', () => {
       );
     });
 
-    test('rejects an allowedRepaymentFrequencies value other than monthly — the schedule generator does not amortize on any other cadence', async () => {
-      await expect(createProduct({ allowedRepaymentFrequencies: ['weekly'] })).rejects.toThrow(loanService.LoanValidationError);
+    test('accepts a weekly allowedRepaymentFrequencies value — the schedule generator now amortizes daily/weekly/biweekly too', async () => {
+      const product = await createProduct({ allowedRepaymentFrequencies: ['weekly'] });
+      expect(product.allowed_repayment_frequencies).toEqual(['weekly']);
+    });
+
+    test('rejects an allowedRepaymentFrequencies value the schedule generator does not support at all', async () => {
+      await expect(createProduct({ allowedRepaymentFrequencies: ['fortnightly'] })).rejects.toThrow(loanService.LoanValidationError);
     });
 
     test('updateLoanProduct edits an existing product and is audited, without touching an already-applied loan', async () => {

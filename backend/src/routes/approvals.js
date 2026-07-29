@@ -78,17 +78,18 @@ function approvalsRouter(pool) {
           .status(400)
           .json({ error: 'actionType, amountThresholdPesewas, and requiredApproverRoleIds are required' });
       }
-      // One row per (action_type, branch_id) — an existing row for the same
-      // pair is updated in place rather than erroring, since "set the
-      // threshold for X" is the natural admin mental model, not "create a
-      // new threshold row."
+      // One row per (action_type, branch_id, amount_threshold_pesewas) —
+      // since migration 066, an action_type can have more than one TIER
+      // (e.g. loan.approve's lower/upper tier), distinguished by their own
+      // amount. Posting the same action_type+branch+amount again updates
+      // that tier in place; a different amount creates a new tier instead
+      // of overwriting the existing one.
       const { rows } = await pool.query(
         `INSERT INTO approval_thresholds
            (action_type, branch_id, amount_threshold_pesewas, required_approver_role_id, required_approver_role_ids)
          VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (action_type, COALESCE(branch_id, 0))
-         DO UPDATE SET amount_threshold_pesewas = EXCLUDED.amount_threshold_pesewas,
-                       required_approver_role_id = EXCLUDED.required_approver_role_id,
+         ON CONFLICT (action_type, COALESCE(branch_id, 0), amount_threshold_pesewas)
+         DO UPDATE SET required_approver_role_id = EXCLUDED.required_approver_role_id,
                        required_approver_role_ids = EXCLUDED.required_approver_role_ids,
                        updated_at = now()
          RETURNING *`,

@@ -61,7 +61,7 @@ async function getLiveStats(pool, { branchId = null, date = todayIso() } = {}) {
     : await cashierService.getConsolidatedCashPosition(pool);
 
   const disbursementParams = [date];
-  let disbursementWhere = "status = 'disbursed' AND disbursed_at::date = $1";
+  let disbursementWhere = "status IN ('disbursed', 'paying', 'missed_payment') AND disbursed_at::date = $1";
   if (branchId) {
     disbursementParams.push(branchId);
     disbursementWhere += ` AND branch_id = $${disbursementParams.length}`;
@@ -174,7 +174,7 @@ const PAR_BUCKET_DAYS = [30, 60, 90];
  */
 async function getLoanBookSnapshot(pool, { asOfDate = todayIso(), branchId = null, loanOfficerId = null } = {}) {
   const params = [asOfDate];
-  let where = "l.status = 'disbursed'";
+  let where = "l.status IN ('disbursed', 'paying', 'missed_payment')";
   if (branchId) {
     params.push(branchId);
     where += ` AND l.branch_id = $${params.length}`;
@@ -196,7 +196,7 @@ async function getLoanBookSnapshot(pool, { asOfDate = todayIso(), branchId = nul
                   END) AS earliest_unpaid_due_date
          FROM loan_schedules ls
          JOIN loans l ON l.id = ls.loan_id AND ls.schedule_version = l.current_schedule_version
-        WHERE l.status = 'disbursed'
+        WHERE l.status IN ('disbursed', 'paying', 'missed_payment')
         GROUP BY ls.loan_id
      )
      SELECT l.id AS loan_id, l.branch_id, l.customer_id, l.applied_by AS loan_officer_id,
@@ -387,7 +387,7 @@ async function getGrowthTrends(pool, { fromDate, toDate, branchId = null, granul
     `SELECT date_trunc('${granularity}', disbursed_at)::date AS period,
             COUNT(*)::int AS count, COALESCE(SUM(principal_pesewas), 0)::bigint AS total
        FROM loans
-      WHERE status = 'disbursed' AND disbursed_at >= $1 AND disbursed_at <= $2${branchClauseSuffix}
+      WHERE status IN ('disbursed', 'paying', 'missed_payment') AND disbursed_at >= $1 AND disbursed_at <= $2${branchClauseSuffix}
       GROUP BY period ORDER BY period`,
     [fromDate, toDate, ...branchParams]
   );
@@ -519,13 +519,13 @@ async function getSocialPerformanceSummary(pool, { branchId = null } = {}) {
     `SELECT COUNT(DISTINCT customer_id)::int AS borrower_count,
             COUNT(*)::int AS loan_count,
             COALESCE(AVG(principal_pesewas), 0)::bigint AS avg_principal_pesewas
-       FROM loans WHERE status = 'disbursed' ${branchClause}`,
+       FROM loans WHERE status IN ('disbursed', 'paying', 'missed_payment') ${branchClause}`,
     params
   );
   const { rows: sectorRows } = await pool.query(
     `SELECT COALESCE(c.classification, 'unspecified') AS sector, COUNT(DISTINCT l.customer_id)::int AS borrower_count
        FROM loans l JOIN customers c ON c.id = l.customer_id
-      WHERE l.status = 'disbursed' ${branchId ? 'AND l.branch_id = $1' : ''}
+      WHERE l.status IN ('disbursed', 'paying', 'missed_payment') ${branchId ? 'AND l.branch_id = $1' : ''}
       GROUP BY sector ORDER BY borrower_count DESC`,
     params
   );

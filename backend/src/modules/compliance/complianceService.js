@@ -518,7 +518,7 @@ async function runAmlScreening(pool, { fromDate, toDate }) {
     if (scopes.includes('loan_disbursement')) {
       const { rows } = await pool.query(
         `SELECT id, customer_id, branch_id, principal_pesewas AS amount_pesewas
-           FROM loans WHERE status = 'disbursed' AND principal_pesewas >= $1 AND disbursed_at::date >= $2 AND disbursed_at::date <= $3`,
+           FROM loans WHERE status IN ('disbursed', 'paying', 'missed_payment') AND principal_pesewas >= $1 AND disbursed_at::date >= $2 AND disbursed_at::date <= $3`,
         [rule.threshold_pesewas, fromDate, toDate]
       );
       for (const row of rows) created.push(await insertAmlFlag(pool, rule, 'loan_disbursement', row));

@@ -2,14 +2,17 @@
 
 const {
   addMonthsToDateString,
+  addDaysToDateString,
   generateLoanSchedule,
   allocateRepayment,
   computeOutstandingPrincipalPesewas,
   bucketArrearsDays,
   computeFeesPesewas,
+  computeFeeAmountPesewas,
   computeOverdraftInterestPesewas,
   computeFloatingEffectiveRateBps,
   evaluateConcessionBounds,
+  computeActiveLoanStatus,
 } = require('../../src/modules/loan/loanMath');
 
 describe('addMonthsToDateString (pure)', () => {
@@ -418,5 +421,172 @@ describe('evaluateConcessionBounds (pure)', () => {
         concessionApprovalThresholdBps: 0,
       })
     ).toThrow(/rateType/);
+  });
+});
+
+describe('addDaysToDateString (pure)', () => {
+  test('adds a simple number of days', () => {
+    expect(addDaysToDateString('2026-01-15', 7)).toBe('2026-01-22');
+  });
+
+  test('crosses a month boundary', () => {
+    expect(addDaysToDateString('2026-01-28', 5)).toBe('2026-02-02');
+  });
+});
+
+describe('generateLoanSchedule — non-monthly repayment frequencies (pure)', () => {
+  const cases = [
+    { repaymentFrequency: 'daily', periodDays: 1 },
+    { repaymentFrequency: 'weekly', periodDays: 7 },
+    { repaymentFrequency: 'biweekly', periodDays: 14 },
+  ];
+
+  for (const { repaymentFrequency, periodDays } of cases) {
+    test(`${repaymentFrequency}: reducing_balance schedule sums exactly to principal and spaces installments ${periodDays} days apart`, () => {
+      const rows = generateLoanSchedule({
+        principalPesewas: 500000,
+        termMonths: 3, // 3 * durationUnit(months)=30 days => 90 days total
+        annualInterestRateBps: 3600,
+        interestMethod: 'reducing_balance',
+        startDate: '2026-01-01',
+        repaymentFrequency,
+        durationUnit: 'months',
+      });
+      expect(rows.length).toBeGreaterThan(0);
+      expect(rows.reduce((s, r) => s + r.principalDuePesewas, 0)).toBe(500000);
+      expect(rows[0].dueDate).toBe(addDaysToDateString('2026-01-01', periodDays));
+      if (rows.length > 1) {
+        expect(rows[1].dueDate).toBe(addDaysToDateString('2026-01-01', 2 * periodDays));
+      }
+    });
+
+    test(`${repaymentFrequency}: flat schedule sums exactly to principal and total interest matches the closed-form total`, () => {
+      const numInstallments = Math.round((6 * 7) / periodDays); // durationUnit='weeks', termMonths(reused as value)=6
+      const rows = generateLoanSchedule({
+        principalPesewas: 100000,
+        termMonths: 6,
+        annualInterestRateBps: 2000,
+        interestMethod: 'flat',
+        startDate: '2026-03-01',
+        repaymentFrequency,
+        durationUnit: 'weeks',
+      });
+      expect(rows).toHaveLength(Math.max(1, numInstallments));
+      expect(rows.reduce((s, r) => s + r.principalDuePesewas, 0)).toBe(100000);
+      const expectedTotalInterest = Math.round((100000 * 2000 * rows.length * periodDays) / (365 * 10000));
+      expect(rows.reduce((s, r) => s + r.interestDuePesewas, 0)).toBe(expectedTotalInterest);
+    });
+  }
+
+  test('the monthly + months path is untouched by the new params (defaults produce identical output)', () => {
+    const base = { principalPesewas: 240000, termMonths: 4, annualInterestRateBps: 1800, interestMethod: 'reducing_balance', startDate: '2026-02-01' };
+    const withDefaults = generateLoanSchedule(base);
+    const withExplicit = generateLoanSchedule({ ...base, repaymentFrequency: 'monthly', durationUnit: 'months' });
+    expect(withExplicit).toEqual(withDefaults);
+  });
+
+  test('rejects an unknown repaymentFrequency', () => {
+    expect(() =>
+      generateLoanSchedule({
+        principalPesewas: 100000,
+        termMonths: 3,
+        annualInterestRateBps: 1000,
+        interestMethod: 'flat',
+        startDate: '2026-01-01',
+        repaymentFrequency: 'fortnightly',
+      })
+    ).toThrow(/repaymentFrequency/);
+  });
+
+  test('rejects an unknown durationUnit', () => {
+    expect(() =>
+      generateLoanSchedule({
+        principalPesewas: 100000,
+        termMonths: 3,
+        annualInterestRateBps: 1000,
+        interestMethod: 'flat',
+        startDate: '2026-01-01',
+        repaymentFrequency: 'weekly',
+        durationUnit: 'fortnights',
+      })
+    ).toThrow(/durationUnit/);
+  });
+});
+
+describe('computeFeeAmountPesewas (pure)', () => {
+  test('flat basis returns the amount as-is', () => {
+    expect(computeFeeAmountPesewas({ basis: 'flat', amountPesewas: 5000, principalPesewas: 200000 })).toBe(5000);
+  });
+
+  test('percent_of_principal basis computes the rate against principal', () => {
+    expect(computeFeeAmountPesewas({ basis: 'percent_of_principal', rateBps: 250, principalPesewas: 200000 })).toBe(5000); // 2.5% of 200000
+  });
+
+  test('flat basis with no amount defaults to zero', () => {
+    expect(computeFeeAmountPesewas({ basis: 'flat', principalPesewas: 200000 })).toBe(0);
+  });
+
+  test('rejects an unknown basis', () => {
+    expect(() => computeFeeAmountPesewas({ basis: 'weird', principalPesewas: 200000 })).toThrow(/basis/);
+  });
+});
+
+describe('computeActiveLoanStatus (pure)', () => {
+  test('all installments current (none due yet) is paying', () => {
+    const status = computeActiveLoanStatus({
+      scheduleRows: [{ dueDate: '2026-06-30', status: 'pending' }],
+      installmentGracePeriodDays: 5,
+      asOfDate: '2026-06-01',
+    });
+    expect(status).toBe('paying');
+  });
+
+  test('an overdue installment still within its grace period is paying', () => {
+    const status = computeActiveLoanStatus({
+      scheduleRows: [{ dueDate: '2026-06-01', status: 'pending' }],
+      installmentGracePeriodDays: 5,
+      asOfDate: '2026-06-04', // 3 days late, grace is 5
+    });
+    expect(status).toBe('paying');
+  });
+
+  test('an overdue installment past its grace period is missed_payment', () => {
+    const status = computeActiveLoanStatus({
+      scheduleRows: [{ dueDate: '2026-06-01', status: 'pending' }],
+      installmentGracePeriodDays: 5,
+      asOfDate: '2026-06-06', // exactly at the grace deadline
+    });
+    expect(status).toBe('missed_payment');
+  });
+
+  test('a paid installment past its due date never counts as missed', () => {
+    const status = computeActiveLoanStatus({
+      scheduleRows: [{ dueDate: '2026-06-01', status: 'paid' }],
+      installmentGracePeriodDays: 5,
+      asOfDate: '2026-07-01',
+    });
+    expect(status).toBe('paying');
+  });
+
+  test('a zero-day grace period marks a loan missed the day it is due', () => {
+    const status = computeActiveLoanStatus({
+      scheduleRows: [{ dueDate: '2026-06-01', status: 'pending' }],
+      installmentGracePeriodDays: 0,
+      asOfDate: '2026-06-01',
+    });
+    expect(status).toBe('missed_payment');
+  });
+
+  test('one missed installment among several current ones still marks the whole loan missed_payment', () => {
+    const status = computeActiveLoanStatus({
+      scheduleRows: [
+        { dueDate: '2026-01-01', status: 'paid' },
+        { dueDate: '2026-06-01', status: 'pending' }, // missed
+        { dueDate: '2026-12-01', status: 'pending' }, // not due yet
+      ],
+      installmentGracePeriodDays: 0,
+      asOfDate: '2026-06-15',
+    });
+    expect(status).toBe('missed_payment');
   });
 });

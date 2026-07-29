@@ -6,6 +6,7 @@ const {
   decide,
   listApprovals,
   registerExecutionHandler,
+  registerRejectionHandler,
   ApprovalValidationError,
   ApprovalNotFoundError,
   MakerCheckerViolationError,
@@ -81,6 +82,27 @@ describe('requestApproval', () => {
     const insertParams = db.query.mock.calls[1][1];
     expect(insertParams).toContain(2); // required_approver_role_id backfilled as role_ids[0]
     expect(insertParams).toContainEqual([2, 4]); // required_approver_role_ids passed through
+  });
+
+  test('forwards amountPesewas into the threshold lookup query, for amount-tiered thresholds', async () => {
+    const threshold = { required_approver_role_ids: [3], amount_threshold_pesewas: 10_000_000 };
+    const created = { id: 6, status: 'pending' };
+    const db = makeSequentialDb([
+      { rows: [threshold] }, // getApplicableThreshold
+      { rows: [created] }, // INSERT approval_requests
+      { rows: [{ id: 1 }] }, // audit log insert
+    ]);
+
+    await requestApproval(db, {
+      actionType: 'loan.approve',
+      entityType: 'loan',
+      branchId: 1,
+      requestedBy: 7,
+      amountPesewas: 20_000_000,
+    });
+
+    const thresholdLookupParams = db.query.mock.calls[0][1];
+    expect(thresholdLookupParams).toEqual(['loan.approve', 1, 20_000_000]);
   });
 });
 
@@ -242,6 +264,44 @@ describe('decide', () => {
     await decide(db, { approvalId: 1, decidedBy: 2, decision: 'approved' });
 
     expect(handler).toHaveBeenCalledWith(updated, db);
+  });
+
+  test('dispatches to a registered REJECTION handler on rejection, never on approval', async () => {
+    const existing = {
+      id: 1,
+      requested_by: 7,
+      status: 'pending',
+      required_approver_role_id: null,
+      action_type: 'loan.approve.test',
+      branch_id: 1,
+    };
+    const updated = { ...existing, status: 'rejected', decided_by: 2 };
+    const db = makeSequentialDb([{ rows: [existing] }, { rows: [updated] }, { rows: [{ id: 99 }] }]);
+    const onReject = jest.fn().mockResolvedValue(undefined);
+    registerRejectionHandler('loan.approve.test', onReject);
+
+    await decide(db, { approvalId: 1, decidedBy: 2, decision: 'rejected' });
+
+    expect(onReject).toHaveBeenCalledWith(updated, db);
+  });
+
+  test('a registered rejection handler is never invoked on approval', async () => {
+    const existing = {
+      id: 1,
+      requested_by: 7,
+      status: 'pending',
+      required_approver_role_id: null,
+      action_type: 'loan.approve.test2',
+      branch_id: 1,
+    };
+    const updated = { ...existing, status: 'approved', decided_by: 2 };
+    const db = makeSequentialDb([{ rows: [existing] }, { rows: [updated] }, { rows: [{ id: 99 }] }]);
+    const onReject = jest.fn();
+    registerRejectionHandler('loan.approve.test2', onReject);
+
+    await decide(db, { approvalId: 1, decidedBy: 2, decision: 'approved' });
+
+    expect(onReject).not.toHaveBeenCalled();
   });
 
   test('an explicit execute callback takes precedence over a registered handler', async () => {
