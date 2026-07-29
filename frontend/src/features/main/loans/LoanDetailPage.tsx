@@ -146,7 +146,7 @@ export function LoanDetailPage() {
               <button type="button" onClick={() => navigate(`/app/customers/${loan.customer_id}`)} className="text-primary underline">
                 {customerQuery.data?.full_name ?? `#${loan.customer_id}`}
               </button>{' '}
-              · {branchName} · Product: {productQuery.data?.name ?? `#${loan.product_id}`}
+              · {branchName} · Loan Offer: {productQuery.data?.name ?? `#${loan.product_id}`}
             </p>
             <p className="text-[13px] text-text-secondary">
               {formatGhs(loan.principal_pesewas)} principal · {loan.term_months} months · disbursed {formatDate(loan.disbursed_at)}
@@ -367,7 +367,7 @@ function TermsCard({
 
       {product && (
         <div className="mt-3 rounded-md border border-border bg-surface-alt p-3">
-          <p className="text-[12.5px] font-medium text-text-primary">Product standard terms ({product.code})</p>
+          <p className="text-[12.5px] font-medium text-text-primary">Loan offer standard terms ({product.code})</p>
           <p className="mt-1 text-[12.5px] text-text-secondary">
             {formatBps(product.annual_interest_rate_bps)} p.a.
             {product.rate_type === 'floating' && ` (floating: reference + ${formatBps(product.spread_bps)} spread, resets ${product.reset_frequency})`}
@@ -376,7 +376,7 @@ function TermsCard({
           </p>
           {currentDiffersFromStandard && (
             <p className="mt-1 text-[12.5px] font-medium text-warning-text-strong">
-              This loan's current rate differs from the product's standard rate — see the concession that granted it below, not a
+              This loan's current rate differs from the offer's standard rate — see the concession that granted it below, not a
               silent override.
             </p>
           )}
@@ -479,14 +479,14 @@ function ConcessionModal({
         <p className="text-[13px] text-text-secondary">
           {result.needsApproval
             ? "Submitted for branch manager approval — this loan can't disburse until it's decided."
-            : "Applied immediately — within this product's approval-free threshold, so no second sign-off was needed."}
+            : "Applied immediately — within this offer's approval-free threshold, so no second sign-off was needed."}
         </p>
       ) : (
         <div className="flex flex-col gap-3">
           <p className="text-[13px] text-text-secondary">
             Standard terms: {formatBps(product?.annual_interest_rate_bps)} p.a.
             {isFloating && ` (spread ${formatBps(product?.spread_bps)})`}, {loan.term_months} months. A concession beyond this
-            product's approval-free threshold routes to a branch manager before the loan can disburse.
+            offer's approval-free threshold routes to a branch manager before the loan can disburse.
           </p>
           <FormField label="Reason">
             {(id) => (

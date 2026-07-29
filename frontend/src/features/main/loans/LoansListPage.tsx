@@ -47,7 +47,7 @@ export function LoansListPage() {
     { key: 'id', header: 'Loan', render: (l) => `#${l.id}` },
     { key: 'customer', header: 'Customer', render: (l) => `#${l.customer_id}` },
     { key: 'type', header: 'Type', render: (l) => <span className="capitalize">{l.loan_type}</span> },
-    { key: 'product', header: 'Product', render: (l) => productsQuery.data?.find((p) => p.id === l.product_id)?.name ?? `#${l.product_id}` },
+    { key: 'product', header: 'Loan Offer', render: (l) => productsQuery.data?.find((p) => p.id === l.product_id)?.name ?? `#${l.product_id}` },
     { key: 'principal', header: 'Principal', render: (l) => formatGhs(l.principal_pesewas), align: 'right' },
     { key: 'term', header: 'Term', render: (l) => `${l.term_months} mo` },
     { key: 'status', header: 'Status', render: (l) => <StatusBadge status={l.status} /> },
@@ -56,6 +56,8 @@ export function LoansListPage() {
 
   return (
     <div className="flex flex-col gap-4">
+      <LoanProductsCard products={productsQuery.data ?? []} isLoading={productsQuery.isLoading} canManage={hasPermission('loan.manage_products')} />
+
       <Card
         title="Loans & Credit"
         actions={
@@ -79,7 +81,7 @@ export function LoansListPage() {
             </select>
           )}
           <select value={productId} onChange={(e) => setProductId(e.target.value)} className={selectClasses + ' h-8 text-[12.5px]'}>
-            <option value="">All products</option>
+            <option value="">All offers</option>
             {productsQuery.data?.map((p) => (
               <option key={p.id} value={p.id}>
                 {p.name}
@@ -112,8 +114,6 @@ export function LoansListPage() {
       {hasPermission('loan.view_reports') && <ArrearsReportCard crossBranch={crossBranch} branches={branches ?? []} defaultBranchId={crossBranch ? '' : user!.homeBranchId} />}
 
       {hasPermission('loan.manage_policy_rates') && <PolicyRatesCard />}
-
-      <LoanProductsCard products={productsQuery.data ?? []} isLoading={productsQuery.isLoading} canManage={hasPermission('loan.manage_products')} />
 
       <CreateLoanModal
         open={createOpen}
@@ -200,10 +200,10 @@ function CreateLoanModal({
         <FormField label="Customer ID" hint="Open this from a customer's 360 page, or enter their ID directly — there's no name search yet.">
           {(id) => <input id={id} type="number" value={customerId} onChange={(e) => setCustomerId(e.target.value)} className={inputClasses} />}
         </FormField>
-        <FormField label="Loan product">
+        <FormField label="Loan offer">
           {(id) => (
             <select id={id} value={productId} onChange={(e) => setProductId(e.target.value)} className={selectClasses}>
-              <option value="">Select a product…</option>
+              <option value="">Select a loan offer…</option>
               {products.map((p) => (
                 <option key={p.id} value={p.id}>
                   {p.name} ({formatBps(p.annual_interest_rate_bps)} p.a.)
@@ -273,7 +273,7 @@ function LoanCalculatorCard({ products }: { products: LoanProduct[] }) {
     <Card title={<span className="flex items-center gap-1.5"><Calculator size={16} /> Loan calculator</span>}>
       <p className="mb-3 text-[13px] text-text-secondary">Preview a repayment schedule without creating anything.</p>
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-4">
-        <FormField label="Product">
+        <FormField label="Offer">
           {(id) => (
             <select id={id} value={productId} onChange={(e) => setProductId(e.target.value)} className={selectClasses}>
               <option value="">Select…</option>
@@ -415,8 +415,8 @@ function PolicyRatesCard() {
       padded={false}
     >
       <p className="px-4 pt-3 text-[12.5px] text-text-secondary">
-        What floating-rate loan products link to — a product's rate is this value plus its own spread, recomputed whenever this
-        changes and on the product's own reset cadence.
+        What floating-rate loan offers link to — an offer's rate is this value plus its own spread, recomputed whenever this
+        changes and on the offer's own reset cadence.
       </p>
       <DataTable
         columns={[
@@ -502,11 +502,11 @@ function LoanProductsCard({ products, isLoading, canManage }: { products: LoanPr
 
   return (
     <Card
-      title="Loan products"
+      title="Loan Offers"
       actions={
         canManage && (
           <Button variant="secondary" size="sm" onClick={() => setCreateOpen(true)}>
-            <Plus size={14} /> New product
+            <Plus size={14} /> New offer
           </Button>
         )
       }
@@ -537,7 +537,7 @@ function LoanProductsCard({ products, isLoading, canManage }: { products: LoanPr
         getRowKey={(p) => p.id}
         isLoading={isLoading}
         onRowClick={canManage ? (p) => setEditProduct(p) : undefined}
-        emptyTitle="No loan products configured yet"
+        emptyTitle="No loan offers configured yet"
       />
       <CreateLoanProductModal
         open={createOpen}
@@ -606,7 +606,7 @@ function RateAndConcessionFields({
           <FormField label="Annual interest rate (%)">
             {(id) => <input id={id} type="number" step="0.01" value={annualRate} onChange={(e) => setAnnualRate(e.target.value)} className={inputClasses} />}
           </FormField>
-          <FormField label="Concession floor — rate can never be negotiated below (%)" hint="Leave blank to not allow any concessions on this product.">
+          <FormField label="Concession floor — rate can never be negotiated below (%)" hint="Leave blank to not allow any concessions on this offer.">
             {(id) => <input id={id} type="number" step="0.01" value={rateFloor} onChange={(e) => setRateFloor(e.target.value)} className={inputClasses} />}
           </FormField>
         </>
@@ -638,7 +638,7 @@ function RateAndConcessionFields({
               )}
             </FormField>
           </div>
-          <FormField label="Concession floor — spread can never be negotiated below (%)" hint="Leave blank to not allow any concessions on this product. The reference rate itself is never negotiable, only the spread.">
+          <FormField label="Concession floor — spread can never be negotiated below (%)" hint="Leave blank to not allow any concessions on this offer. The reference rate itself is never negotiable, only the spread.">
             {(id) => <input id={id} type="number" step="0.01" value={spreadFloor} onChange={(e) => setSpreadFloor(e.target.value)} className={inputClasses} />}
           </FormField>
         </>
@@ -721,7 +721,7 @@ function CreateLoanProductModal({ open, onClose, onCreated }: { open: boolean; o
       onClose();
       reset();
     },
-    onError: (err) => setError(err instanceof ApiError ? err.message : 'Unable to create loan product'),
+    onError: (err) => setError(err instanceof ApiError ? err.message : 'Unable to create loan offer'),
   });
 
   return (
@@ -731,14 +731,14 @@ function CreateLoanProductModal({ open, onClose, onCreated }: { open: boolean; o
         onClose();
         reset();
       }}
-      title="New loan product"
+      title="New loan offer"
       footer={
         <>
           <Button variant="secondary" size="sm" onClick={onClose}>
             Cancel
           </Button>
           <Button variant="primary" size="sm" disabled={mutation.isPending} onClick={() => mutation.mutate()}>
-            Create product
+            Create offer
           </Button>
         </>
       }
@@ -853,14 +853,14 @@ function EditLoanProductModal({ product, onClose, onSaved }: { product: LoanProd
       onSaved();
       onClose();
     },
-    onError: (err) => setError(err instanceof ApiError ? err.message : 'Unable to update loan product'),
+    onError: (err) => setError(err instanceof ApiError ? err.message : 'Unable to update loan offer'),
   });
 
   return (
     <Modal
       open={!!product}
       onClose={onClose}
-      title={product ? `Edit ${product.code}` : 'Edit product'}
+      title={product ? `Edit ${product.code}` : 'Edit offer'}
       footer={
         <>
           <Button variant="secondary" size="sm" onClick={onClose}>
