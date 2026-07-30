@@ -1,10 +1,10 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { ArrowLeft, ClipboardCheck, Send, Banknote, HandCoins, Repeat, Ban, Plus, Percent, Check, X } from 'lucide-react';
 import { useAuth } from '../../../auth/AuthContext';
 import { api, ApiError } from '../../../lib/apiClient';
-import { useBranches } from '../../../lib/adminHooks';
+import { useBranches, useStaff, usePaymentModes } from '../../../lib/adminHooks';
 import { Card } from '../../../components/Card';
 import { DataTable, type Column } from '../../../components/DataTable';
 import { StatusBadge } from '../../../components/StatusBadge';
@@ -34,6 +34,11 @@ const CONCESSION_ELIGIBLE_STATUSES = ['applied', 'appraised', 'pending_approval'
 // installments come due (see Decisions_Log.md) — every action that used
 // to gate on the literal 'disbursed' status now checks this set instead.
 const ACTIVE_LOAN_STATUSES = ['disbursed', 'paying', 'missed_payment'];
+// Principal/tenor/offer stay editable through these statuses only — the
+// button disappears once a loan is 'approved' or later (see
+// loanService.updateLoanApplication's own PRE_APPROVAL_EDITABLE_STATUSES;
+// the real enforcement is server-side, this just matches it in the UI).
+const PRE_APPROVAL_EDITABLE_STATUSES = ['applied', 'appraised', 'pending_approval'];
 
 export function LoanDetailPage() {
   const { id } = useParams<{ id: string }>();
@@ -41,16 +46,21 @@ export function LoanDetailPage() {
   const { hasPermission } = useAuth();
   const queryClient = useQueryClient();
   const { data: branches } = useBranches();
+  const productsQuery = useQuery({ queryKey: ['loan-products'], queryFn: () => api.get<LoanProduct[]>('/loans/products') });
 
   const [appraiseOpen, setAppraiseOpen] = useState(false);
   const [rejectOpen, setRejectOpen] = useState(false);
   const [disburseOpen, setDisburseOpen] = useState(false);
   const [repaymentOpen, setRepaymentOpen] = useState(false);
   const [restructureOpen, setRestructureOpen] = useState(false);
+  const [editTermsOpen, setEditTermsOpen] = useState(false);
   const [writeOffOpen, setWriteOffOpen] = useState(false);
   const [accrueOpen, setAccrueOpen] = useState(false);
   const [collateralOpen, setCollateralOpen] = useState(false);
   const [guarantorOpen, setGuarantorOpen] = useState(false);
+  const [editingCollateral, setEditingCollateral] = useState<LoanCollateral | null>(null);
+  const [removingCollateral, setRemovingCollateral] = useState<LoanCollateral | null>(null);
+  const [editingGuarantor, setEditingGuarantor] = useState<LoanGuarantor | null>(null);
   const [concessionOpen, setConcessionOpen] = useState(false);
 
   const invalidateLoan = () => queryClient.invalidateQueries({ queryKey: ['loan', id] });
@@ -74,6 +84,8 @@ export function LoanDetailPage() {
     enabled: Boolean(id) && loan?.status !== 'applied' && loan?.status !== 'appraised' && loan?.status !== 'pending_approval',
   });
   const repaymentsQuery = useQuery({ queryKey: ['loan-repayments', id], queryFn: () => api.get<LoanRepayment[]>(`/loans/${id}/repayments`), enabled: Boolean(id) });
+  const paymentModesQuery = usePaymentModes();
+  const staffQuery = useStaff();
   const appraisalsQuery = useQuery({ queryKey: ['loan-appraisals', id], queryFn: () => api.get<LoanAppraisal[]>(`/loans/${id}/appraisals`), enabled: Boolean(id) });
   const collateralQuery = useQuery({ queryKey: ['loan-collateral', id], queryFn: () => api.get<LoanCollateral[]>(`/loans/${id}/collateral`), enabled: Boolean(id) });
   const guarantorsQuery = useQuery({ queryKey: ['loan-guarantors', id], queryFn: () => api.get<LoanGuarantor[]>(`/loans/${id}/guarantors`), enabled: Boolean(id) });
@@ -110,6 +122,16 @@ export function LoanDetailPage() {
       api.post(`/loans/${id}/collateral/${collateralId}/verify`, { verificationStatus }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['loan-collateral', id] }),
   });
+  const removeCollateralMutation = useMutation({
+    mutationFn: ({ collateralId, reason }: { collateralId: string; reason: string }) =>
+      api.post(`/loans/${id}/collateral/${collateralId}/remove`, { reason }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['loan-collateral', id] }),
+  });
+  const verifyGuarantorMutation = useMutation({
+    mutationFn: ({ guarantorId, verificationStatus }: { guarantorId: string; verificationStatus: string }) =>
+      api.post(`/loans/${id}/guarantors/${guarantorId}/verify`, { verificationStatus }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['loan-guarantors', id] }),
+  });
 
   if (loanQuery.isLoading) return <p className="p-4 text-[13px] text-text-secondary">Loading loan…</p>;
   if (loanQuery.error || !loan) {
@@ -133,6 +155,17 @@ export function LoanDetailPage() {
     { key: 'principal', header: 'Principal', render: (r) => formatGhs(r.principal_component_pesewas), align: 'right' },
     { key: 'interest', header: 'Interest', render: (r) => formatGhs(r.interest_component_pesewas), align: 'right' },
     { key: 'fees', header: 'Fees', render: (r) => formatGhs(r.fees_component_pesewas), align: 'right' },
+    {
+      key: 'mode',
+      header: 'Payment mode',
+      render: (r) => paymentModesQuery.data?.find((m) => m.id === r.payment_mode_id)?.name ?? '—',
+    },
+    {
+      key: 'receiver',
+      header: 'Receiver',
+      render: (r) => staffQuery.data?.find((s) => s.id === r.receiver_user_id)?.full_name ?? '—',
+    },
+    { key: 'reference', header: 'Reference', render: (r) => r.transaction_reference ?? '—' },
   ];
   const appraisalColumns: Column<LoanAppraisal>[] = [
     { key: 'date', header: 'Date', render: (a) => formatDate(a.created_at) },
@@ -190,6 +223,11 @@ export function LoanDetailPage() {
             </p>
           </div>
           <div className="flex flex-wrap justify-end gap-1.5">
+            {hasPermission('loan.apply') && !isOverdraft && PRE_APPROVAL_EDITABLE_STATUSES.includes(loan.status) && (
+              <Button variant="secondary" size="sm" onClick={() => setEditTermsOpen(true)}>
+                Edit terms
+              </Button>
+            )}
             {hasPermission('loan.appraise') && (loan.status === 'applied' || loan.status === 'appraised') && (
               <Button variant="secondary" size="sm" onClick={() => setAppraiseOpen(true)}>
                 <ClipboardCheck size={14} /> Appraise
@@ -243,6 +281,13 @@ export function LoanDetailPage() {
           </div>
         </div>
       </Card>
+
+      {loan.terms_last_edited_at && (
+        <div className="rounded-md border border-warning/30 bg-warning/14 px-3 py-2 text-[13px] text-warning-text-strong">
+          Terms (principal/tenor/offer) were edited on {formatDate(loan.terms_last_edited_at)} after this application was
+          first submitted — re-check the current numbers before appraising or approving.
+        </div>
+      )}
 
       <TermsCard loan={loan} product={productQuery.data} concessions={concessionsQuery.data ?? []} isLoading={concessionsQuery.isLoading} />
 
@@ -304,23 +349,32 @@ export function LoanDetailPage() {
       >
         <DataTable
           columns={collateralColumns}
-          rows={collateralQuery.data ?? []}
+          rows={(collateralQuery.data ?? []).filter((c) => !c.removed_at)}
           getRowKey={(c) => c.id}
           isLoading={collateralQuery.isLoading}
           emptyTitle="No collateral recorded"
           rowActions={
             hasPermission('loan.manage_collateral')
-              ? (c) =>
-                  c.verification_status === 'pending' && (
-                    <div className="flex justify-end gap-1.5">
-                      <Button variant="secondary" size="sm" onClick={() => verifyCollateralMutation.mutate({ collateralId: c.id, verificationStatus: 'verified' })}>
-                        Verify
-                      </Button>
-                      <Button variant="danger" size="sm" onClick={() => verifyCollateralMutation.mutate({ collateralId: c.id, verificationStatus: 'rejected' })}>
-                        Reject
-                      </Button>
-                    </div>
-                  )
+              ? (c) => (
+                  <div className="flex justify-end gap-1.5">
+                    {c.verification_status === 'pending' && (
+                      <>
+                        <Button variant="secondary" size="sm" onClick={() => verifyCollateralMutation.mutate({ collateralId: c.id, verificationStatus: 'verified' })}>
+                          Verify
+                        </Button>
+                        <Button variant="danger" size="sm" onClick={() => verifyCollateralMutation.mutate({ collateralId: c.id, verificationStatus: 'rejected' })}>
+                          Reject
+                        </Button>
+                      </>
+                    )}
+                    <Button variant="secondary" size="sm" onClick={() => setEditingCollateral(c)}>
+                      Edit
+                    </Button>
+                    <Button variant="danger" size="sm" onClick={() => setRemovingCollateral(c)}>
+                      Remove
+                    </Button>
+                  </div>
+                )
               : undefined
           }
         />
@@ -337,7 +391,34 @@ export function LoanDetailPage() {
         }
         padded={false}
       >
-        <DataTable columns={guarantorColumns} rows={guarantorsQuery.data ?? []} getRowKey={(g) => g.id} isLoading={guarantorsQuery.isLoading} emptyTitle="No guarantors recorded" />
+        <DataTable
+          columns={guarantorColumns}
+          rows={guarantorsQuery.data ?? []}
+          getRowKey={(g) => g.id}
+          isLoading={guarantorsQuery.isLoading}
+          emptyTitle="No guarantors recorded"
+          rowActions={
+            hasPermission('loan.manage_guarantors')
+              ? (g) => (
+                  <div className="flex justify-end gap-1.5">
+                    {g.verification_status === 'pending' && (
+                      <>
+                        <Button variant="secondary" size="sm" onClick={() => verifyGuarantorMutation.mutate({ guarantorId: g.id, verificationStatus: 'verified' })}>
+                          Verify
+                        </Button>
+                        <Button variant="danger" size="sm" onClick={() => verifyGuarantorMutation.mutate({ guarantorId: g.id, verificationStatus: 'rejected' })}>
+                          Reject
+                        </Button>
+                      </>
+                    )}
+                    <Button variant="secondary" size="sm" onClick={() => setEditingGuarantor(g)}>
+                      Edit
+                    </Button>
+                  </div>
+                )
+              : undefined
+          }
+        />
       </Card>
 
       <AppraiseModal open={appraiseOpen} onClose={() => setAppraiseOpen(false)} loanId={loan.id} onSaved={() => { invalidateLoan(); queryClient.invalidateQueries({ queryKey: ['loan-appraisals', id] }); }} />
@@ -352,6 +433,7 @@ export function LoanDetailPage() {
         }
         isPending={decideApprovalMutation.isPending}
       />
+      <EditTermsModal open={editTermsOpen} onClose={() => setEditTermsOpen(false)} loan={loan} products={productsQuery.data ?? []} onSaved={invalidateLoan} />
       <DisburseModal open={disburseOpen} onClose={() => setDisburseOpen(false)} loanId={loan.id} onSaved={invalidateLoan} />
       <RepaymentModal open={repaymentOpen} onClose={() => setRepaymentOpen(false)} loanId={loan.id} onSaved={() => { invalidateLoan(); queryClient.invalidateQueries({ queryKey: ['loan-schedule', id] }); queryClient.invalidateQueries({ queryKey: ['loan-repayments', id] }); }} />
       <RestructureModal open={restructureOpen} onClose={() => setRestructureOpen(false)} loanId={loan.id} onSaved={invalidateLoan} />
@@ -370,6 +452,26 @@ export function LoanDetailPage() {
       <AccrueInterestModal open={accrueOpen} onClose={() => setAccrueOpen(false)} loanId={loan.id} onSaved={() => queryClient.invalidateQueries({ queryKey: ['loan-overdraft-status', id] })} />
       <AddCollateralModal open={collateralOpen} onClose={() => setCollateralOpen(false)} loanId={loan.id} onSaved={() => queryClient.invalidateQueries({ queryKey: ['loan-collateral', id] })} />
       <AddGuarantorModal open={guarantorOpen} onClose={() => setGuarantorOpen(false)} loanId={loan.id} onSaved={() => queryClient.invalidateQueries({ queryKey: ['loan-guarantors', id] })} />
+      <EditCollateralModal
+        collateral={editingCollateral}
+        onClose={() => setEditingCollateral(null)}
+        onSaved={() => queryClient.invalidateQueries({ queryKey: ['loan-collateral', id] })}
+      />
+      <RemoveCollateralModal
+        collateral={removingCollateral}
+        onClose={() => setRemovingCollateral(null)}
+        onSaved={(reason) =>
+          removeCollateralMutation.mutate(
+            { collateralId: removingCollateral!.id, reason },
+            { onSuccess: () => setRemovingCollateral(null) }
+          )
+        }
+      />
+      <EditGuarantorModal
+        guarantor={editingGuarantor}
+        onClose={() => setEditingGuarantor(null)}
+        onSaved={() => queryClient.invalidateQueries({ queryKey: ['loan-guarantors', id] })}
+      />
     </div>
   );
 }
@@ -717,14 +819,31 @@ function DisburseModal({ open, onClose, loanId, onSaved }: { open: boolean; onCl
 function RepaymentModal({ open, onClose, loanId, onSaved }: { open: boolean; onClose: () => void; loanId: string; onSaved: () => void }) {
   const [amount, setAmount] = useState('');
   const [paymentDate, setPaymentDate] = useState('');
+  const [paymentModeId, setPaymentModeId] = useState('');
+  const [receiverUserId, setReceiverUserId] = useState('');
+  const [transactionReference, setTransactionReference] = useState('');
   const [error, setError] = useState<string | null>(null);
 
+  const paymentModesQuery = usePaymentModes();
+  const staffQuery = useStaff();
+  const selectedMode = paymentModesQuery.data?.find((m) => m.id === paymentModeId);
+
   const mutation = useMutation({
-    mutationFn: () => api.post(`/loans/${loanId}/repayments`, { amountPesewas: parseGhsInput(amount), paymentDate: paymentDate || undefined }),
+    mutationFn: () =>
+      api.post(`/loans/${loanId}/repayments`, {
+        amountPesewas: parseGhsInput(amount),
+        paymentDate: paymentDate || undefined,
+        paymentModeId,
+        receiverUserId,
+        transactionReference: transactionReference || undefined,
+      }),
     onSuccess: () => {
       onSaved();
       onClose();
       setAmount('');
+      setPaymentModeId('');
+      setReceiverUserId('');
+      setTransactionReference('');
     },
     onError: (err) => setError(err instanceof ApiError ? err.message : 'Unable to record repayment'),
   });
@@ -739,7 +858,12 @@ function RepaymentModal({ open, onClose, loanId, onSaved }: { open: boolean; onC
           <Button variant="secondary" size="sm" onClick={onClose}>
             Cancel
           </Button>
-          <Button variant="primary" size="sm" disabled={mutation.isPending || !amount} onClick={() => mutation.mutate()}>
+          <Button
+            variant="primary"
+            size="sm"
+            disabled={mutation.isPending || !amount || !paymentModeId || !receiverUserId}
+            onClick={() => mutation.mutate()}
+          >
             Record
           </Button>
         </>
@@ -749,6 +873,167 @@ function RepaymentModal({ open, onClose, loanId, onSaved }: { open: boolean; onC
         <FormField label="Amount (GH₵)">{(id) => <input id={id} type="number" step="0.01" value={amount} onChange={(e) => setAmount(e.target.value)} className={inputClasses} />}</FormField>
         <FormField label="Payment date" hint="Defaults to today if left blank.">
           {(id) => <input id={id} type="date" value={paymentDate} onChange={(e) => setPaymentDate(e.target.value)} className={inputClasses} />}
+        </FormField>
+        <FormField label="Payment mode">
+          {(id) => (
+            <select id={id} value={paymentModeId} onChange={(e) => setPaymentModeId(e.target.value)} className={selectClasses}>
+              <option value="">Select…</option>
+              {paymentModesQuery.data?.map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.name}
+                </option>
+              ))}
+            </select>
+          )}
+        </FormField>
+        <FormField
+          label="Receiver"
+          hint={
+            selectedMode?.code === 'mobile_money'
+              ? 'The staff member accountable for this transaction (e.g. who confirmed the MoMo credit).'
+              : 'The staff member/teller who physically received the payment.'
+          }
+        >
+          {(id) => (
+            <select id={id} value={receiverUserId} onChange={(e) => setReceiverUserId(e.target.value)} className={selectClasses}>
+              <option value="">Select…</option>
+              {staffQuery.data?.map((s) => (
+                <option key={s.id} value={s.id}>
+                  {s.full_name} ({s.role_name.replace(/_/g, ' ')})
+                </option>
+              ))}
+            </select>
+          )}
+        </FormField>
+        {selectedMode?.code === 'mobile_money' && (
+          <FormField label="Transaction reference" hint="MoMo settlement reference, for reconciliation. Optional.">
+            {(id) => (
+              <input
+                id={id}
+                value={transactionReference}
+                onChange={(e) => setTransactionReference(e.target.value)}
+                className={inputClasses}
+                placeholder="e.g. MP240730.1234.A56789"
+              />
+            )}
+          </FormField>
+        )}
+        {error && (
+          <p role="alert" className="text-[13px] text-danger">
+            {error}
+          </p>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
+const REPAYMENT_FREQUENCY_LABELS: Record<string, string> = { daily: 'Daily', weekly: 'Weekly', biweekly: 'Bi-weekly', monthly: 'Monthly' };
+
+/**
+ * Principal/tenor/offer edit — only ever shown while the loan is still
+ * pre-approval (see PRE_APPROVAL_EDITABLE_STATUSES); the server rejects
+ * the request outright once approved, this modal isn't the only guard.
+ * Unlike RestructureModal, this applies IMMEDIATELY — no maker-checker —
+ * since the loan hasn't been decided yet; a "review notice" banner is
+ * left on the loan instead (see terms_last_edited_at).
+ */
+function EditTermsModal({
+  open,
+  onClose,
+  loan,
+  products,
+  onSaved,
+}: {
+  open: boolean;
+  onClose: () => void;
+  loan: Loan;
+  products: LoanProduct[];
+  onSaved: () => void;
+}) {
+  const [productId, setProductId] = useState(loan.product_id);
+  const [principal, setPrincipal] = useState(String(loan.principal_pesewas / 100));
+  const [termMonths, setTermMonths] = useState(String(loan.term_months));
+  const [repaymentFrequency, setRepaymentFrequency] = useState(loan.repayment_frequency);
+  const [error, setError] = useState<string | null>(null);
+
+  const selectedProduct = products.find((p) => p.id === productId);
+  const productChanged = productId !== loan.product_id;
+
+  const mutation = useMutation({
+    mutationFn: () =>
+      api.patch(`/loans/${loan.id}`, {
+        productId,
+        principalPesewas: parseGhsInput(principal),
+        termMonths: Number(termMonths),
+        repaymentFrequency,
+      }),
+    onSuccess: () => {
+      onSaved();
+      onClose();
+    },
+    onError: (err) => setError(err instanceof ApiError ? err.message : 'Unable to edit this loan'),
+  });
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title="Edit loan terms"
+      footer={
+        <>
+          <Button variant="secondary" size="sm" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button variant="primary" size="sm" disabled={mutation.isPending || !principal || !termMonths} onClick={() => mutation.mutate()}>
+            Save
+          </Button>
+        </>
+      }
+    >
+      <div className="flex flex-col gap-3">
+        <p className="text-[13px] text-text-secondary">
+          Only available before this loan is approved. Applies immediately and leaves a review notice on the application
+          — interest rate/method are set by the selected offer, never edited directly here.
+        </p>
+        <FormField label="Loan offer">
+          {(id) => (
+            <select id={id} value={productId} onChange={(e) => setProductId(e.target.value)} className={selectClasses}>
+              {products.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.name}
+                </option>
+              ))}
+            </select>
+          )}
+        </FormField>
+        {productChanged && (
+          <p className="text-[12.5px] text-warning-text-strong">
+            Switching offers re-snapshots interest rate/fees/grace periods from the new offer's standard terms.
+          </p>
+        )}
+        <FormField
+          label="Principal (GH₵)"
+          hint={selectedProduct ? `Range: ${formatGhs(selectedProduct.min_principal_pesewas)} – ${formatGhs(selectedProduct.max_principal_pesewas)}` : undefined}
+        >
+          {(id) => <input id={id} type="number" step="0.01" value={principal} onChange={(e) => setPrincipal(e.target.value)} className={inputClasses} />}
+        </FormField>
+        <FormField
+          label={`Duration${selectedProduct ? ` (${selectedProduct.duration_unit})` : ''}`}
+          hint={selectedProduct ? `Range: ${selectedProduct.min_term_months} – ${selectedProduct.max_term_months} ${selectedProduct.duration_unit}` : undefined}
+        >
+          {(id) => <input id={id} type="number" value={termMonths} onChange={(e) => setTermMonths(e.target.value)} className={inputClasses} />}
+        </FormField>
+        <FormField label="Repayment frequency">
+          {(id) => (
+            <select id={id} value={repaymentFrequency} onChange={(e) => setRepaymentFrequency(e.target.value as Loan['repayment_frequency'])} className={selectClasses}>
+              {(selectedProduct?.allowed_repayment_frequencies ?? [repaymentFrequency]).map((f) => (
+                <option key={f} value={f}>
+                  {REPAYMENT_FREQUENCY_LABELS[f] ?? f}
+                </option>
+              ))}
+            </select>
+          )}
         </FormField>
         {error && (
           <p role="alert" className="text-[13px] text-danger">
@@ -1027,6 +1312,202 @@ function AddGuarantorModal({ open, onClose, loanId, onSaved }: { open: boolean; 
         <p className="text-[13px] text-text-secondary">Either an existing customer ID, or a name for someone not in the system.</p>
         <FormField label="Customer ID (optional)">{(id) => <input id={id} type="number" value={customerId} onChange={(e) => setCustomerId(e.target.value)} className={inputClasses} />}</FormField>
         <FormField label="Guarantor name (if not a customer)">{(id) => <input id={id} value={guarantorName} onChange={(e) => setGuarantorName(e.target.value)} className={inputClasses} />}</FormField>
+        <FormField label="Phone">{(id) => <input id={id} value={guarantorPhone} onChange={(e) => setGuarantorPhone(e.target.value)} className={inputClasses} />}</FormField>
+        <FormField label="Relationship to guarantor">
+          {(id) => (
+            <select id={id} value={relationship} onChange={(e) => setRelationship(e.target.value)} className={selectClasses}>
+              <option value="">Select…</option>
+              {GUARANTOR_RELATIONSHIPS.map((r) => (
+                <option key={r} value={r} className="capitalize">
+                  {r}
+                </option>
+              ))}
+            </select>
+          )}
+        </FormField>
+        <FormField label="Guaranteed amount (GH₵)">{(id) => <input id={id} type="number" step="0.01" value={guaranteedAmount} onChange={(e) => setGuaranteedAmount(e.target.value)} className={inputClasses} />}</FormField>
+        {error && (
+          <p role="alert" className="text-[13px] text-danger">
+            {error}
+          </p>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
+/**
+ * "Replace" (item 3c) is just an edit of the same record's fields, not a
+ * new row. If the loan has already been approved/is active, the server
+ * resets verification_status back to 'pending' as the review notice —
+ * this modal doesn't need to know that, the row's badge will show it.
+ */
+function EditCollateralModal({
+  collateral,
+  onClose,
+  onSaved,
+}: {
+  collateral: LoanCollateral | null;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const [description, setDescription] = useState(collateral?.description ?? '');
+  const [estimatedValue, setEstimatedValue] = useState(collateral?.estimated_value_pesewas != null ? String(collateral.estimated_value_pesewas / 100) : '');
+  const [documentUrl, setDocumentUrl] = useState(collateral?.document_url ?? '');
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setDescription(collateral?.description ?? '');
+    setEstimatedValue(collateral?.estimated_value_pesewas != null ? String(collateral.estimated_value_pesewas / 100) : '');
+    setDocumentUrl(collateral?.document_url ?? '');
+    setError(null);
+  }, [collateral]);
+
+  const mutation = useMutation({
+    mutationFn: () =>
+      api.patch(`/loans/${collateral!.loan_id}/collateral/${collateral!.id}`, {
+        description,
+        estimatedValuePesewas: estimatedValue ? parseGhsInput(estimatedValue) : undefined,
+        documentUrl: documentUrl || undefined,
+      }),
+    onSuccess: () => {
+      onSaved();
+      onClose();
+    },
+    onError: (err) => setError(err instanceof ApiError ? err.message : 'Unable to edit collateral'),
+  });
+
+  return (
+    <Modal
+      open={!!collateral}
+      onClose={onClose}
+      title="Edit collateral"
+      footer={
+        <>
+          <Button variant="secondary" size="sm" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button variant="primary" size="sm" disabled={mutation.isPending || !description} onClick={() => mutation.mutate()}>
+            Save
+          </Button>
+        </>
+      }
+    >
+      <div className="flex flex-col gap-3">
+        <FormField label="Description">{(id) => <input id={id} value={description} onChange={(e) => setDescription(e.target.value)} className={inputClasses} />}</FormField>
+        <FormField label="Estimated value (GH₵)">{(id) => <input id={id} type="number" step="0.01" value={estimatedValue} onChange={(e) => setEstimatedValue(e.target.value)} className={inputClasses} />}</FormField>
+        <FormField label="Document URL">{(id) => <input id={id} type="url" value={documentUrl} onChange={(e) => setDocumentUrl(e.target.value)} className={inputClasses} placeholder="https://…" />}</FormField>
+        {error && (
+          <p role="alert" className="text-[13px] text-danger">
+            {error}
+          </p>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
+function RemoveCollateralModal({
+  collateral,
+  onClose,
+  onSaved,
+}: {
+  collateral: LoanCollateral | null;
+  onClose: () => void;
+  onSaved: (reason: string) => void;
+}) {
+  const [reason, setReason] = useState('');
+
+  return (
+    <Modal
+      open={!!collateral}
+      onClose={onClose}
+      title="Remove collateral"
+      footer={
+        <>
+          <Button variant="secondary" size="sm" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button
+            variant="danger"
+            size="sm"
+            disabled={!reason}
+            onClick={() => {
+              onSaved(reason);
+              setReason('');
+            }}
+          >
+            Remove
+          </Button>
+        </>
+      }
+    >
+      <div className="flex flex-col gap-3">
+        <p className="text-[13px] text-text-secondary">
+          This record is never deleted outright — it's marked removed, with a reason, and kept for audit.
+        </p>
+        <FormField label="Reason">{(id) => <input id={id} value={reason} onChange={(e) => setReason(e.target.value)} className={inputClasses} />}</FormField>
+      </div>
+    </Modal>
+  );
+}
+
+function EditGuarantorModal({
+  guarantor,
+  onClose,
+  onSaved,
+}: {
+  guarantor: LoanGuarantor | null;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const [guarantorName, setGuarantorName] = useState(guarantor?.guarantor_name ?? '');
+  const [guarantorPhone, setGuarantorPhone] = useState(guarantor?.guarantor_phone ?? '');
+  const [guaranteedAmount, setGuaranteedAmount] = useState(guarantor?.guaranteed_amount_pesewas != null ? String(guarantor.guaranteed_amount_pesewas / 100) : '');
+  const [relationship, setRelationship] = useState(guarantor?.relationship ?? '');
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setGuarantorName(guarantor?.guarantor_name ?? '');
+    setGuarantorPhone(guarantor?.guarantor_phone ?? '');
+    setGuaranteedAmount(guarantor?.guaranteed_amount_pesewas != null ? String(guarantor.guaranteed_amount_pesewas / 100) : '');
+    setRelationship(guarantor?.relationship ?? '');
+    setError(null);
+  }, [guarantor]);
+
+  const mutation = useMutation({
+    mutationFn: () =>
+      api.patch(`/loans/${guarantor!.loan_id}/guarantors/${guarantor!.id}`, {
+        guarantorName: guarantorName || undefined,
+        guarantorPhone: guarantorPhone || undefined,
+        guaranteedAmountPesewas: guaranteedAmount ? parseGhsInput(guaranteedAmount) : undefined,
+        relationship: relationship || undefined,
+      }),
+    onSuccess: () => {
+      onSaved();
+      onClose();
+    },
+    onError: (err) => setError(err instanceof ApiError ? err.message : 'Unable to edit guarantor'),
+  });
+
+  return (
+    <Modal
+      open={!!guarantor}
+      onClose={onClose}
+      title="Edit guarantor"
+      footer={
+        <>
+          <Button variant="secondary" size="sm" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button variant="primary" size="sm" disabled={mutation.isPending} onClick={() => mutation.mutate()}>
+            Save
+          </Button>
+        </>
+      }
+    >
+      <div className="flex flex-col gap-3">
+        <FormField label="Guarantor name">{(id) => <input id={id} value={guarantorName} onChange={(e) => setGuarantorName(e.target.value)} className={inputClasses} />}</FormField>
         <FormField label="Phone">{(id) => <input id={id} value={guarantorPhone} onChange={(e) => setGuarantorPhone(e.target.value)} className={inputClasses} />}</FormField>
         <FormField label="Relationship to guarantor">
           {(id) => (

@@ -358,7 +358,7 @@ async function getTopLoanCustomersByRevenue(pool, { fromDate, toDate, branchId =
 
 // --- Growth trends ------------------------------------------------------------
 
-const VALID_GRANULARITIES = new Set(['day', 'month', 'year']);
+const VALID_GRANULARITIES = new Set(['day', 'week', 'month', 'year']);
 
 /**
  * Customer recruitment, disbursement, and net-deposit trends bucketed by
@@ -419,6 +419,110 @@ async function getGrowthTrends(pool, { fromDate, toDate, branchId = null, granul
     disbursementTrend: disbursementRows.map((r) => ({ period: r.period, count: r.count, totalPesewas: Number(r.total) })),
     depositGrowth: depositRows.map((r) => ({ period: r.period, netPesewas: Number(r.net_pesewas) })),
     sectorBreakdown: sectorRows.map((r) => ({ sector: r.sector, customerCount: r.customer_count })),
+  };
+}
+
+// --- Repayment / payment-mode breakdown (loan module amendment) --------------
+
+/**
+ * Payment record dashboard (item 2): totals by Payment Mode, breakdown by
+ * Receiver (staff/teller who received it — for cash till accountability),
+ * and a trend line over the date range, all under the SAME filter set
+ * (branch/agent/loan-offer) so every panel reflects one consistent slice.
+ * "Agent" filters on loans.applied_by, the same "loan officer" proxy
+ * resolveLoanOfficerScope already uses elsewhere in this file (see its own
+ * comment — this schema has no dedicated loan-officer/case assignment
+ * concept). A loan_officer caller is always scoped to their own book here
+ * too, never able to pass a different loanOfficerId to see someone else's.
+ */
+async function getRepaymentBreakdown(
+  pool,
+  { fromDate, toDate, branchId = null, loanOfficerId = null, productId = null, granularity = 'day', requestingUser } = {}
+) {
+  if (!fromDate || !toDate) throw new AnalyticsValidationError('fromDate and toDate are required');
+  if (!VALID_GRANULARITIES.has(granularity)) {
+    throw new AnalyticsValidationError(`granularity must be one of ${[...VALID_GRANULARITIES].join(', ')}`);
+  }
+  const scopedLoanOfficerId = resolveLoanOfficerScope(requestingUser, loanOfficerId);
+
+  const clauses = ['lr.payment_date >= $1', 'lr.payment_date <= $2'];
+  const params = [fromDate, toDate];
+  if (branchId) {
+    params.push(branchId);
+    clauses.push(`l.branch_id = $${params.length}`);
+  }
+  if (scopedLoanOfficerId) {
+    params.push(scopedLoanOfficerId);
+    clauses.push(`l.applied_by = $${params.length}`);
+  }
+  if (productId) {
+    params.push(productId);
+    clauses.push(`l.product_id = $${params.length}`);
+  }
+  const where = clauses.join(' AND ');
+
+  const { rows: totalRows } = await pool.query(
+    `SELECT COUNT(*)::int AS count, COALESCE(SUM(lr.amount_pesewas), 0)::bigint AS total_pesewas
+       FROM loan_repayments lr JOIN loans l ON l.id = lr.loan_id
+      WHERE ${where}`,
+    params
+  );
+
+  const { rows: byModeRows } = await pool.query(
+    `SELECT pm.id AS payment_mode_id, pm.code, pm.name,
+            COUNT(*)::int AS count, COALESCE(SUM(lr.amount_pesewas), 0)::bigint AS total_pesewas
+       FROM loan_repayments lr
+       JOIN loans l ON l.id = lr.loan_id
+       LEFT JOIN payment_modes pm ON pm.id = lr.payment_mode_id
+      WHERE ${where}
+      GROUP BY pm.id, pm.code, pm.name
+      ORDER BY total_pesewas DESC`,
+    params
+  );
+
+  const { rows: byReceiverRows } = await pool.query(
+    `SELECT lr.receiver_user_id, u.full_name AS receiver_name,
+            COUNT(*)::int AS count, COALESCE(SUM(lr.amount_pesewas), 0)::bigint AS total_pesewas
+       FROM loan_repayments lr
+       JOIN loans l ON l.id = lr.loan_id
+       LEFT JOIN users u ON u.id = lr.receiver_user_id
+      WHERE ${where}
+      GROUP BY lr.receiver_user_id, u.full_name
+      ORDER BY total_pesewas DESC`,
+    params
+  );
+
+  const { rows: trendRows } = await pool.query(
+    `SELECT date_trunc('${granularity}', lr.payment_date)::date AS period,
+            COUNT(*)::int AS count, COALESCE(SUM(lr.amount_pesewas), 0)::bigint AS total_pesewas
+       FROM loan_repayments lr JOIN loans l ON l.id = lr.loan_id
+      WHERE ${where}
+      GROUP BY period ORDER BY period`,
+    params
+  );
+
+  return {
+    fromDate,
+    toDate,
+    branchId: branchId ? Number(branchId) : null,
+    loanOfficerId: scopedLoanOfficerId ? Number(scopedLoanOfficerId) : null,
+    productId: productId ? Number(productId) : null,
+    granularity,
+    total: { count: totalRows[0].count, totalPesewas: Number(totalRows[0].total_pesewas) },
+    byMode: byModeRows.map((r) => ({
+      paymentModeId: r.payment_mode_id ? Number(r.payment_mode_id) : null,
+      code: r.code,
+      name: r.name ?? 'Unspecified',
+      count: r.count,
+      totalPesewas: Number(r.total_pesewas),
+    })),
+    byReceiver: byReceiverRows.map((r) => ({
+      receiverUserId: r.receiver_user_id ? Number(r.receiver_user_id) : null,
+      receiverName: r.receiver_name ?? 'Unspecified',
+      count: r.count,
+      totalPesewas: Number(r.total_pesewas),
+    })),
+    trend: trendRows.map((r) => ({ period: r.period, count: r.count, totalPesewas: Number(r.total_pesewas) })),
   };
 }
 
@@ -674,6 +778,7 @@ module.exports = {
   getProfitability,
   getTopLoanCustomersByRevenue,
   getGrowthTrends,
+  getRepaymentBreakdown,
   getAgentProductivity,
   getSocialPerformanceSummary,
   generateExecutiveReportPack,

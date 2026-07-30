@@ -575,6 +575,23 @@ async function resetFloatingRateProducts(pool, { asOfDate = todayIso(), resetBy,
 // amendment" for the full list of call sites this touched.
 const ACTIVE_LOAN_STATUSES = ['disbursed', 'paying', 'missed_payment'];
 
+// Loan module amendment (item 3, revised classification): principal, tenor,
+// and the selected loan offer stay editable through these statuses only —
+// the edit action itself disappears once a loan reaches 'approved' (or
+// anything after it). 'pending_approval' IS included deliberately: an
+// edit made here cancels the stale approval_requests row and reverts the
+// loan to 'appraised' (see updateLoanApplication) rather than leaving an
+// approver looking at terms that no longer match the loan.
+const PRE_APPROVAL_EDITABLE_STATUSES = ['applied', 'appraised', 'pending_approval'];
+
+// Guarantor/collateral edits stay possible at any loan status (unlike
+// principal/tenor/offer above), but editing one on a loan that's already
+// been decided resets that record's verification_status back to 'pending'
+// — a lightweight "review notice," reusing the SAME field/mechanism the
+// original add/verify flow already has, rather than inventing a second
+// one. See Decisions_Log.md.
+const REVIEW_TRIGGER_LOAN_STATUSES = new Set(['approved', ...ACTIVE_LOAN_STATUSES]);
+
 /**
  * Loan module amendment (item 5): recomputes — and, if it changed,
  * persists — a disbursed non-overdraft loan's status between 'paying' and
@@ -982,6 +999,171 @@ async function applyForLoan(pool, params) {
   });
 
   return loan;
+}
+
+/**
+ * Loan module amendment (item 3, revised classification): principal, tenor,
+ * and the selected loan offer/product are editable ONLY while the loan is
+ * still pre-approval (see PRE_APPROVAL_EDITABLE_STATUSES) — the button
+ * disappears the moment a loan is 'approved' or later, matching the DB-
+ * layer guard here (this is the enforcement point; the frontend hiding the
+ * button is not). Interest rate/method are never directly editable this
+ * way — only a product SWITCH pulls in that new product's own standard
+ * rate, and a concession is the only path that overrides a rate in place.
+ *
+ * Editing while 'pending_approval' cancels the stale approval_requests
+ * row and reverts the loan to 'appraised', since that request's stamped
+ * amountPesewas (which determines the approval tier) would otherwise no
+ * longer match the loan — see Decisions_Log.md.
+ */
+async function updateLoanApplication(pool, { loanId, principalPesewas, termMonths, productId, repaymentFrequency, updatedBy }) {
+  if (!updatedBy) throw new LoanValidationError('updatedBy is required');
+  if (principalPesewas === undefined && termMonths === undefined && productId === undefined) {
+    throw new LoanValidationError('at least one of principalPesewas, termMonths, productId must be provided');
+  }
+
+  const client = await pool.connect();
+  let result;
+  try {
+    await client.query('BEGIN');
+
+    const { rows: loanRows } = await client.query('SELECT * FROM loans WHERE id = $1 FOR UPDATE', [loanId]);
+    const before = loanRows[0];
+    if (!before) throw new LoanNotFoundError(`loan ${loanId} not found`);
+    if (before.loan_type === 'overdraft') {
+      throw new LoanValidationError('overdraft loans do not support this edit — principal is the requested limit, fixed at application');
+    }
+    if (!PRE_APPROVAL_EDITABLE_STATUSES.includes(before.status)) {
+      throw new LoanConflictError(`loan ${loanId} terms can only be edited before approval (status: ${before.status})`);
+    }
+
+    const productChanged = productId !== undefined && Number(productId) !== Number(before.product_id);
+    const newProductId = productId !== undefined ? productId : before.product_id;
+    const newPrincipal = principalPesewas !== undefined ? principalPesewas : Number(before.principal_pesewas);
+    const newTerm = termMonths !== undefined ? termMonths : before.term_months;
+    const newFrequency = repaymentFrequency !== undefined ? repaymentFrequency : before.repayment_frequency;
+
+    const product = await getLoanProduct(client, newProductId);
+    if (product.status !== 'active') throw new LoanConflictError(`loan_product ${newProductId} is not active`);
+    if (product.loan_type !== before.loan_type) {
+      throw new LoanValidationError(
+        `product ${product.code} is a '${product.loan_type}' product; loan ${loanId} is '${before.loan_type}' — switching loan_type via edit is not supported, apply for a new loan instead`
+      );
+    }
+    assertWithinProductLimits(product, newPrincipal, newTerm);
+    assertRepaymentFrequencyAllowed(product, newFrequency);
+
+    if (productChanged) {
+      const { rows: pendingConcessionRows } = await client.query(
+        `SELECT lc.id FROM loan_concessions lc
+           JOIN approval_requests ar ON ar.id = lc.approval_request_id
+          WHERE lc.loan_id = $1 AND ar.status = 'pending'`,
+        [loanId]
+      );
+      if (pendingConcessionRows.length > 0) {
+        throw new LoanConflictError(
+          `loan ${loanId} has a concession awaiting approval against the current offer — resolve it before switching offers`
+        );
+      }
+    }
+
+    let newStatus = before.status;
+    if (before.status === 'pending_approval') {
+      const { rows: pendingApprovalRows } = await client.query(
+        `SELECT id FROM approval_requests
+          WHERE action_type = 'loan.approve' AND entity_type = 'loan' AND entity_id = $1 AND status = 'pending'`,
+        [String(loanId)]
+      );
+      if (pendingApprovalRows.length > 0) {
+        await client.query(`UPDATE approval_requests SET status = 'cancelled', updated_at = now() WHERE id = $1`, [
+          pendingApprovalRows[0].id,
+        ]);
+      }
+      newStatus = 'appraised';
+    }
+
+    // Interest/fee terms are only re-snapshotted from the product when the
+    // product itself changes — a plain principal/tenor edit on the SAME
+    // product must never disturb annual_interest_rate_bps (which may
+    // already reflect an approved concession) or the fee/grace-period
+    // snapshot.
+    const { rows } = productChanged
+      ? await client.query(
+          `UPDATE loans
+              SET product_id = $1, principal_pesewas = $2, term_months = $3, repayment_frequency = $4,
+                  interest_method = $5, annual_interest_rate_bps = $6, fee_schedule = $7, duration_unit = $8,
+                  processing_fee_basis = $9, processing_fee_amount_pesewas = $10, processing_fee_rate_bps = $11,
+                  insurance_fee_basis = $12, insurance_fee_amount_pesewas = $13, insurance_fee_rate_bps = $14,
+                  default_charge_basis = $15, default_charge_amount_pesewas = $16, default_charge_rate_bps = $17,
+                  repayment_grace_period_days = $18, installment_grace_period_days = $19,
+                  status = $20, terms_last_edited_at = now(), terms_last_edited_by = $21, updated_at = now()
+            WHERE id = $22
+            RETURNING *`,
+          [
+            newProductId,
+            newPrincipal,
+            newTerm,
+            newFrequency,
+            product.interest_method,
+            product.annual_interest_rate_bps,
+            JSON.stringify(product.fee_schedule),
+            product.duration_unit,
+            product.processing_fee_basis,
+            product.processing_fee_amount_pesewas,
+            product.processing_fee_rate_bps,
+            product.insurance_fee_basis,
+            product.insurance_fee_amount_pesewas,
+            product.insurance_fee_rate_bps,
+            product.default_charge_basis,
+            product.default_charge_amount_pesewas,
+            product.default_charge_rate_bps,
+            product.repayment_grace_period_days,
+            product.installment_grace_period_days,
+            newStatus,
+            updatedBy,
+            loanId,
+          ]
+        )
+      : await client.query(
+          `UPDATE loans
+              SET principal_pesewas = $1, term_months = $2, repayment_frequency = $3,
+                  status = $4, terms_last_edited_at = now(), terms_last_edited_by = $5, updated_at = now()
+            WHERE id = $6
+            RETURNING *`,
+          [newPrincipal, newTerm, newFrequency, newStatus, updatedBy, loanId]
+        );
+    result = rows[0];
+
+    await auditLog.record(client, {
+      userId: updatedBy,
+      branchId: before.branch_id,
+      action: 'loan.terms_edited',
+      entityType: 'loan',
+      entityId: loanId,
+      beforeState: {
+        productId: before.product_id,
+        principalPesewas: Number(before.principal_pesewas),
+        termMonths: before.term_months,
+        repaymentFrequency: before.repayment_frequency,
+        status: before.status,
+      },
+      afterState: {
+        productId: newProductId,
+        principalPesewas: newPrincipal,
+        termMonths: newTerm,
+        repaymentFrequency: newFrequency,
+        status: newStatus,
+      },
+    });
+
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+  return result;
 }
 
 // --- Appraisal -------------------------------------------------------------
@@ -1583,17 +1765,31 @@ function toMathRow(row) {
  *     Cr Loan Interest Income    interest component
  *     Cr Loan Fee Income         fee component (if any)
  */
-async function postRepayment(pool, { loanId, amountPesewas, paymentDate = todayIso(), receivedBy }) {
+async function postRepayment(
+  pool,
+  { loanId, amountPesewas, paymentDate = todayIso(), receivedBy, paymentModeId, receiverUserId, transactionReference = null }
+) {
   if (!receivedBy) throw new LoanValidationError('receivedBy is required');
   if (!Number.isInteger(amountPesewas) || amountPesewas <= 0) {
     throw new LoanValidationError('amountPesewas must be a positive integer');
   }
+  if (!paymentModeId) throw new LoanValidationError('paymentModeId is required');
+  if (!receiverUserId) throw new LoanValidationError('receiverUserId is required');
 
   const client = await pool.connect();
   let context;
 
   try {
     await client.query('BEGIN');
+
+    const { rows: modeRows } = await client.query('SELECT * FROM payment_modes WHERE id = $1', [paymentModeId]);
+    if (!modeRows[0]) throw new LoanValidationError(`payment mode ${paymentModeId} not found`);
+    if (modeRows[0].status !== 'active') {
+      throw new LoanValidationError(`payment mode '${modeRows[0].name}' is not active`);
+    }
+
+    const { rows: receiverRows } = await client.query('SELECT id FROM users WHERE id = $1', [receiverUserId]);
+    if (!receiverRows[0]) throw new LoanValidationError(`receiver user ${receiverUserId} not found`);
 
     const { rows: loanRows } = await client.query('SELECT * FROM loans WHERE id = $1 FOR UPDATE', [loanId]);
     const loan = loanRows[0];
@@ -1643,8 +1839,8 @@ async function postRepayment(pool, { loanId, amountPesewas, paymentDate = todayI
       const { rows: repaymentRows } = await client.query(
         `INSERT INTO loan_repayments
            (loan_id, schedule_id, amount_pesewas, principal_component_pesewas, interest_component_pesewas,
-            fees_component_pesewas, payment_date, received_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            fees_component_pesewas, payment_date, received_by, payment_mode_id, receiver_user_id, transaction_reference)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
          RETURNING id`,
         [
           loanId,
@@ -1655,6 +1851,9 @@ async function postRepayment(pool, { loanId, amountPesewas, paymentDate = todayI
           allocation.feesPaidPesewas,
           paymentDate,
           receivedBy,
+          paymentModeId,
+          receiverUserId,
+          transactionReference,
         ]
       );
       repaymentIds.push(repaymentRows[0].id);
@@ -1742,6 +1941,12 @@ async function listRepayments(pool, { loanId }) {
     'SELECT * FROM loan_repayments WHERE loan_id = $1 ORDER BY payment_date, id',
     [loanId]
   );
+  return rows;
+}
+
+/** Powers the Payment Mode dropdown on the repayment-recording forms. */
+async function listPaymentModes(pool, { status = 'active' } = {}) {
+  const { rows } = await pool.query('SELECT * FROM payment_modes WHERE status = $1 ORDER BY name', [status]);
   return rows;
 }
 
@@ -2297,6 +2502,87 @@ async function listCollateral(pool, { loanId }) {
   return rows;
 }
 
+/**
+ * Edits an existing collateral record ("replace" per item 3c is just an
+ * edit of the same row's description/value/document, not a new row). If
+ * the loan has already been decided (approved or currently active),
+ * flips verification_status back to 'pending' as the review notice — see
+ * REVIEW_TRIGGER_LOAN_STATUSES.
+ */
+const MUTABLE_COLLATERAL_FIELDS = {
+  description: 'description',
+  estimatedValuePesewas: 'estimated_value_pesewas',
+  documentUrl: 'document_url',
+};
+
+async function updateCollateral(pool, { collateralId, updatedBy, ...fields }) {
+  if (!updatedBy) throw new LoanValidationError('updatedBy is required');
+  const { rows: beforeRows } = await pool.query('SELECT * FROM loan_collateral WHERE id = $1', [collateralId]);
+  const before = beforeRows[0];
+  if (!before) throw new LoanNotFoundError(`loan_collateral ${collateralId} not found`);
+  if (before.removed_at) throw new LoanConflictError(`loan_collateral ${collateralId} has been removed`);
+
+  const loan = await getLoan(pool, before.loan_id);
+  const requiresReview = REVIEW_TRIGGER_LOAN_STATUSES.has(loan.status);
+
+  const setClauses = [];
+  const params = [];
+  for (const [key, column] of Object.entries(MUTABLE_COLLATERAL_FIELDS)) {
+    if (fields[key] !== undefined) {
+      params.push(fields[key]);
+      setClauses.push(`${column} = $${params.length}`);
+    }
+  }
+  if (setClauses.length === 0) return before;
+  if (requiresReview) {
+    setClauses.push(`verification_status = 'pending'`, `verified_by = NULL`);
+  }
+
+  params.push(collateralId);
+  const { rows } = await pool.query(
+    `UPDATE loan_collateral SET ${setClauses.join(', ')} WHERE id = $${params.length} RETURNING *`,
+    params
+  );
+
+  await auditLog.record(pool, {
+    userId: updatedBy,
+    branchId: loan.branch_id,
+    action: 'loan.collateral_edited',
+    entityType: 'loan',
+    entityId: before.loan_id,
+    beforeState: before,
+    afterState: rows[0],
+  });
+  return rows[0];
+}
+
+/** Soft-delete only — a collateral record is never hard-deleted (CLAUDE.md rule 3). */
+async function removeCollateral(pool, { collateralId, reason, removedBy }) {
+  if (!removedBy) throw new LoanValidationError('removedBy is required');
+  if (!reason) throw new LoanValidationError('reason is required');
+  const { rows: beforeRows } = await pool.query('SELECT * FROM loan_collateral WHERE id = $1', [collateralId]);
+  const before = beforeRows[0];
+  if (!before) throw new LoanNotFoundError(`loan_collateral ${collateralId} not found`);
+  if (before.removed_at) throw new LoanConflictError(`loan_collateral ${collateralId} has already been removed`);
+
+  const loan = await getLoan(pool, before.loan_id);
+  const { rows } = await pool.query(
+    `UPDATE loan_collateral SET removed_at = now(), removed_by = $1, removal_reason = $2 WHERE id = $3 RETURNING *`,
+    [removedBy, reason, collateralId]
+  );
+
+  await auditLog.record(pool, {
+    userId: removedBy,
+    branchId: loan.branch_id,
+    action: 'loan.collateral_removed',
+    entityType: 'loan',
+    entityId: before.loan_id,
+    beforeState: before,
+    afterState: rows[0],
+  });
+  return rows[0];
+}
+
 async function addGuarantor(pool, params) {
   const {
     loanId,
@@ -2331,6 +2617,81 @@ async function addGuarantor(pool, params) {
 async function listGuarantors(pool, { loanId }) {
   const { rows } = await pool.query('SELECT * FROM loan_guarantors WHERE loan_id = $1 ORDER BY id', [loanId]);
   return rows;
+}
+
+const MUTABLE_GUARANTOR_FIELDS = {
+  guarantorName: 'guarantor_name',
+  guarantorPhone: 'guarantor_phone',
+  guaranteedAmountPesewas: 'guaranteed_amount_pesewas',
+  relationship: 'relationship',
+};
+
+/**
+ * Edits an existing guarantor record's supporting details. If the loan
+ * has already been decided (approved or currently active), flips
+ * verification_status back to 'pending' as the review notice — same
+ * mechanism updateCollateral uses, see REVIEW_TRIGGER_LOAN_STATUSES.
+ */
+async function updateGuarantor(pool, { guarantorId, updatedBy, ...fields }) {
+  if (!updatedBy) throw new LoanValidationError('updatedBy is required');
+  const { rows: beforeRows } = await pool.query('SELECT * FROM loan_guarantors WHERE id = $1', [guarantorId]);
+  const before = beforeRows[0];
+  if (!before) throw new LoanNotFoundError(`loan_guarantors ${guarantorId} not found`);
+
+  const loan = await getLoan(pool, before.loan_id);
+  const requiresReview = REVIEW_TRIGGER_LOAN_STATUSES.has(loan.status);
+
+  const setClauses = [];
+  const params = [];
+  for (const [key, column] of Object.entries(MUTABLE_GUARANTOR_FIELDS)) {
+    if (fields[key] !== undefined) {
+      params.push(fields[key]);
+      setClauses.push(`${column} = $${params.length}`);
+    }
+  }
+  if (setClauses.length === 0) return before;
+  if (requiresReview) {
+    setClauses.push(`verification_status = 'pending'`, `verified_by = NULL`);
+  }
+
+  params.push(guarantorId);
+  const { rows } = await pool.query(
+    `UPDATE loan_guarantors SET ${setClauses.join(', ')} WHERE id = $${params.length} RETURNING *`,
+    params
+  );
+
+  await auditLog.record(pool, {
+    userId: updatedBy,
+    branchId: loan.branch_id,
+    action: 'loan.guarantor_edited',
+    entityType: 'loan',
+    entityId: before.loan_id,
+    beforeState: before,
+    afterState: rows[0],
+  });
+  return rows[0];
+}
+
+/** Guarantors never had a verify action despite carrying verification_status since migration 025 — added alongside the edit/review flow above. */
+async function verifyGuarantor(pool, { guarantorId, verificationStatus, verifiedBy }) {
+  if (!['verified', 'rejected'].includes(verificationStatus)) {
+    throw new LoanValidationError("verificationStatus must be 'verified' or 'rejected'");
+  }
+  const { rows } = await pool.query(
+    `UPDATE loan_guarantors SET verification_status = $1, verified_by = $2 WHERE id = $3 RETURNING *`,
+    [verificationStatus, verifiedBy, guarantorId]
+  );
+  if (!rows[0]) throw new LoanNotFoundError(`loan_guarantors ${guarantorId} not found`);
+  const loan = await getLoan(pool, rows[0].loan_id);
+  await auditLog.record(pool, {
+    userId: verifiedBy,
+    branchId: loan.branch_id,
+    action: 'loan.guarantor_verified',
+    entityType: 'loan',
+    entityId: rows[0].loan_id,
+    afterState: rows[0],
+  });
+  return rows[0];
 }
 
 // --- Arrears / aging report ----------------------------------------------------
@@ -2413,6 +2774,7 @@ module.exports = {
   listLoanProducts,
   calculateLoan,
   applyForLoan,
+  updateLoanApplication,
   getLoan,
   listLoans,
   submitAppraisal,
@@ -2427,6 +2789,7 @@ module.exports = {
   getLoanSchedule,
   postRepayment,
   listRepayments,
+  listPaymentModes,
   requestRestructure,
   applyRestructureOnApproval,
   requestConcession,
@@ -2436,8 +2799,12 @@ module.exports = {
   writeOffLoan,
   addCollateral,
   verifyCollateral,
+  updateCollateral,
+  removeCollateral,
   listCollateral,
   addGuarantor,
+  updateGuarantor,
+  verifyGuarantor,
   listGuarantors,
   waiveDefaultCharge,
   getArrearsReport,
