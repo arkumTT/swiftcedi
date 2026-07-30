@@ -183,6 +183,19 @@ export interface ExecutiveReportPack {
   };
 }
 
+export interface RepaymentBreakdown {
+  fromDate: string;
+  toDate: string;
+  branchId: number | null;
+  loanOfficerId: number | null;
+  productId: number | null;
+  granularity: 'day' | 'week' | 'month' | 'year';
+  total: { count: number; totalPesewas: number };
+  byMode: { paymentModeId: number | null; code: string | null; name: string; count: number; totalPesewas: number }[];
+  byReceiver: { receiverUserId: number | null; receiverName: string; count: number; totalPesewas: number }[];
+  trend: { period: string; count: number; totalPesewas: number }[];
+}
+
 export interface ReportTemplate {
   id: string;
   name: string;
@@ -342,6 +355,10 @@ export interface Loan {
     | 'written_off';
   disbursed_at: string | null;
   created_at: string;
+  // "Review notice" — set whenever principal/tenor/offer is edited
+  // pre-approval (see updateLoanApplication). Not cleared automatically.
+  terms_last_edited_at: string | null;
+  terms_last_edited_by: string | null;
   // Attached by loanService's getLoan/listLoans (not stored on the loans
   // table itself) — see attachLoanAggregates.
   total_paid_pesewas: number;
@@ -659,6 +676,23 @@ export interface LoanRepayment {
   fees_component_pesewas: number;
   payment_date: string;
   received_by: string;
+  payment_mode_id: string | null;
+  receiver_user_id: string | null;
+  transaction_reference: string | null;
+}
+
+export interface PaymentMode {
+  id: string;
+  code: string;
+  name: string;
+  status: 'active' | 'inactive';
+}
+
+export interface StaffMember {
+  id: string;
+  full_name: string;
+  role_name: string;
+  home_branch_id: string;
 }
 
 export interface LoanCollateral {
@@ -668,6 +702,8 @@ export interface LoanCollateral {
   estimated_value_pesewas: number | null;
   document_url: string | null;
   verification_status: 'pending' | 'verified' | 'rejected';
+  removed_at: string | null;
+  removal_reason: string | null;
 }
 
 export interface LoanGuarantor {

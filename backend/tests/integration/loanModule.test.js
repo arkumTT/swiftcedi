@@ -33,6 +33,7 @@ describeIfDb('Module 3: loan management', () => {
   let branchManagerRoleId;
   let loanOfficerRoleId;
   let systemAdminRoleId;
+  let cashPaymentModeId;
   let maker;
   let checker;
   let branchManagerChecker;
@@ -158,6 +159,11 @@ describeIfDb('Module 3: loan management', () => {
     loanOfficerRoleId = loRoleRows[0].id;
     const { rows: saRoleRows } = await pool.query("SELECT id FROM roles WHERE name = 'system_admin'");
     systemAdminRoleId = saRoleRows[0].id;
+    // Seeded once by migration 067, never truncated by this suite (a
+    // reference table like roles/permissions) — every postRepayment call
+    // below needs a real paymentModeId now that it's required.
+    const { rows: cashModeRows } = await pool.query("SELECT id FROM payment_modes WHERE code = 'cash'");
+    cashPaymentModeId = cashModeRows[0].id;
 
     maker = await createTestUser('loan-maker@test.local');
     checker = await createTestUser('loan-checker@test.local');
@@ -495,6 +501,303 @@ describeIfDb('Module 3: loan management', () => {
     });
   });
 
+  describe('repayment: payment mode and receiver of funds', () => {
+    let mobileMoneyModeId;
+
+    beforeAll(async () => {
+      const { rows } = await pool.query("SELECT id FROM payment_modes WHERE code = 'mobile_money'");
+      mobileMoneyModeId = rows[0].id;
+    });
+
+    test('paymentModeId and receiverUserId are both required', async () => {
+      const product = await createProduct();
+      const customer = await createVerifiedCustomer('Payment Fields Borrower');
+      const disbursed = await takeLoanToDisbursed({ product, customer, principalPesewas: 50000, termMonths: 3 });
+
+      await expect(
+        loanService.postRepayment(pool, { loanId: disbursed.id, amountPesewas: 1000, receivedBy: maker, receiverUserId: maker })
+      ).rejects.toThrow(loanService.LoanValidationError);
+      await expect(
+        loanService.postRepayment(pool, { loanId: disbursed.id, amountPesewas: 1000, receivedBy: maker, paymentModeId: cashPaymentModeId })
+      ).rejects.toThrow(loanService.LoanValidationError);
+    });
+
+    test('an inactive or nonexistent payment mode is rejected', async () => {
+      const product = await createProduct();
+      const customer = await createVerifiedCustomer('Inactive Mode Borrower');
+      const disbursed = await takeLoanToDisbursed({ product, customer, principalPesewas: 50000, termMonths: 3 });
+
+      await expect(
+        loanService.postRepayment(pool, {
+          loanId: disbursed.id,
+          amountPesewas: 1000,
+          receivedBy: maker,
+          paymentModeId: 999999,
+          receiverUserId: maker,
+        })
+      ).rejects.toThrow(loanService.LoanValidationError);
+
+      // payment_modes is a reference table like roles/permissions — never
+      // truncated between runs — so this must be idempotent across repeat
+      // local runs, not just a fresh CI database.
+      const { rows: inactiveRows } = await pool.query(
+        `INSERT INTO payment_modes (code, name, status) VALUES ('cheque', 'Cheque', 'inactive')
+         ON CONFLICT (code) DO UPDATE SET status = 'inactive'
+         RETURNING id`
+      );
+      await expect(
+        loanService.postRepayment(pool, {
+          loanId: disbursed.id,
+          amountPesewas: 1000,
+          receivedBy: maker,
+          paymentModeId: inactiveRows[0].id,
+          receiverUserId: maker,
+        })
+      ).rejects.toThrow(loanService.LoanValidationError);
+    });
+
+    test('a nonexistent receiver is rejected', async () => {
+      const product = await createProduct();
+      const customer = await createVerifiedCustomer('Bad Receiver Borrower');
+      const disbursed = await takeLoanToDisbursed({ product, customer, principalPesewas: 50000, termMonths: 3 });
+
+      await expect(
+        loanService.postRepayment(pool, {
+          loanId: disbursed.id,
+          amountPesewas: 1000,
+          receivedBy: maker,
+          paymentModeId: cashPaymentModeId,
+          receiverUserId: 999999,
+        })
+      ).rejects.toThrow(loanService.LoanValidationError);
+    });
+
+    test('mode/receiver/reference are stamped identically onto every loan_repayments row a single call produces, regardless of mode', async () => {
+      const product = await createProduct();
+      const customer = await createVerifiedCustomer('Multi-Installment Payer');
+      const disbursed = await takeLoanToDisbursed({ product, customer, principalPesewas: 100000, termMonths: 3 });
+
+      // Pays across more than one installment in a single call — same
+      // physical payment, so every resulting row must carry the same
+      // payment_mode_id/receiver_user_id/transaction_reference.
+      const schedule = await loanService.getLoanSchedule(pool, { loanId: disbursed.id });
+      const twoInstallments =
+        Number(schedule[0].principal_due_pesewas) +
+        Number(schedule[0].interest_due_pesewas) +
+        Number(schedule[1].principal_due_pesewas) +
+        Number(schedule[1].interest_due_pesewas);
+
+      await loanService.postRepayment(pool, {
+        loanId: disbursed.id,
+        amountPesewas: twoInstallments,
+        receivedBy: maker,
+        paymentModeId: mobileMoneyModeId,
+        receiverUserId: checker,
+        transactionReference: 'MOMO-REF-777',
+      });
+
+      const repayments = await loanService.listRepayments(pool, { loanId: disbursed.id });
+      expect(repayments.length).toBeGreaterThanOrEqual(2);
+      for (const r of repayments) {
+        expect(Number(r.payment_mode_id)).toBe(Number(mobileMoneyModeId));
+        expect(Number(r.receiver_user_id)).toBe(Number(checker));
+        expect(r.transaction_reference).toBe('MOMO-REF-777');
+      }
+    });
+
+    test('receiver is the same single field for Cash as for Mobile Money — no mode-conditional lookup table', async () => {
+      const product = await createProduct();
+      const customer = await createVerifiedCustomer('Cash Payer');
+      const disbursed = await takeLoanToDisbursed({ product, customer, principalPesewas: 50000, termMonths: 3 });
+
+      const result = await loanService.postRepayment(pool, {
+        loanId: disbursed.id,
+        amountPesewas: 1000,
+        receivedBy: maker,
+        paymentModeId: cashPaymentModeId,
+        receiverUserId: checker,
+      });
+      expect(result).toBeTruthy();
+
+      const [repayment] = await loanService.listRepayments(pool, { loanId: disbursed.id });
+      expect(Number(repayment.receiver_user_id)).toBe(Number(checker));
+    });
+  });
+
+  describe('loan terms edit: principal/tenor/offer (item 3, revised classification)', () => {
+    test('principal and tenor are editable while applied, constrained to the product limits', async () => {
+      const product = await createProduct({ minPrincipalPesewas: 10000, maxPrincipalPesewas: 200000, minTermMonths: 1, maxTermMonths: 12 });
+      const customer = await createVerifiedCustomer('Edit Terms Borrower');
+      const loan = await loanService.applyForLoan(pool, {
+        customerId: customer.id,
+        productId: product.id,
+        principalPesewas: 50000,
+        termMonths: 6,
+        appliedBy: maker,
+      });
+
+      const updated = await loanService.updateLoanApplication(pool, {
+        loanId: loan.id,
+        principalPesewas: 150000,
+        termMonths: 10,
+        updatedBy: maker,
+      });
+      expect(Number(updated.principal_pesewas)).toBe(150000);
+      expect(updated.term_months).toBe(10);
+      expect(updated.terms_last_edited_at).not.toBeNull();
+      expect(Number(updated.terms_last_edited_by)).toBe(Number(maker));
+
+      await expect(
+        loanService.updateLoanApplication(pool, { loanId: loan.id, principalPesewas: 999999999, updatedBy: maker })
+      ).rejects.toThrow(loanService.LoanValidationError);
+      await expect(
+        loanService.updateLoanApplication(pool, { loanId: loan.id, termMonths: 999, updatedBy: maker })
+      ).rejects.toThrow(loanService.LoanValidationError);
+    });
+
+    test('the edit is rejected once the loan is approved — server-side, not just a hidden button', async () => {
+      const product = await createProduct();
+      const customer = await createVerifiedCustomer('Locked Terms Borrower');
+      const disbursed = await takeLoanToDisbursed({ product, customer, principalPesewas: 50000, termMonths: 6 });
+
+      await expect(
+        loanService.updateLoanApplication(pool, { loanId: disbursed.id, principalPesewas: 60000, updatedBy: maker })
+      ).rejects.toThrow(loanService.LoanConflictError);
+    });
+
+    test('editing while pending_approval cancels the stale approval request and reverts the loan to appraised', async () => {
+      const product = await createProduct();
+      const customer = await createVerifiedCustomer('Pending Edit Borrower');
+      const loan = await loanService.applyForLoan(pool, {
+        customerId: customer.id,
+        productId: product.id,
+        principalPesewas: 50000,
+        termMonths: 6,
+        appliedBy: maker,
+      });
+      await loanService.submitAppraisal(pool, { loanId: loan.id, checklist: {}, recommendation: 'recommend', appraiserId: maker });
+      const approval = await loanService.requestLoanApproval(pool, { loanId: loan.id, requestedBy: maker });
+
+      const edited = await loanService.updateLoanApplication(pool, { loanId: loan.id, termMonths: 9, updatedBy: maker });
+      expect(edited.status).toBe('appraised');
+
+      const { rows } = await pool.query('SELECT status FROM approval_requests WHERE id = $1', [approval.id]);
+      expect(rows[0].status).toBe('cancelled');
+    });
+
+    test('switching the loan offer re-snapshots interest/fee terms from the new offer', async () => {
+      const productA = await createProduct({ annualInterestRateBps: 2400 });
+      const productB = await createProduct({ annualInterestRateBps: 3600 });
+      const customer = await createVerifiedCustomer('Switch Offer Borrower');
+      const loan = await loanService.applyForLoan(pool, {
+        customerId: customer.id,
+        productId: productA.id,
+        principalPesewas: 50000,
+        termMonths: 6,
+        appliedBy: maker,
+      });
+      expect(loan.annual_interest_rate_bps).toBe(2400);
+
+      const updated = await loanService.updateLoanApplication(pool, { loanId: loan.id, productId: productB.id, updatedBy: maker });
+      expect(Number(updated.product_id)).toBe(Number(productB.id));
+      expect(updated.annual_interest_rate_bps).toBe(3600);
+    });
+
+    test('overdraft loans do not support this edit', async () => {
+      const product = await createProduct({ loanType: 'overdraft', annualInterestRateBps: 3000 });
+      const customer = await createVerifiedCustomer('OD Edit Borrower');
+      const account = await openOverdraftAccount(customer);
+      const loan = await loanService.applyForLoan(pool, {
+        customerId: customer.id,
+        productId: product.id,
+        principalPesewas: 500000,
+        termMonths: 12,
+        overdraftSavingsAccountId: account.id,
+        appliedBy: maker,
+      });
+
+      await expect(
+        loanService.updateLoanApplication(pool, { loanId: loan.id, principalPesewas: 600000, updatedBy: maker })
+      ).rejects.toThrow(loanService.LoanValidationError);
+    });
+  });
+
+  describe('guarantor/collateral edit: review notice on an already-decided loan', () => {
+    test('editing a guarantor on a disbursed loan resets verification_status to pending', async () => {
+      const product = await createProduct();
+      const customer = await createVerifiedCustomer('Guarantor Edit Borrower');
+      const disbursed = await takeLoanToDisbursed({ product, customer, principalPesewas: 50000, termMonths: 6 });
+
+      const guarantor = await loanService.addGuarantor(pool, {
+        loanId: disbursed.id,
+        guarantorName: 'Original Name',
+        createdBy: maker,
+      });
+      const verified = await loanService.verifyGuarantor(pool, {
+        guarantorId: guarantor.id,
+        verificationStatus: 'verified',
+        verifiedBy: checker,
+      });
+      expect(verified.verification_status).toBe('verified');
+
+      const edited = await loanService.updateGuarantor(pool, {
+        guarantorId: guarantor.id,
+        guarantorPhone: '0244000111',
+        updatedBy: maker,
+      });
+      expect(edited.verification_status).toBe('pending');
+      expect(edited.verified_by).toBeNull();
+      expect(edited.guarantor_phone).toBe('0244000111');
+    });
+
+    test('editing a guarantor on a pre-approval loan does NOT force a review reset (nothing to protect yet)', async () => {
+      const product = await createProduct();
+      const customer = await createVerifiedCustomer('Pre-approval Guarantor Borrower');
+      const loan = await loanService.applyForLoan(pool, {
+        customerId: customer.id,
+        productId: product.id,
+        principalPesewas: 50000,
+        termMonths: 6,
+        appliedBy: maker,
+      });
+      const guarantor = await loanService.addGuarantor(pool, { loanId: loan.id, guarantorName: 'Applied Guarantor', createdBy: maker });
+      expect(guarantor.verification_status).toBe('pending');
+
+      const edited = await loanService.updateGuarantor(pool, { guarantorId: guarantor.id, guarantorPhone: '0200000000', updatedBy: maker });
+      // Still pending (it was never anything else), and no verified_by to clobber.
+      expect(edited.verification_status).toBe('pending');
+    });
+
+    test('editing collateral on an approved loan resets verification_status; remove is a soft delete', async () => {
+      const product = await createProduct();
+      const customer = await createVerifiedCustomer('Collateral Edit Borrower');
+      const disbursed = await takeLoanToDisbursed({ product, customer, principalPesewas: 50000, termMonths: 6 });
+
+      const collateral = await loanService.addCollateral(pool, {
+        loanId: disbursed.id,
+        description: 'Motorbike',
+        estimatedValuePesewas: 500000,
+        createdBy: maker,
+      });
+      await loanService.verifyCollateral(pool, { collateralId: collateral.id, verificationStatus: 'verified', verifiedBy: checker });
+
+      const edited = await loanService.updateCollateral(pool, { collateralId: collateral.id, description: 'Motorbike (Honda)', updatedBy: maker });
+      expect(edited.verification_status).toBe('pending');
+      expect(edited.description).toBe('Motorbike (Honda)');
+
+      const removed = await loanService.removeCollateral(pool, { collateralId: collateral.id, reason: 'duplicate entry', removedBy: maker });
+      expect(removed.removed_at).not.toBeNull();
+      expect(removed.removal_reason).toBe('duplicate entry');
+
+      await expect(
+        loanService.updateCollateral(pool, { collateralId: collateral.id, description: 'x', updatedBy: maker })
+      ).rejects.toThrow(loanService.LoanConflictError);
+      await expect(
+        loanService.removeCollateral(pool, { collateralId: collateral.id, reason: 'again', removedBy: maker })
+      ).rejects.toThrow(loanService.LoanConflictError);
+    });
+  });
+
   test('a declined appraisal rejects the loan outright', async () => {
     const product = await createProduct();
     const customer = await createVerifiedCustomer('Declined Borrower');
@@ -574,6 +877,8 @@ describeIfDb('Module 3: loan management', () => {
       amountPesewas: firstInterest + 5000,
       paymentDate: '2026-02-01',
       receivedBy: maker,
+      paymentModeId: cashPaymentModeId,
+      receiverUserId: maker,
     });
     expect(partial.interestComponentPesewas).toBe(firstInterest);
     expect(partial.principalComponentPesewas).toBe(5000);
@@ -597,6 +902,8 @@ describeIfDb('Module 3: loan management', () => {
       amountPesewas: remaining,
       paymentDate: '2026-04-01',
       receivedBy: maker,
+      paymentModeId: cashPaymentModeId,
+      receiverUserId: maker,
     });
     expect(final.loanClosed).toBe(true);
 
@@ -623,7 +930,13 @@ describeIfDb('Module 3: loan management', () => {
     const disbursed = await takeLoanToDisbursed({ product, customer, principalPesewas: 50000, termMonths: 3 });
 
     await expect(
-      loanService.postRepayment(pool, { loanId: disbursed.id, amountPesewas: 99999999, receivedBy: maker })
+      loanService.postRepayment(pool, {
+        loanId: disbursed.id,
+        amountPesewas: 99999999,
+        receivedBy: maker,
+        paymentModeId: cashPaymentModeId,
+        receiverUserId: maker,
+      })
     ).rejects.toThrow(loanService.LoanValidationError);
   });
 
@@ -634,10 +947,22 @@ describeIfDb('Module 3: loan management', () => {
 
     const schedule = await loanService.getLoanSchedule(pool, { loanId: disbursed.id });
     const total = schedule.reduce((s, r) => s + Number(r.principal_due_pesewas) + Number(r.interest_due_pesewas), 0);
-    await loanService.postRepayment(pool, { loanId: disbursed.id, amountPesewas: total, receivedBy: maker });
+    await loanService.postRepayment(pool, {
+      loanId: disbursed.id,
+      amountPesewas: total,
+      receivedBy: maker,
+      paymentModeId: cashPaymentModeId,
+      receiverUserId: maker,
+    });
 
     await expect(
-      loanService.postRepayment(pool, { loanId: disbursed.id, amountPesewas: 1000, receivedBy: maker })
+      loanService.postRepayment(pool, {
+        loanId: disbursed.id,
+        amountPesewas: 1000,
+        receivedBy: maker,
+        paymentModeId: cashPaymentModeId,
+        receiverUserId: maker,
+      })
     ).rejects.toThrow(loanService.LoanConflictError);
   });
 
@@ -653,6 +978,8 @@ describeIfDb('Module 3: loan management', () => {
       amountPesewas: firstInterest + 18000,
       paymentDate: '2026-02-01',
       receivedBy: maker,
+      paymentModeId: cashPaymentModeId,
+      receiverUserId: maker,
     });
 
     const restructure = await loanService.requestRestructure(pool, {
@@ -868,6 +1195,8 @@ describeIfDb('Module 3: loan management', () => {
       loanId: disbursed.id,
       amountPesewas: Number(schedule[0].interest_due_pesewas) + 1000,
       receivedBy: maker,
+      paymentModeId: cashPaymentModeId,
+      receiverUserId: maker,
     });
     const [repayment] = await loanService.listRepayments(pool, { loanId: disbursed.id });
 

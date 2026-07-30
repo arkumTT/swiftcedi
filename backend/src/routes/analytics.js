@@ -84,6 +84,27 @@ function analyticsRouter(pool) {
   );
 
   router.get(
+    '/repayment-breakdown',
+    auth,
+    requirePermission('analytics.view'),
+    asyncHandler(async (req, res) => {
+      const branchId = resolveConsolidatedBranchScope(req);
+      const { fromDate, toDate, loanOfficerId, productId, granularity } = req.query;
+      res.json(
+        await analyticsService.getRepaymentBreakdown(pool, {
+          fromDate,
+          toDate,
+          branchId,
+          loanOfficerId: loanOfficerId ? Number(loanOfficerId) : null,
+          productId: productId ? Number(productId) : null,
+          granularity,
+          requestingUser: req.user,
+        })
+      );
+    })
+  );
+
+  router.get(
     '/agent-productivity',
     auth,
     requirePermission('analytics.view'),

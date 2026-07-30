@@ -124,6 +124,35 @@ function rbacRouter(pool) {
     })
   );
 
+  // Minimal staff directory for dropdowns used outside Admin (e.g. the
+  // repayment "Receiver" picker) — deliberately NOT gated behind
+  // rbac.manage_users like /users below: any authenticated staff member
+  // may see the list of active staff names, the same low-sensitivity bar
+  // as GET /branches or GET /loans/products. Returns only what a dropdown
+  // needs, not the full admin row (no email/last-login/status detail).
+  router.get(
+    '/staff',
+    auth,
+    asyncHandler(async (req, res) => {
+      const { branchId } = req.query;
+      const clauses = ["u.status = 'active'"];
+      const params = [];
+      if (branchId) {
+        params.push(branchId);
+        clauses.push(`u.home_branch_id = $${params.length}`);
+      }
+      const { rows } = await pool.query(
+        `SELECT u.id, u.full_name, r.name AS role_name, u.home_branch_id
+           FROM users u
+           JOIN roles r ON r.id = u.role_id
+          WHERE ${clauses.join(' AND ')}
+          ORDER BY u.full_name`,
+        params
+      );
+      res.json(rows);
+    })
+  );
+
   // Powers the Users & Roles admin table — filterable by role/branch/status
   // plus a name/email search, matching the design spec's "filterable table
   // (role, branch, status)" requirement.

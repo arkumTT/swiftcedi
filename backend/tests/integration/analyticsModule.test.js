@@ -31,6 +31,7 @@ describeIfDb('Module 9: analytics & owner dashboard', () => {
   let ownerRoleId;
   let loanOfficerRoleId;
   let branchManagerRoleId;
+  let cashPaymentModeId;
   let maker;
   let checker;
   let branchManagerChecker;
@@ -146,6 +147,8 @@ describeIfDb('Module 9: analytics & owner dashboard', () => {
     loanOfficerRoleId = officerRoleRows[0].id;
     const { rows: bmRoleRows } = await pool.query("SELECT id FROM roles WHERE name = 'branch_manager'");
     branchManagerRoleId = bmRoleRows[0].id;
+    const { rows: cashModeRows } = await pool.query("SELECT id FROM payment_modes WHERE code = 'cash'");
+    cashPaymentModeId = cashModeRows[0].id;
 
     maker = await createTestUser('analytics-maker@test.local', ownerRoleId);
     checker = await createTestUser('analytics-checker@test.local', ownerRoleId);
@@ -363,7 +366,14 @@ describeIfDb('Module 9: analytics & owner dashboard', () => {
     const schedule = await loanService.getLoanSchedule(pool, { loanId: loan.id });
     const firstInstallment = schedule[0];
     const repaymentAmount = Number(firstInstallment.principal_due_pesewas) + Number(firstInstallment.interest_due_pesewas);
-    await loanService.postRepayment(pool, { loanId: loan.id, amountPesewas: repaymentAmount, paymentDate: '2026-07-15', receivedBy: maker });
+    await loanService.postRepayment(pool, {
+      loanId: loan.id,
+      amountPesewas: repaymentAmount,
+      paymentDate: '2026-07-15',
+      receivedBy: maker,
+      paymentModeId: cashPaymentModeId,
+      receiverUserId: maker,
+    });
 
     const branchProfitability = await analyticsService.getProfitability(pool, { fromDate: '2026-07-01', toDate: '2026-07-31', branchId });
     expect(branchProfitability.totalIncomePesewas).toBeGreaterThan(0);
@@ -398,9 +408,84 @@ describeIfDb('Module 9: analytics & owner dashboard', () => {
 
   test('getGrowthTrends rejects a missing date range and an invalid granularity', async () => {
     await expect(analyticsService.getGrowthTrends(pool, { branchId })).rejects.toThrow(analyticsService.AnalyticsValidationError);
+    // 'week' was added as a valid granularity by the loan module amendment
+    // (the payment dashboard's "weekly" trend option) — every VALID_GRANULARITIES
+    // consumer, including getGrowthTrends, picked it up for free. Use a
+    // genuinely unsupported value here instead.
     await expect(
-      analyticsService.getGrowthTrends(pool, { fromDate: '2026-01-01', toDate: '2026-12-31', granularity: 'week' })
+      analyticsService.getGrowthTrends(pool, { fromDate: '2026-01-01', toDate: '2026-12-31', granularity: 'fortnight' })
     ).rejects.toThrow(analyticsService.AnalyticsValidationError);
+  });
+
+  test('getRepaymentBreakdown aggregates exactly by payment mode, by receiver, and in the trend, over the date range', async () => {
+    const { rows: cashRows } = await pool.query("SELECT id FROM payment_modes WHERE code = 'cash'");
+    const { rows: momoRows } = await pool.query("SELECT id FROM payment_modes WHERE code = 'mobile_money'");
+    const cashModeId = cashRows[0].id;
+    const momoModeId = momoRows[0].id;
+
+    const product = await createProduct();
+    const customer = await createVerifiedCustomer('Breakdown Borrower');
+    const loan = await takeLoanToDisbursed({ product, customer, principalPesewas: 200000, termMonths: 6, disbursementDate: '2026-10-01' });
+
+    await loanService.postRepayment(pool, {
+      loanId: loan.id,
+      amountPesewas: 5000,
+      paymentDate: '2026-10-05',
+      receivedBy: maker,
+      paymentModeId: cashModeId,
+      receiverUserId: maker,
+    });
+    await loanService.postRepayment(pool, {
+      loanId: loan.id,
+      amountPesewas: 7000,
+      paymentDate: '2026-10-05',
+      receivedBy: maker,
+      paymentModeId: momoModeId,
+      receiverUserId: checker,
+      transactionReference: 'MOMO-XYZ',
+    });
+    await loanService.postRepayment(pool, {
+      loanId: loan.id,
+      amountPesewas: 3000,
+      paymentDate: '2026-10-06',
+      receivedBy: maker,
+      paymentModeId: cashModeId,
+      receiverUserId: maker,
+    });
+    // Outside the query's date range — must NOT be counted.
+    await loanService.postRepayment(pool, {
+      loanId: loan.id,
+      amountPesewas: 9000,
+      paymentDate: '2026-11-15',
+      receivedBy: maker,
+      paymentModeId: cashModeId,
+      receiverUserId: maker,
+    });
+
+    const breakdown = await analyticsService.getRepaymentBreakdown(pool, {
+      fromDate: '2026-10-01',
+      toDate: '2026-10-31',
+      branchId,
+      granularity: 'day',
+    });
+
+    expect(breakdown.total.totalPesewas).toBe(15000);
+    expect(breakdown.total.count).toBe(3);
+
+    const byMode = Object.fromEntries(breakdown.byMode.map((m) => [m.code, m.totalPesewas]));
+    expect(byMode.cash).toBe(8000);
+    expect(byMode.mobile_money).toBe(7000);
+
+    const byReceiver = Object.fromEntries(breakdown.byReceiver.map((r) => [Number(r.receiverUserId), r.totalPesewas]));
+    expect(byReceiver[Number(maker)]).toBe(8000);
+    expect(byReceiver[Number(checker)]).toBe(7000);
+
+    // Called directly against the service (not through the HTTP layer's
+    // JSON.stringify), so `period` comes back as a raw pg Date object here.
+    const trendByPeriod = Object.fromEntries(breakdown.trend.map((t) => [new Date(t.period).toISOString().slice(0, 10), t.totalPesewas]));
+    expect(trendByPeriod['2026-10-05']).toBe(12000);
+    expect(trendByPeriod['2026-10-06']).toBe(3000);
+    expect(trendByPeriod['2026-11-15']).toBeUndefined();
   });
 
   // --- Agent / loan officer productivity ---------------------------------------
@@ -447,6 +532,8 @@ describeIfDb('Module 9: analytics & owner dashboard', () => {
       amountPesewas: Math.floor(scheduledDue / 2),
       paymentDate: '2026-09-01',
       receivedBy: maker,
+      paymentModeId: cashPaymentModeId,
+      receiverUserId: maker,
     });
 
     const productivity = await analyticsService.getAgentProductivity(pool, { agentId: officerA, fromDate: '2026-08-01', toDate: '2026-09-30' });

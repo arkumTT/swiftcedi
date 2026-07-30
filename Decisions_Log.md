@@ -286,6 +286,7 @@ values, loan status values, account status values._
 | `loan_schedules.status` | `pending`, `partially_paid`, `paid` | 3 |
 | `loan_appraisals.recommendation` | `recommend`, `decline` | 3 — a `decline` moves the loan straight to `rejected` |
 | `loan_collateral.verification_status` / `loan_guarantors.verification_status` | `pending`, `verified`, `rejected` | 3 |
+| `payment_modes.status` | `active`, `inactive` | 3, loan module amendment — a real lookup table (see that section), not a CHECK enum; `inactive` modes are excluded from `listPaymentModes` and rejected by `postRepayment` |
 | `savings_products.status` | `active`, `inactive` | 4 |
 | `savings_accounts.status` | `active`, `dormant`, `closed` | 4 — `closed` requires a zero balance; nothing sets `dormant` yet (no inactivity job until Module 12) |
 | `savings_transactions.txn_type` | `deposit`, `withdrawal`, `maintenance_fee`, `withdrawal_fee`, `min_balance_charge`, `standing_order_out`, `standing_order_in`, `susu_payout` | 4 — the signed `amount_pesewas` carries direction, so type is descriptive not directional |
@@ -1447,6 +1448,143 @@ loan_officer, lower-tier rejecting an owner/system_admin decider,
 upper-tier decidable by owner/system_admin (rejecting
 branch_manager/loan_officer), and rejection flipping the loan to
 `rejected` with disbursement staying blocked.
+
+### Loan module amendment: payment mode/receiver, payment dashboard, application editing — extension to Module 3
+
+_Added in a later session, after the offer-fields/schedule/statuses/approval-gate
+amendment above. Orientation (where repayments are recorded, the existing
+reporting/dashboard pattern, the loan application form/model and what was
+already editable, staff/role structure, MoMo/payment-channel config) was
+done and summarized before any code was written; the field-by-field
+classification for item 3 was revised by a human after the first proposal
+(principal/tenor/offer moved from "locked" to "safe to edit, pre-approval
+only") before implementation began._
+
+**Schema** (migrations `067`–`069`, all additive):
+
+```
+payment_modes (id, code, name, status) — a real lookup TABLE, not a
+  CHECK-constraint enum, specifically so a bank transfer or cheque mode
+  can be added with a plain INSERT later, no migration required. Seeded
+  with 'cash'/'mobile_money' (067).
+
+loan_repayments += payment_mode_id (FK), receiver_user_id (FK to users),
+  transaction_reference (068) — all nullable (existing rows predate the
+  feature, never backfilled, same convention as
+  investment_payouts.payment_reference). The append-only trigger
+  (migration 024) was extended to cover all three new columns.
+
+loans += terms_last_edited_at, terms_last_edited_by (069) — the "review
+  notice" for principal/tenor/offer edits.
+loan_collateral += removed_at, removed_by, removal_reason (069) — soft
+  delete, never a hard DELETE (CLAUDE.md rule 3).
+```
+
+**"Receiver of funds" is a single field, not mode-conditional — a
+confirmed simplification over the original two-lookup-table proposal**
+(staff dropdown for Cash, a separate MoMo-business-line lookup for Mobile
+Money). Implemented as one FK to `users`, used identically for both
+modes — a dropdown, not free text, matching every other actor column in
+this schema (`received_by`, `requested_by`, `verified_by`, ...) and
+keeping the original "for accountability" intent intact. A separate,
+always-optional `transaction_reference` text field exists alongside it
+for MoMo settlement reconciliation specifically (the frontend only shows
+it when Payment Mode = Mobile Money, but nothing prevents filling it in
+for any mode). **No admin CRUD screen was built for `payment_modes`** —
+new modes need a migration-seeded or direct-SQL row for now; flagged as a
+scope decision, not silently built.
+
+One physical repayment can still produce multiple `loan_repayments` rows
+(one per schedule installment an allocation touches, per the ORIGINAL
+Module 3 design) — `postRepayment` stamps the SAME `payment_mode_id`/
+`receiver_user_id`/`transaction_reference` onto every row from one call,
+since they're one payment, not several.
+
+**Staff picker: a new low-sensitivity endpoint, not the admin one.**
+`GET /rbac/users` (the Users & Roles admin table) is gated behind
+`rbac.manage_users` — wrong bar for a repayment-recording dropdown a
+cashier or loan officer needs. Added `GET /rbac/staff` (id/full_name/
+role_name/home_branch_id only, `auth`-only gate, no special permission),
+matching the existing low-sensitivity bar `GET /branches` and
+`GET /loans/products` already use for reference-data lookups.
+
+**Payment dashboard (item 2) reuses the existing analytics
+pattern exactly** — a new `analyticsService.getRepaymentBreakdown(pool,
+{fromDate, toDate, branchId, loanOfficerId, productId, granularity})`
+alongside `getGrowthTrends`, sharing its date-range/branch-scoping shape
+and its `resolveLoanOfficerScope` self-scoping guard (a loan_officer
+caller can never see another officer's book, matching every other
+per-officer query in this file). `VALID_GRANULARITIES` gained `'week'`
+(previously `day`/`month`/`year` only) — a genuine feature addition
+prompted by item 2's "daily/weekly/monthly trend view" ask, which
+`getGrowthTrends` picked up for free since it shares the same set.
+Exposed as `GET /analytics/repayment-breakdown` under the same
+`analytics.view` permission every other analytics route uses. The
+frontend adds a "Repayment breakdown" card to the existing
+`ReportsPage.tsx` (not a new page/nav item) — KPI tiles, a by-mode table,
+a by-receiver table, and a new single-series `PaymentTrendChart.tsx`
+built in the exact same Recharts/CSS-token style as
+`dashboard/TrendChart.tsx` (no new charting library).
+
+**Loan application editing (item 3) — revised classification, principal/tenor/offer now editable pre-approval:**
+
+| Field | Classification | Notes |
+|---|---|---|
+| Principal, tenor, loan offer/product | **Safe to edit, pre-approval only** | New `loanService.updateLoanApplication`; constrained to the (possibly newly-selected) product's own min/max principal and term via the same `assertWithinProductLimits`/`assertRepaymentFrequencyAllowed` helpers `applyForLoan` already used |
+| Interest rate/method | **Still locked** | Never directly editable; only a product SWITCH pulls in that new product's own standard rate, or an approved concession overrides it — no change to either existing mechanism |
+| Guarantor name/phone/relationship/guaranteed amount | Safe to edit (unchanged from the original classification) | New `updateGuarantor` |
+| Collateral description/value/document URL | Safe to edit; remove is a soft delete (unchanged) | New `updateCollateral`/`removeCollateral` |
+| Applicant contact info | Already editable (unchanged) | Via `customerService.updateCustomer`, not loan-specific |
+
+`PRE_APPROVAL_EDITABLE_STATUSES = ['applied', 'appraised',
+'pending_approval']` — the edit action's server-side enforcement point
+(the frontend "Edit terms" button disappearing is not the only guard).
+`'pending_approval'` is deliberately included: editing here is not
+blocked, but **cancels the loan's pending `loan.approve` request and
+reverts the loan to `'appraised'`**, since that request's stamped
+`amount_pesewas` (which determines the tiered-approval role required —
+see the prior amendment's tiering) would otherwise no longer match the
+loan's new principal. Confirmed as the intended behavior over two
+alternatives (blocking the edit outright while pending, or leaving the
+stale request as-is) before implementation. Switching the loan offer
+re-snapshots ALL offer-derived fields (interest, fees, grace periods,
+duration_unit) from the new product exactly like `applyForLoan` does,
+but ONLY when the product actually changes — a plain principal/tenor
+edit on the same product never touches `annual_interest_rate_bps` (which
+may already reflect an approved concession). A product switch is
+rejected outright if a concession request is still pending against the
+current offer, rather than silently invalidating it.
+
+The "review notice" for principal/tenor/offer is `loans.terms_last_edited_at`/
+`_by`, surfaced as a permanent (non-dismissable) banner on the loan
+detail page — not cleared automatically, since it's a durable record that
+"this application's numbers changed after first submission," for
+whoever appraises/decides it next.
+
+**Guarantor/collateral review notice reuses existing infrastructure,
+confirmed over building a new one.** Both tables already carried
+`verification_status`/`verified_by` from the original Module 3 build;
+editing either on a loan that's already been decided
+(`approved`/`disbursed`/`paying`/`missed_payment` — `REVIEW_TRIGGER_LOAN_STATUSES`)
+resets `verification_status` back to `'pending'` and clears `verified_by`,
+and the pre-existing verify action (extended to guarantors, which never
+had one despite carrying the column since migration 025) is the
+acknowledgement — no new "pending review" flag, no new workflow state
+machine. Editing on a pre-approval loan does not force a reset (nothing
+decided yet to protect).
+
+**Testing note**: `payment_modes` is a reference table like
+`roles`/`permissions` — seeded once by migration 067, never truncated by
+any integration suite — so a test inserting a fixed-code row (the
+"inactive payment mode is rejected" test's `'cheque'` row) must be
+idempotent across repeat LOCAL runs (`ON CONFLICT (code) DO UPDATE`), not
+just a fresh CI database. `postRepayment` gaining two new required
+params (`paymentModeId`, `receiverUserId`) broke every existing call site
+across `loanModule.test.js` and `analyticsModule.test.js` (both use it as
+setup/fixture generation, unrelated to the feature under test in most
+cases) — fixed by adding a `cashPaymentModeId` lookup to each file's
+`beforeAll`, the same pattern already used for role-id lookups, rather
+than loosening the requirement to avoid touching call sites.
 
 ### Savings / susu / standing orders — `backend/src/modules/savings/` (Module 4)
 

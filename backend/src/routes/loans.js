@@ -128,6 +128,16 @@ function loansRouter(pool) {
     })
   );
 
+  // --- Payment modes (lookup table, extensible without a schema change) --
+
+  router.get(
+    '/payment-modes',
+    auth,
+    asyncHandler(async (req, res) => {
+      res.json(await loanService.listPaymentModes(pool, { status: req.query.status || 'active' }));
+    })
+  );
+
   // --- Calculator (no commitment, creates nothing) ----------------------
 
   router.post(
@@ -187,6 +197,27 @@ function loansRouter(pool) {
     auth,
     asyncHandler(async (req, res) => {
       res.json(await loanService.getLoan(pool, req.params.id));
+    })
+  );
+
+  // Principal/tenor/offer edits — pre-approval only (enforced in the
+  // service layer, not just by the frontend hiding the button). Same
+  // permission required to submit the application in the first place.
+  router.patch(
+    '/:id',
+    auth,
+    requirePermission('loan.apply'),
+    asyncHandler(async (req, res) => {
+      const { principalPesewas, termMonths, productId, repaymentFrequency } = req.body || {};
+      const loan = await loanService.updateLoanApplication(pool, {
+        loanId: req.params.id,
+        principalPesewas,
+        termMonths,
+        productId,
+        repaymentFrequency,
+        updatedBy: req.user.id,
+      });
+      res.json(loan);
     })
   );
 
@@ -301,12 +332,15 @@ function loansRouter(pool) {
     auth,
     requirePermission('loan.post_repayment'),
     asyncHandler(async (req, res) => {
-      const { amountPesewas, paymentDate } = req.body || {};
+      const { amountPesewas, paymentDate, paymentModeId, receiverUserId, transactionReference } = req.body || {};
       const result = await loanService.postRepayment(pool, {
         loanId: req.params.id,
         amountPesewas,
         paymentDate,
         receivedBy: req.user.id,
+        paymentModeId,
+        receiverUserId,
+        transactionReference,
       });
       res.status(201).json(result);
     })
@@ -436,6 +470,38 @@ function loansRouter(pool) {
     })
   );
 
+  router.patch(
+    '/:id/collateral/:collateralId',
+    auth,
+    requirePermission('loan.manage_collateral'),
+    asyncHandler(async (req, res) => {
+      const { description, estimatedValuePesewas, documentUrl } = req.body || {};
+      const collateral = await loanService.updateCollateral(pool, {
+        collateralId: req.params.collateralId,
+        description,
+        estimatedValuePesewas,
+        documentUrl,
+        updatedBy: req.user.id,
+      });
+      res.json(collateral);
+    })
+  );
+
+  router.post(
+    '/:id/collateral/:collateralId/remove',
+    auth,
+    requirePermission('loan.manage_collateral'),
+    asyncHandler(async (req, res) => {
+      const { reason } = req.body || {};
+      const collateral = await loanService.removeCollateral(pool, {
+        collateralId: req.params.collateralId,
+        reason,
+        removedBy: req.user.id,
+      });
+      res.json(collateral);
+    })
+  );
+
   router.get(
     '/:id/guarantors',
     auth,
@@ -460,6 +526,39 @@ function loansRouter(pool) {
         createdBy: req.user.id,
       });
       res.status(201).json(guarantor);
+    })
+  );
+
+  router.patch(
+    '/:id/guarantors/:guarantorId',
+    auth,
+    requirePermission('loan.manage_guarantors'),
+    asyncHandler(async (req, res) => {
+      const { guarantorName, guarantorPhone, guaranteedAmountPesewas, relationship } = req.body || {};
+      const guarantor = await loanService.updateGuarantor(pool, {
+        guarantorId: req.params.guarantorId,
+        guarantorName,
+        guarantorPhone,
+        guaranteedAmountPesewas,
+        relationship,
+        updatedBy: req.user.id,
+      });
+      res.json(guarantor);
+    })
+  );
+
+  router.post(
+    '/:id/guarantors/:guarantorId/verify',
+    auth,
+    requirePermission('loan.manage_guarantors'),
+    asyncHandler(async (req, res) => {
+      const { verificationStatus } = req.body || {};
+      const guarantor = await loanService.verifyGuarantor(pool, {
+        guarantorId: req.params.guarantorId,
+        verificationStatus,
+        verifiedBy: req.user.id,
+      });
+      res.json(guarantor);
     })
   );
 

@@ -5,7 +5,7 @@ import { Plus, Calculator, ShieldAlert, ChevronUp, ChevronDown, ClipboardList } 
 import { useAuth } from '../../../auth/AuthContext';
 import { isCrossBranchRole } from '../../../lib/roleScope';
 import { api, ApiError } from '../../../lib/apiClient';
-import { useBranches } from '../../../lib/adminHooks';
+import { useBranches, useStaff, usePaymentModes } from '../../../lib/adminHooks';
 import { Card } from '../../../components/Card';
 import { DataTable, type Column } from '../../../components/DataTable';
 import { FilterToolbar } from '../../../components/FilterToolbar';
@@ -451,9 +451,16 @@ function ManageRepaymentsModal({ loan, onClose, onChanged }: { loan: Loan | null
   const { hasPermission } = useAuth();
   const queryClient = useQueryClient();
   const [amount, setAmount] = useState('');
+  const [paymentModeId, setPaymentModeId] = useState('');
+  const [receiverUserId, setReceiverUserId] = useState('');
+  const [transactionReference, setTransactionReference] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [waiveReason, setWaiveReason] = useState('');
   const [waivingScheduleId, setWaivingScheduleId] = useState<string | null>(null);
+
+  const paymentModesQuery = usePaymentModes();
+  const staffQuery = useStaff();
+  const selectedMode = paymentModesQuery.data?.find((m) => m.id === paymentModeId);
 
   const scheduleQuery = useQuery({
     queryKey: ['loan-schedule', loan?.id],
@@ -462,9 +469,18 @@ function ManageRepaymentsModal({ loan, onClose, onChanged }: { loan: Loan | null
   });
 
   const repayMutation = useMutation({
-    mutationFn: () => api.post(`/loans/${loan!.id}/repayments`, { amountPesewas: parseGhsInput(amount) }),
+    mutationFn: () =>
+      api.post(`/loans/${loan!.id}/repayments`, {
+        amountPesewas: parseGhsInput(amount),
+        paymentModeId,
+        receiverUserId,
+        transactionReference: transactionReference || undefined,
+      }),
     onSuccess: () => {
       setAmount('');
+      setPaymentModeId('');
+      setReceiverUserId('');
+      setTransactionReference('');
       setError(null);
       queryClient.invalidateQueries({ queryKey: ['loan-schedule', loan?.id] });
       onChanged();
@@ -507,14 +523,53 @@ function ManageRepaymentsModal({ loan, onClose, onChanged }: { loan: Loan | null
             <KpiCard label="Balance" value={formatGhs(loan.balance_pesewas)} higherIsBetter={false} />
           </div>
 
-          <div className="flex items-end gap-2">
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 sm:items-end">
             <FormField label="Record repayment (GH₵)">
               {(id) => <input id={id} type="number" step="0.01" min="0" value={amount} onChange={(e) => setAmount(e.target.value)} className={inputClasses} />}
             </FormField>
-            <Button variant="primary" size="md" disabled={!amount || repayMutation.isPending} onClick={() => repayMutation.mutate()}>
-              Record
-            </Button>
+            <FormField label="Payment mode">
+              {(id) => (
+                <select id={id} value={paymentModeId} onChange={(e) => setPaymentModeId(e.target.value)} className={selectClasses}>
+                  <option value="">Select…</option>
+                  {paymentModesQuery.data?.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.name}
+                    </option>
+                  ))}
+                </select>
+              )}
+            </FormField>
+            <FormField label="Receiver">
+              {(id) => (
+                <select id={id} value={receiverUserId} onChange={(e) => setReceiverUserId(e.target.value)} className={selectClasses}>
+                  <option value="">Select…</option>
+                  {staffQuery.data?.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.full_name}
+                    </option>
+                  ))}
+                </select>
+              )}
+            </FormField>
+            {selectedMode?.code === 'mobile_money' ? (
+              <FormField label="Transaction reference" hint="Optional, for MoMo reconciliation.">
+                {(id) => (
+                  <input id={id} value={transactionReference} onChange={(e) => setTransactionReference(e.target.value)} className={inputClasses} placeholder="e.g. MP240730.1234.A56789" />
+                )}
+              </FormField>
+            ) : (
+              <div />
+            )}
           </div>
+          <Button
+            variant="primary"
+            size="md"
+            disabled={!amount || !paymentModeId || !receiverUserId || repayMutation.isPending}
+            onClick={() => repayMutation.mutate()}
+            className="self-start"
+          >
+            Record
+          </Button>
           {error && (
             <p role="alert" className="text-[13px] text-danger">
               {error}
